@@ -55,14 +55,14 @@ class CausalSelfAttention(nn.Module):
         self.proj = nn.Linear(config.n_embd, config.n_embd)
         # causal mask to ensure that attention is only applied to the left in the input sequence
         self.register_buffer("mask", torch.tril(torch.ones(config.block_size, config.block_size))
-                                     .view(1, 1, config.block_size, config.block_size))
+                             .view(1, 1, config.block_size, config.block_size))
         self.n_head = config.n_head
 
     def forward(self, x, layer_past=None):
         B, T, C = x.size()
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        k = self.key(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        k = self.key(x).view(  B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = self.query(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = self.value(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
@@ -105,8 +105,8 @@ class GPT(nn.Module):
         super().__init__()
 
         # input embedding stem
-        self.tok_emb = nn.Embedding(config.vocab_size, config.n_embd)
-        self.pos_emb = nn.Parameter(torch.zeros(1, config.block_size, config.n_embd))
+        self.tok_emb = nn.Embedding(config.vocab_size, config.n_embd)  # map token index => token vector encoding
+        self.pos_emb = nn.Parameter(torch.zeros(1, config.block_size, config.n_embd))  # block_size x embedding dimension => learn 512 position encoding
         self.drop = nn.Dropout(config.embd_pdrop)
         # transformer
         self.blocks = nn.Sequential(*[Block(config) for _ in range(config.n_layer)])
