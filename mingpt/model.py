@@ -15,6 +15,8 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+from constants import NEPTUNE_RUN
+
 logger = logging.getLogger(__name__)
 
 class GPTConfig:
@@ -104,6 +106,7 @@ class GPT(nn.Module):
 
     def __init__(self, config):
         super().__init__()
+        self.vocab_size = config.vocab_size
 
         # input embedding stem
         self.tok_emb = nn.Embedding(config.vocab_size, config.n_embd)  # map token index => token vector encoding
@@ -113,10 +116,16 @@ class GPT(nn.Module):
         self.blocks = nn.Sequential(*[Block(config) for _ in range(config.n_layer)])
         # decoder head
         self.ln_f = nn.LayerNorm(config.n_embd)
-        self.head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+        # These don't have bias, why? Should output prob be totally dependent on input / context at last layer? Seems
+        # limiting. related: https://aidungeon.medium.com/controlling-gpt-3-with-logit-bias-55866d593292
+        self.logit_p_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)   # logit of probability
+        self.deviation_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)   # logit of variance
 
         self.block_size = config.block_size
         self.apply(self._init_weights)
+
+        self.iter = 0
 
         logger.info("number of parameters: %e", sum(p.numel() for p in self.parameters()))
 
@@ -188,11 +197,38 @@ class GPT(nn.Module):
         x = self.drop(token_embeddings + position_embeddings)
         x = self.blocks(x)
         x = self.ln_f(x)
-        logits = self.head(x)
+        logits = self.logit_p_head(x)
+        expected_deviation = self.deviation_head(x)  # Using mean deviation instead of standard deviation https://stats.stackexchange.com/q/81986/18187
+
+        NEPTUNE_RUN['train/expected_deviation_median'].log(torch.quantile(expected_deviation, 0.5))
+        NEPTUNE_RUN['train/expected_deviation_90pct'].log(torch.quantile(expected_deviation, 0.9))
+        NEPTUNE_RUN['train/expected_deviation_95pct'].log(torch.quantile(expected_deviation, 0.95))
+        NEPTUNE_RUN['train/expected_deviation_99pct'].log(torch.quantile(expected_deviation, 0.99))
+        NEPTUNE_RUN['train/expected_deviation_mean'].log(expected_deviation.mean())
+        NEPTUNE_RUN['train/expected_deviation_max'].log(expected_deviation.max())
+        NEPTUNE_RUN['train/expected_deviation_min'].log(expected_deviation.min())
+        NEPTUNE_RUN['train/logits_std'].log(logits.std())
 
         # if we are given some desired targets also calculate the loss
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            # Turn targets into one hot B x block_size x vocab_size with 1 in vocab
+            one_hot = F.one_hot(targets, num_classes=self.vocab_size)
 
+            probs = F.softmax(logits, dim=-1)
+            NEPTUNE_RUN['train/probs_std'].log(probs.std())
+
+            p_diff = (one_hot - probs).abs()  # actual deviation
+            d_diff = p_diff - expected_deviation
+
+            d_loss = d_diff.square().sum() / d_diff.numel()
+
+            p_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))  # does softmax internally
+
+            # print(f'{p_loss=}')
+            # print(f'{v_loss=}')
+
+            loss = d_loss + p_loss
+
+        self.iter += 1
         return logits, loss
