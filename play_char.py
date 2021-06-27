@@ -102,14 +102,13 @@ def main():
     train_dataset = CharDataset(open('train_shakespeare.txt', 'r').read(), BLOCK_SIZE)  # one line of poem is roughly 50 characters
     test_dataset = CharDataset(open('test_shakespeare.txt', 'r').read(), BLOCK_SIZE)
 
-mconf = GPTConfig(train_dataset.vocab_size, train_dataset.block_size,
-                  n_layer=8, n_head=8, n_embd=512)
-model = GPT(mconf)
-
-# %%
-
-DATE_STR = datetime.now().strftime('%Y_%m-%d_%H-%M.%S.%f')
-SAVE_DIR = f'{os.path.dirname(os.path.realpath(__file__))}/checkpoints/{DATE_STR}.ckpt'
+    mconf = GPTConfig(train_dataset.vocab_size, train_dataset.block_size,
+                      n_layer=8, n_head=8, n_embd=512)
+    model = GPT(mconf)
+    if IS_DEBUG_MODE:
+        num_workers = 0
+    else:
+        num_workers = 1
 
     # initialize a trainer instance and kick off training
     tconf = TrainerConfig(max_epochs=2, batch_size=64, learning_rate=6e-4,
