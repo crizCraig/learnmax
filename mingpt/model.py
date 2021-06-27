@@ -9,6 +9,8 @@ GPT model:
 
 import math
 import logging
+from collections import defaultdict
+from typing import Tuple, Dict
 
 import numpy as np
 import torch
@@ -126,6 +128,8 @@ class GPT(nn.Module):
         self.apply(self._init_weights)
 
         self.iter = 0
+        self.trajectory_counts: Dict[Tuple[int], int] = defaultdict(int)
+        self.max_trajectory_count = 0
 
         logger.info("number of parameters: %e", sum(p.numel() for p in self.parameters()))
 
@@ -187,7 +191,19 @@ class GPT(nn.Module):
         optimizer = torch.optim.AdamW(optim_groups, lr=train_config.learning_rate, betas=train_config.betas)
         return optimizer
 
-    def forward(self, idx, targets=None, targets_cpu=None):
+    def count_trajectories(self, targets):
+        # 1, 3, 4, 5
+        trajectories = [tuple(x) for x in targets.numpy()]
+        for t in trajectories:
+            t_small = t[-5:]
+            self.trajectory_counts[t_small] += 1
+            self.max_trajectory_count = max(self.max_trajectory_count, self.trajectory_counts[t_small])
+
+        if self.iter % 5 == 0:
+            print('trajectories: ', len(self.trajectory_counts))
+            print('max_trajectory_count: ', self.max_trajectory_count)
+
+    def forward(self, idx, targets=None):
         b, t = idx.size()
         assert t <= self.block_size, "Cannot forward, model block size is exhausted."
 

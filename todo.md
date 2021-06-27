@@ -1,0 +1,4 @@
+- try training the whole thing without having a good vqvae representation from a good pretrained agent or videos
+    - this will mean that the meaning of the clusters will change over time. that should be okay as we are trying to maximize interestingness anyway. if we switch between training the transformer and dVAE 
+- train dVAE with pretrained agent
+- integrate transformer to take actions

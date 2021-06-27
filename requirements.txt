@@ -1,0 +1,6 @@
+matplotlib
+loguru
+torch
+atari-py
+gym
+fire

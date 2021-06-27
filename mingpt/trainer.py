@@ -78,7 +78,8 @@ class Trainer:
 
                 # forward the model
                 with torch.set_grad_enabled(is_train):
-                    logits, loss = model(x, targets=y, targets_cpu=y)
+                    model.module.count_trajectories(y_cpu)
+                    logits, loss = model(x, targets=y)
                     loss = loss.mean() # collapse all losses if they are scattered on multiple gpus
                     losses.append(loss.item())
 
