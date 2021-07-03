@@ -1,16 +1,24 @@
 import argparse
 import os
-from typing import Tuple, List
+from typing import Tuple, List, OrderedDict, Dict, Optional
 
 import gym
+import numpy as np
 import pytorch_lightning as pl
 import torch
+from gym import Env
+from pl_bolts.datamodules import ExperienceSourceDataset
+from pl_bolts.datamodules.experience_source import Experience
 from pl_bolts.models.rl.common.gym_wrappers import make_environment
+from pl_bolts.models.rl.common.memory import MultiStepBuffer
+from pytorch_lightning import seed_everything
 from pytorch_lightning.callbacks import ModelCheckpoint
+from torch import optim
+from torch.optim.optimizer import Optimizer
 from torch.utils.data import DataLoader
 
+from learn_max.agent import LearnMaxAgent
 from learn_max.constants import SAVE_DIR
-from learn_max.data.experience_source import ExperienceSourceDataset
 from learn_max.dvq.vqvae import VQVAE
 from learn_max.mingpt.model import GPT
 
@@ -117,6 +125,7 @@ class LearnMax(pl.LightningModule):
         self.batch_actions = []
 
         self.state = self.env.reset()
+        self.agent = LearnMaxAgent()
 
         self.dvq = VQVAE(n_hid=dvq_n_hid, num_embeddings=dvq_num_embeddings, embedding_dim=self.dvq_embedding_dim,
                          loss_flavor=dvq_loss_flavor, input_channels=dvq_input_channels,
@@ -124,55 +133,6 @@ class LearnMax(pl.LightningModule):
 
         self.gpt = GPT(vocab_size=gpt_vocab_size, block_size=gpt_block_size, n_layer=gpt_n_layer,
                        n_embd=self.gpt_n_embd, n_head=gpt_n_head)
-
-    def train_dataloader(self):
-        dataset = ExperienceSourceDataset(self.train_batch)
-
-        dataloader = DataLoader(
-            dataset,
-            batch_size=self.batch_size,
-            num_workers=self.num_workers,
-            drop_last=True,
-            pin_memory=True,
-        )
-        return dataloader
-
-    def train_batch(self) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
-        """
-        Contains the logic for generating a new batch of data to be passed to the DataLoader
-
-        Returns:
-            yields a tuple of Lists containing tensors for states, actions and rewards of the batch.
-        """
-
-        while True:
-            action = self.agent(self.state, self.device)
-
-            next_state, reward, done, _ = self.env.step(action[0])
-
-            # TODO: Subtract 0.5 from image so that we - map [0,1] range to [-0.5, 0.5]
-
-            # TODO: Allow learning within the episode
-
-            self.episode_rewards.append(reward)
-            self.batch_actions.append(action)
-            self.batch_states.append(self.state)
-            self.state = next_state
-
-            if done:
-                self.done_episodes += 1
-                self.state = self.env.reset()
-                self.total_rewards.append(sum(self.episode_rewards))
-                self.avg_rewards = float(np.mean(self.total_rewards[-self.avg_reward_len:]))
-
-                returns = self.compute_returns(self.episode_rewards)
-
-                for idx in range(len(self.batch_actions)):
-                    yield self.batch_states[idx], self.batch_actions[idx], returns[idx]
-
-                self.batch_states = []
-                self.batch_actions = []
-                self.episode_rewards = []
 
     def run_n_episodes(self, env, n_epsiodes: int = 1, epsilon: float = 1.0) -> List[int]:
         """
@@ -217,11 +177,6 @@ class LearnMax(pl.LightningModule):
                 if done:
                     self.state = self.env.reset()
 
-    def build_networks(self) -> None:
-        """Initializes the DQN train and target networks"""
-        self.net = CNN(self.obs_shape, self.n_actions)
-        self.target_net = CNN(self.obs_shape, self.n_actions)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Passes in a state x through the network and gets the q_values of each action as an output
@@ -260,7 +215,6 @@ class LearnMax(pl.LightningModule):
 
             exp = Experience(state=self.state, action=action[0], reward=r, done=is_done, new_state=next_state)
 
-            self.agent.update_epsilon(self.global_step)
             self.buffer.append(exp)
             self.state = next_state
 
@@ -285,7 +239,7 @@ class LearnMax(pl.LightningModule):
     def training_step(self, batch: Tuple[torch.Tensor, torch.Tensor], _) -> OrderedDict:
         """
         Carries out a single step through the environment to update the replay buffer.
-        Then calculates loss based on the minibatch recieved
+        Then calculates loss based on the minibatch received
 
         Args:
             batch: current mini batch of replay data
@@ -296,7 +250,7 @@ class LearnMax(pl.LightningModule):
         """
 
         # calculates training loss
-        loss = dqn_loss(batch, self.net, self.target_net, self.gamma)
+        # loss = dqn_loss(batch, self.net, self.target_net, self.gamma)
 
         if self.trainer.use_dp or self.trainer.use_ddp2:
             loss = loss.unsqueeze(0)
@@ -313,10 +267,10 @@ class LearnMax(pl.LightningModule):
             "episode_steps": self.total_episode_steps[-1]
         })
 
-        return OrderedDict({
+        return OrderedDict[{
             "loss": loss,
             "avg_reward": self.avg_rewards,
-        })
+        }]
 
     def test_step(self, *args, **kwargs) -> Dict[str, torch.Tensor]:
         """Evaluate the agent for 10 episodes"""
@@ -342,7 +296,8 @@ class LearnMax(pl.LightningModule):
         self.populate(self.warm_start_size)
 
         self.dataset = ExperienceSourceDataset(self.train_batch)
-        return DataLoader(dataset=self.dataset, batch_size=self.batch_size)
+        return DataLoader(dataset=self.dataset, batch_size=self.batch_size, num_workers=self.num_workers,
+                          drop_last=True, pin_memory=True)
 
     def train_dataloader(self) -> DataLoader:
         """Get train loader"""

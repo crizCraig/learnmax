@@ -39,7 +39,7 @@ model.cuda()
 x = x.cuda()
 
 
-x_hat, latent_loss, ind = model(x)
+x_hat, z_q, latent_loss, ind = model(x)
 
 
 xcols = torch.cat([x, x_hat], axis=2) # side by side x_pre and xhat

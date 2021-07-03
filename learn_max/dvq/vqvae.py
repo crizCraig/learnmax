@@ -14,12 +14,12 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
 
-from dvq.data.cifar10 import CIFAR10Data
-from dvq.model.deepmind_enc_dec import DeepMindEncoder, DeepMindDecoder
-from dvq.model.openai_enc_dec import OpenAIEncoder, OpenAIDecoder
-from dvq.model.openai_enc_dec import Conv2d as PatchedConv2d
-from dvq.model.quantize import VQVAEQuantize, GumbelQuantize
-from dvq.model.loss import Normal, LogitLaplace
+# from learn_max.dvq.data.cifar10 import CIFAR10Data
+from learn_max.dvq.model.deepmind_enc_dec import DeepMindEncoder, DeepMindDecoder
+from learn_max.dvq.model.openai_enc_dec import OpenAIEncoder, OpenAIDecoder
+from learn_max.dvq.model.openai_enc_dec import Conv2d as PatchedConv2d
+from learn_max.dvq.model.quantize import VQVAEQuantize, GumbelQuantize
+from learn_max.dvq.model.loss import Normal, LogitLaplace
 
 # -----------------------------------------------------------------------------
 
@@ -65,18 +65,18 @@ class VQVAE(nn.Module):
         z = self.encoder(x)
         z_q, latent_loss, ind = self.quantizer(z)
         x_hat = self.decoder(z_q)
-        return x_hat, latent_loss, ind
+        return x_hat, z_q, latent_loss, ind
 
     def training_step(self, batch, batch_idx):
         x, y = batch # hate that i have to do this here in the model
-        x_hat, latent_loss, ind = self.forward(x)
+        x_hat, z_q, latent_loss, ind = self.forward(x)
         recon_loss = self.recon_loss.nll(x, x_hat)
         loss = recon_loss + latent_loss
         return loss
 
     def validation_step(self, batch, batch_idx):
         x, y = batch # hate that i have to do this here in the model
-        x_hat, latent_loss, ind = self.forward(x)
+        x_hat, z_q, latent_loss, ind = self.forward(x)
         recon_loss = self.recon_loss.nll(x, x_hat)
         self.log('val_recon_loss', recon_loss, prog_bar=True)
 
