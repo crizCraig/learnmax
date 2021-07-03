@@ -4,6 +4,9 @@ import fire
 from gym import wrappers
 from loguru import logger as log
 from matplotlib import pyplot as plt
+import pytorch_lightning as pl
+
+from dvq.vqvae import VQVAE
 
 
 def main(env_id='MontezumaRevenge-v0'):
@@ -24,6 +27,14 @@ def main(env_id='MontezumaRevenge-v0'):
     episode_count = 100
     reward = 0
     done = False
+
+    frame_encoder = VQVAE(n_hid=64, num_embeddings=1024, embedding_dim=64, loss_flavor='l2', input_channels=3,
+                          enc_dec_flavor='deepmind', vq_flavor='vqvae')
+
+    # TODO: Set this up as a lightning module
+    # TODO: Instantiate transformer - look into using detach to separate training of two. See if you can actually join them???
+
+    # transformer =
 
     for i in range(episode_count):
         ob = env.reset()

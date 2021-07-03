@@ -25,31 +25,40 @@ from dvq.model.loss import Normal, LogitLaplace
 
 class VQVAE(pl.LightningModule):
 
-    def __init__(self, args, input_channels=3):
+    def __init__(self, n_hid=64, num_embeddings=512, embedding_dim=64, loss_flavor='l2',
+                 input_channels=3, enc_dec_flavor='deepmind', vq_flavor='vqvae'):
+        """
+        @type n_hid: number of channels controlling the size of the model
+        @type num_embeddings: vocabulary size; number of possible discrete states
+        @type embedding_dim: size of the vector of the embedding of each discrete token
+        @type loss_flavor: `l2` or `logit_laplace`
+        @type input_channels: Typically 3 for RGB
+        @type enc_dec_flavor: Deepmind VQVAE or OpenAI Dall-E dVAE
+        @type vq_flavor: `vqvae` or `gumbel`
+        """
         super().__init__()
-        self.args = args
 
         # encoder/decoder module pair
         Encoder, Decoder = {
             'deepmind': (DeepMindEncoder, DeepMindDecoder),
             'openai': (OpenAIEncoder, OpenAIDecoder),
-        }[args.enc_dec_flavor]
-        self.encoder = Encoder(input_channels=input_channels, n_hid=args.n_hid)
-        self.decoder = Decoder(n_init=args.embedding_dim, n_hid=args.n_hid, output_channels=input_channels)
+        }[enc_dec_flavor]
+        self.encoder = Encoder(input_channels=input_channels, n_hid=n_hid)
+        self.decoder = Decoder(n_init=embedding_dim, n_hid=n_hid, output_channels=input_channels)
 
         # the quantizer module sandwiched between them, +contributes a KL(posterior || prior) loss to ELBO
         QuantizerModule = {
             'vqvae': VQVAEQuantize,
             'gumbel': GumbelQuantize,
-        }[args.vq_flavor]
-        self.quantizer = QuantizerModule(self.encoder.output_channels, args.num_embeddings, args.embedding_dim)
+        }[vq_flavor]
+        self.quantizer = QuantizerModule(self.encoder.output_channels, num_embeddings, embedding_dim)
 
         # the data reconstruction loss in the ELBO
         ReconLoss = {
             'l2': Normal,
             'logit_laplace': LogitLaplace,
             # todo: add vqgan
-        }[args.loss_flavor]
+        }[loss_flavor]
         self.recon_loss = ReconLoss
 
     def forward(self, x):

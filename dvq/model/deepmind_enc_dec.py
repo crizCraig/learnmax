@@ -43,7 +43,6 @@ class DeepMindEncoder(nn.Module):
         )
 
         self.output_channels = 2 * n_hid
-        self.output_stide = 4
 
     def forward(self, x):
         return self.net(x)

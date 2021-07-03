@@ -1,9 +1,10 @@
 import torch
 
 from mingpt.utils import sample
-from play_char import train_dataset, trainer, model
+from mingpt.play_char import train_dataset, trainer, model
 
-checkpoint = torch.load('/home/c2/src/safeobjective/checkpoints/2021_06-20_13-46.54.657999.ckpt')
+# checkpoint = torch.load('/home/c2/src/safeobjective/checkpoints/2021_06-20_13-46.54.657999.ckpt')
+checkpoint = torch.load('/home/c2/src/safeobjective/checkpoints/2021_06-25_12-10.31.754278.ckpt')
 model.load_state_dict(checkpoint)
 
 context = "O God, O God!"
