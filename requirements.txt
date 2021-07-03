@@ -4,3 +4,4 @@ torch
 atari-py
 gym
 fire
+lightning-bolts

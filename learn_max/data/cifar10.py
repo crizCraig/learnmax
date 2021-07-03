@@ -4,7 +4,7 @@ from torchvision.datasets import CIFAR10
 
 import pytorch_lightning as pl
 
-from dvq.model.loss import LogitLaplace, Normal
+from learn_max.dvq.model.loss import LogitLaplace, Normal
 
 
 class CIFAR10Data(pl.LightningDataModule):
@@ -39,7 +39,7 @@ class CIFAR10Data(pl.LightningDataModule):
         transform = T.Compose(
             [
                 T.ToTensor(),
-                # self.inmap
+                self.inmap
             ]
         )
         dataset = CIFAR10(root=self.hparams.data_dir, train=False, transform=transform, download=True)

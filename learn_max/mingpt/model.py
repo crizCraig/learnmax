@@ -9,35 +9,18 @@ GPT model:
 
 import math
 import logging
-from collections import defaultdict
-from typing import Tuple, Dict
+from typing import List, Set, Dict, Tuple, Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import pytorch_lightning as pl
 
-from constants import NEPTUNE_RUN
+
+from learn_max.constants import NEPTUNE_RUN
 
 logger = logging.getLogger(__name__)
-
-class GPTConfig:
-    """ base GPT config, params common to all GPT versions """
-    embd_pdrop = 0.1
-    resid_pdrop = 0.1
-    attn_pdrop = 0.1
-
-    def __init__(self, vocab_size, block_size, **kwargs):
-        self.vocab_size = vocab_size
-        self.block_size = block_size
-        for k,v in kwargs.items():
-            setattr(self, k, v)
-
-class GPT1Config(GPTConfig):
-    """ GPT-1 like network roughly 125M params """
-    n_layer = 12
-    n_head = 12
-    n_embd = 768
 
 class CausalSelfAttention(nn.Module):
     """
@@ -46,22 +29,22 @@ class CausalSelfAttention(nn.Module):
     explicit implementation here to show that there is nothing too scary here.
     """
 
-    def __init__(self, config):
+    def __init__(self, n_embd, block_size, n_head, attn_pdrop, resid_pdrop):
         super().__init__()
-        assert config.n_embd % config.n_head == 0
+        assert n_embd % n_head == 0
+        self.n_head = n_head
         # key, query, value projections for all heads
-        self.key = nn.Linear(config.n_embd, config.n_embd)
-        self.query = nn.Linear(config.n_embd, config.n_embd)
-        self.value = nn.Linear(config.n_embd, config.n_embd)
+        self.key = nn.Linear(n_embd, n_embd)
+        self.query = nn.Linear(n_embd, n_embd)
+        self.value = nn.Linear(n_embd, n_embd)
         # regularization
-        self.attn_drop = nn.Dropout(config.attn_pdrop)
-        self.resid_drop = nn.Dropout(config.resid_pdrop)
+        self.attn_drop = nn.Dropout(attn_pdrop)
+        self.resid_drop = nn.Dropout(resid_pdrop)
         # output projection
-        self.proj = nn.Linear(config.n_embd, config.n_embd)
+        self.proj = nn.Linear(n_embd, n_embd)
         # causal mask to ensure that attention is only applied to the left in the input sequence
-        self.register_buffer("mask", torch.tril(torch.ones(config.block_size, config.block_size))
-                             .view(1, 1, config.block_size, config.block_size))
-        self.n_head = config.n_head
+        self.register_buffer("mask", torch.tril(torch.ones(block_size, block_size))
+                                     .view(1, 1, block_size, block_size))
 
     def forward(self, x, layer_past=None):
         B, T, C = x.size()
@@ -86,16 +69,16 @@ class CausalSelfAttention(nn.Module):
 class Block(nn.Module):
     """ an unassuming Transformer block """
 
-    def __init__(self, config):
+    def __init__(self, n_embd, block_size, n_head, attn_pdrop, resid_pdrop):
         super().__init__()
-        self.ln1 = nn.LayerNorm(config.n_embd)
-        self.ln2 = nn.LayerNorm(config.n_embd)
-        self.attn = CausalSelfAttention(config)
+        self.ln1 = nn.LayerNorm(n_embd)
+        self.ln2 = nn.LayerNorm(n_embd)
+        self.attn = CausalSelfAttention(n_embd, block_size, n_head, attn_pdrop, resid_pdrop)
         self.mlp = nn.Sequential(
-            nn.Linear(config.n_embd, 4 * config.n_embd),
+            nn.Linear(n_embd, 4 * n_embd),
             nn.GELU(),
-            nn.Linear(4 * config.n_embd, config.n_embd),
-            nn.Dropout(config.resid_pdrop),
+            nn.Linear(4 * n_embd, n_embd),
+            nn.Dropout(resid_pdrop),
         )
 
     def forward(self, x):
@@ -106,25 +89,41 @@ class Block(nn.Module):
 class GPT(nn.Module):
     """  the full GPT language model, with a context size of block_size """
 
-    def __init__(self, config):
+    def __init__(self,
+                 # model definition args
+                 vocab_size: int, # size of the vocabulary (number of possible tokens)
+                 block_size: int, # length of the model's context window in time
+                 n_layer: int, # depth of the model; number of Transformer blocks in sequence
+                 n_embd: int, # the "width" of the model, number of channels in each Transformer
+                 n_head: int, # number of heads in each multi-head attention inside each Transformer block
+                 # model optimization args
+                 learning_rate: float = 3e-4, # the base learning rate of the model
+                 weight_decay: float = 0.1, # amount of regularizing L2 weight decay on MatMul ops
+                 betas: Tuple[float, float] = (0.9, 0.95), # momentum terms (betas) for the Adam optimizer
+                 embd_pdrop: float = 0.1, # \in [0,1]: amount of dropout on input embeddings
+                 resid_pdrop: float = 0.1, # \in [0,1]: amount of dropout in each residual connection
+                 attn_pdrop: float = 0.1, # \in [0,1]: amount of dropout on the attention matrix
+                 ):
         super().__init__()
-        self.vocab_size = config.vocab_size
+        self.vocab_size = vocab_size
 
-        # input embedding stem
-        self.tok_emb = nn.Embedding(config.vocab_size, config.n_embd)  # map token index => token vector encoding
-        self.pos_emb = nn.Parameter(torch.zeros(1, config.block_size, config.n_embd))  # block_size x embedding dimension => learn 512 position encoding
-        self.drop = nn.Dropout(config.embd_pdrop)
-        # transformer
-        self.blocks = nn.Sequential(*[Block(config) for _ in range(config.n_layer)])
-        # decoder head
-        self.ln_f = nn.LayerNorm(config.n_embd)
+        # save these for optimizer init later
+        self.learning_rate = learning_rate
+        self.weight_decay = weight_decay
+        self.betas = betas
 
-        # These don't have bias, why? Should output prob be totally dependent on input / context at last layer? Seems
-        # limiting. related: https://aidungeon.medium.com/controlling-gpt-3-with-logit-bias-55866d593292
-        self.logit_p_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)   # logit of probability
-        self.deviation_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)   # logit of variance
+        # input embedding stem: drop(content + position)
+        self.tok_emb = nn.Embedding(vocab_size, n_embd)
+        self.pos_emb = nn.Parameter(torch.zeros(1, block_size, n_embd))
+        self.drop = nn.Dropout(embd_pdrop)
+        # deep transformer: just a sequence of transformer blocks
+        self.blocks = nn.Sequential(*[Block(n_embd, block_size, n_head, attn_pdrop, resid_pdrop) for _ in range(n_layer)])
+        # decoder: at the end one more layernorm and decode the answers
+        self.ln_f = nn.LayerNorm(n_embd)
+        self.logit_p_head = nn.Linear(n_embd, vocab_size, bias=False) # no need for extra bias due to one in ln_f
+        self.deviation_head = nn.Linear(n_embd, vocab_size, bias=False)   # mean deviation
 
-        self.block_size = config.block_size
+        self.block_size = block_size
         self.apply(self._init_weights)
 
         self.iter = 0
@@ -137,6 +136,11 @@ class GPT(nn.Module):
         return self.block_size
 
     def _init_weights(self, module):
+        """
+        Vanilla model initialization:
+        - all MatMul weights \in N(0, 0.02) and biases to zero
+        - all LayerNorm post-normalization scaling set to identity, so weight=1, bias=0
+        """
         if isinstance(module, (nn.Linear, nn.Embedding)):
             module.weight.data.normal_(mean=0.0, std=0.02)
             if isinstance(module, nn.Linear) and module.bias is not None:
@@ -145,7 +149,7 @@ class GPT(nn.Module):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
 
-    def configure_optimizers(self, train_config):
+    def configure_optimizers(self):
         """
         This long function is unfortunately doing something very simple and is being very defensive:
         We are separating out all parameters of the model into two buckets: those that will experience
@@ -185,10 +189,10 @@ class GPT(nn.Module):
 
         # create the pytorch optimizer object
         optim_groups = [
-            {"params": [param_dict[pn] for pn in sorted(list(decay))], "weight_decay": train_config.weight_decay},
+            {"params": [param_dict[pn] for pn in sorted(list(decay))], "weight_decay": self.weight_decay},
             {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0.0},
         ]
-        optimizer = torch.optim.AdamW(optim_groups, lr=train_config.learning_rate, betas=train_config.betas)
+        optimizer = torch.optim.AdamW(optim_groups, lr=self.learning_rate, betas=self.betas)
         return optimizer
 
     def count_trajectories(self, targets):
@@ -203,7 +207,7 @@ class GPT(nn.Module):
             print('trajectories: ', len(self.trajectory_counts))
             print('max_trajectory_count: ', self.max_trajectory_count)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx):
         b, t = idx.size()
         assert t <= self.block_size, "Cannot forward, model block size is exhausted."
 
@@ -214,7 +218,7 @@ class GPT(nn.Module):
         x = self.blocks(x)
         x = self.ln_f(x)
         logits = self.logit_p_head(x)
-        expected_deviation = self.deviation_head(x)  # Using mean deviation instead of standard deviation https://stats.stackexchange.com/q/81986/18187
+        expected_deviation = self.deviation_head(x)  # Uses mean deviation instead of standard deviation https://stats.stackexchange.com/q/81986/18187
 
         NEPTUNE_RUN['train/expected_deviation_median'].log(torch.quantile(expected_deviation, 0.5))
         NEPTUNE_RUN['train/expected_deviation_90pct'].log(torch.quantile(expected_deviation, 0.9))
@@ -225,26 +229,25 @@ class GPT(nn.Module):
         NEPTUNE_RUN['train/expected_deviation_min'].log(expected_deviation.min())
         NEPTUNE_RUN['train/logits_std'].log(logits.std())
 
-        # if we are given some desired targets also calculate the loss
-        loss = None
-        if targets is not None:
-            # Turn targets into one hot B x block_size x vocab_size with 1 in vocab
-            one_hot = F.one_hot(targets, num_classes=self.vocab_size)
+        return logits, expected_deviation
 
-            probs = F.softmax(logits, dim=-1)
-            NEPTUNE_RUN['train/probs_std'].log(probs.std())
+    def step_(self, split, batch, batch_idx=None):
+        idx, targets = batch
+        logits, expected_deviation = self(idx)
 
-            p_diff = (one_hot - probs).abs()  # actual deviation
-            d_diff = p_diff - expected_deviation
+        # Calculate mean deviation loss --------------------------------------
+        # Turn targets into one hot B x block_size x vocab_size with 1 in vocab
+        one_hot = F.one_hot(targets, num_classes=self.vocab_size)
+        probs = F.softmax(logits, dim=-1)
+        NEPTUNE_RUN['train/probs_std'].log(probs.std())
+        p_diff = (one_hot - probs).abs()  # actual deviation
+        d_diff = p_diff - expected_deviation
+        d_loss = d_diff.square().sum() / d_diff.numel()
 
-            d_loss = d_diff.square().sum() / d_diff.numel()
-
-            p_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))  # does softmax internally
-
-            # print(f'{p_loss=}')
-            # print(f'{v_loss=}')
-
-            loss = d_loss + p_loss
-
+        # Calculate standard transformer categorical probability loss-----------
+        # pytorch cross entropy has built-in softmax so pass logits
+        p_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        loss = d_loss + p_loss
         self.iter += 1
-        return logits, loss
+        return {'loss': loss}
+

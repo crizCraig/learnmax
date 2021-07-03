@@ -23,7 +23,7 @@ from dvq.model.loss import Normal, LogitLaplace
 
 # -----------------------------------------------------------------------------
 
-class VQVAE(pl.LightningModule):
+class VQVAE(nn.Module):
 
     def __init__(self, n_hid=64, num_embeddings=512, embedding_dim=64, loss_flavor='l2',
                  input_channels=3, enc_dec_flavor='deepmind', vq_flavor='vqvae'):
