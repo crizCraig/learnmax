@@ -8,25 +8,21 @@ GPT model:
 """
 
 import math
-import logging
-from typing import List, Set, Dict, Tuple, Optional
+from collections import defaultdict
+from typing import Dict, Tuple
 
-import numpy as np
 import torch
 import torch.nn as nn
+import wandb
+from loguru import logger as log
 from torch.nn import functional as F
-import pytorch_lightning as pl
 
-
-from learn_max.constants import NEPTUNE_RUN
-
-logger = logging.getLogger(__name__)
 
 class CausalSelfAttention(nn.Module):
     """
     A vanilla multi-head masked self-attention layer with a projection at the end.
-    It is possible to use torch.nn.MultiheadAttention here but I am including an
-    explicit implementation here to show that there is nothing too scary here.
+    It is possible to use torch.nn.MultiheadAttention but I am including an
+    explicit implementation to show that there is nothing too scary here.
     """
 
     def __init__(self, n_embd, block_size, n_head, attn_pdrop, resid_pdrop):
@@ -130,7 +126,7 @@ class GPT(nn.Module):
         self.trajectory_counts: Dict[Tuple[int], int] = defaultdict(int)
         self.max_trajectory_count = 0
 
-        logger.info("number of parameters: %e", sum(p.numel() for p in self.parameters()))
+        log.info("number of parameters: %e", sum(p.numel() for p in self.parameters()))
 
     def get_block_size(self):
         return self.block_size
@@ -220,14 +216,14 @@ class GPT(nn.Module):
         logits = self.logit_p_head(x)
         expected_deviation = self.deviation_head(x)  # Uses mean deviation instead of standard deviation https://stats.stackexchange.com/q/81986/18187
 
-        NEPTUNE_RUN['train/expected_deviation_median'].log(torch.quantile(expected_deviation, 0.5))
-        NEPTUNE_RUN['train/expected_deviation_90pct'].log(torch.quantile(expected_deviation, 0.9))
-        NEPTUNE_RUN['train/expected_deviation_95pct'].log(torch.quantile(expected_deviation, 0.95))
-        NEPTUNE_RUN['train/expected_deviation_99pct'].log(torch.quantile(expected_deviation, 0.99))
-        NEPTUNE_RUN['train/expected_deviation_mean'].log(expected_deviation.mean())
-        NEPTUNE_RUN['train/expected_deviation_max'].log(expected_deviation.max())
-        NEPTUNE_RUN['train/expected_deviation_min'].log(expected_deviation.min())
-        NEPTUNE_RUN['train/logits_std'].log(logits.std())
+        wandb.log({'train/expected_deviation_median', torch.quantile(expected_deviation, 0.5)})
+        wandb.log({'train/expected_deviation_90pct', torch.quantile(expected_deviation, 0.9 )})
+        wandb.log({'train/expected_deviation_95pct', torch.quantile(expected_deviation, 0.95)})
+        wandb.log({'train/expected_deviation_99pct', torch.quantile(expected_deviation, 0.99)})
+        wandb.log({'train/expected_deviation_mean', expected_deviation.mean()})
+        wandb.log({'train/expected_deviation_max', expected_deviation.max()})
+        wandb.log({'train/expected_deviation_min', expected_deviation.min()})
+        wandb.log({'train/logits_std', logits.std()})
 
         return logits, expected_deviation
 
@@ -239,7 +235,7 @@ class GPT(nn.Module):
         # Turn targets into one hot B x block_size x vocab_size with 1 in vocab
         one_hot = F.one_hot(targets, num_classes=self.vocab_size)
         probs = F.softmax(logits, dim=-1)
-        NEPTUNE_RUN['train/probs_std'].log(probs.std())
+        wandb.log({'train/probs_std', probs.std()})
         p_diff = (one_hot - probs).abs()  # actual deviation
         d_diff = p_diff - expected_deviation
         d_loss = d_diff.square().sum() / d_diff.numel()

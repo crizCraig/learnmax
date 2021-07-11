@@ -58,8 +58,8 @@ def learn_max_beam(seq, model, deviation, beam_batch_size=64):
 
     * take the transformer's input sequence of z(a,s) embeddings and output deviations as input
       (note that deviation is the predicted output prob change and is the proxy we are using for uncertainty)
-    * get the action that corresponds to each output state by forwarding it through the dvq in batch(es) and getting
-      the closest action embedding to the decoded one
+    * get the action that corresponds to each output state by forwarding it through the dvq decoder
+      in batch(es) and getting the closest action embedding to the decoded one
     * sum the deviations over decoded actions to avoid searching over duplicate actions
     * sum these action_deviations (or possibly z deviation?) to the appropriate trajectories to get total deviation
       the network should be learning. we need to predict the state and the action in order to roll the model

@@ -6,3 +6,4 @@ atari-py
 gym
 fire
 lightning-bolts
+wandb
