@@ -5,26 +5,30 @@ import os
 import time
 from typing import Tuple, List, OrderedDict, Dict, Optional
 
+import cv2
 import gym
 import numpy as np
 import pytorch_lightning as pl
 import torch
 import torch.backends.cudnn
 import wandb
-from gym import Env
+from gym import Env, ObservationWrapper
 from loguru import logger as log
 from pl_bolts.datamodules import ExperienceSourceDataset
 from pl_bolts.datamodules.experience_source import Experience
-from pl_bolts.models.rl.common.gym_wrappers import make_environment
+from pl_bolts.models.rl.common.gym_wrappers import (
+    make_environment, ImageToPyTorch, ProcessFrame84, FireResetEnv, MaxAndSkipEnv, ScaledFloatFrame)
 from pl_bolts.models.rl.common.memory import MultiStepBuffer
+from pl_bolts.utils import _OPENCV_AVAILABLE
 from pytorch_lightning import seed_everything
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
-from torch import optim
+from torch import nn
 from torch.optim.optimizer import Optimizer
 from torch.utils.data import DataLoader
 
 from learn_max.agent import LearnMaxAgent
+from learn_max.utils import topk_interesting, _init_weights
 from learn_max.constants import SAVE_DIR, SEED
 from learn_max.dvq.vqvae import VQVAE, DecayLR, DecayTemperature, RampBeta
 from learn_max.mingpt.lr_decay import WarmupCosineLearningRateDecay
@@ -105,54 +109,92 @@ class LearnMax(pl.LightningModule):
 
         # Hyperparameters
         self.dvq_embedding_dim = embedding_dim  # size of the embedding vector representing a cluster of embeddings
-        self.gpt_n_embd = embedding_dim  # the "width" of the model (embedding_dim), number of channels in each Transformer
-        self.batches_per_epoch = batches_per_epoch
-        self.gamma = gamma
-        self.n_steps = n_steps
-        self.replay_size = replay_size
-        self.warm_start_size = warm_start_size
+        self.dvq_n_hid = dvq_n_hid
+        self.dvq_num_embeddings = dvq_num_embeddings
+        self.dvq_loss_flavor = dvq_loss_flavor
+        self.dvq_input_channels = dvq_input_channels
+        self.dvq_enc_dec_flavor = dvq_enc_dec_flavor
+        self.dvq_vq_flavor = dvq_vq_flavor
 
-        self.save_hyperparameters()
-
-        self.num_workers = num_workers
-        self.data_dir = data_dir
-
-        if 'DISABLE_ENV_WRAPPERS' in os.environ:
-            self.env = gym.make(env_id)
-            self.env.seed(SEED)
-            self.test_env = gym.make(env_id)
-        else:
-            # Thinking these slow things down a lot, but at what benefit?!
-            self.env = self.make_environment(env_id, 0)
-            self.test_env = self.make_environment(env_id)
-
-        self.obs_shape = self.env.observation_space.shape
-        self.n_actions = self.env.action_space.n
+        self.gpt_embedding_dim = embedding_dim  # the "width" of the model (embedding_dim), number of channels in each Transformer
+        self.gpt_block_size = gpt_block_size
+        self.gpt_n_layer = gpt_n_layer
+        self.gpt_n_head = gpt_n_head
+        self.gpt_learning_rate = gpt_learning_rate
+        self.gpt_weight_decay = gpt_weight_decay
+        self.gpt_betas = gpt_betas
+        self.gpt_embd_pdrop = gpt_embd_pdrop
+        self.gpt_resid_pdrop = gpt_resid_pdrop
+        self.gpt_attn_pdrop = gpt_attn_pdrop
 
         self.avg_reward_len = avg_reward_len
         self.epoch_len = epoch_len
         self.gamma = gamma
+        self.n_steps = n_steps
+        self.replay_size = replay_size
+        self.env_id = env_id
+        self.warm_start_size = warm_start_size
+        self.batches_per_epoch = batches_per_epoch
+        self.num_workers = num_workers
+        self.data_dir = data_dir
 
-        # Tracking metrics
+        self.save_hyperparameters()
+
+        def make_env(_env_id):
+            _env = gym.make(_env_id)
+            _env = MaxAndSkipEnv(_env)
+            _env = FireResetEnv(_env)
+
+            # These wrappers also convert to grayscale, which I think was done
+            # to be able to stack frames, but we should probably not do.
+            _env = ProcessFrame84Color(_env)
+            _env = ImageToPyTorch(_env)
+
+            # We don't want to stack frames, the transformer will do sequential inference
+            # _env = BufferWrapper(_env, 4)
+
+            _env = ScaledFloatFrame(_env)
+            return _env
+
+        if 'USE_STANDARD_ENV_WRAPPERS' in os.environ:
+            # Thinking these slow things down a lot, but at what benefit?!
+            # These wrappers also convert to grayscale, which I think was done
+            # to be able to stack frames, but we should probably not do.
+            self.env = self.make_environment(env_id)
+            self.env.seed(SEED)
+            self.test_env = self.make_environment(env_id)
+        else:
+            self.env = make_env(env_id)
+            self.env.seed(SEED)
+            self.test_env = make_env(env_id)
+
+        self.obs_shape = self.env.observation_space.shape
+        self.n_actions = self.env.action_space.n
+
+        self.action_emb = nn.Embedding(self.n_actions, embedding_dim)
+
+        self.apply(_init_weights)  # Should only be action embeddings, other weights are in dvq and gpt
+
+        # RL type tracking metrics
         self.total_rewards = []
         self.episode_rewards = []
         self.done_episodes = 0
         self.avg_rewards = 0
         self.avg_reward_len = avg_reward_len
-        self.eps = np.finfo(np.float32).eps.item()
         self.batch_states = []
         self.batch_actions = []
 
         self.state = self.env.reset()
-        self.agent = LearnMaxAgent()
 
         self.dvq = VQVAE(n_hid=dvq_n_hid, num_embeddings=dvq_num_embeddings, embedding_dim=self.dvq_embedding_dim,
                          loss_flavor=dvq_loss_flavor, input_channels=dvq_input_channels,
                          enc_dec_flavor=dvq_enc_dec_flavor, vq_flavor=dvq_vq_flavor)
         self.gpt = GPT(vocab_size=gpt_vocab_size, block_size=gpt_block_size, n_layer=gpt_n_layer,
-                       n_embd=self.gpt_n_embd, n_head=gpt_n_head, learning_rate=gpt_learning_rate,
+                       embedding_dim=self.gpt_embedding_dim, n_head=gpt_n_head, learning_rate=gpt_learning_rate,
                        weight_decay=gpt_weight_decay, betas=gpt_betas, embd_pdrop=gpt_embd_pdrop,
                        resid_pdrop=gpt_resid_pdrop, attn_pdrop=gpt_attn_pdrop)
+
+        self.agent = LearnMaxAgent(model=self, num_actions=self.env.action_space.n)
 
     def run_n_episodes(self, env, n_epsiodes: int = 1, epsilon: float = 1.0) -> List[int]:
         """
@@ -304,9 +346,9 @@ class LearnMax(pl.LightningModule):
         return {"avg_test_reward": avg_reward}
 
     def configure_optimizers(self) -> List[Optimizer]:
-        """ Initialize Adam optimizer"""
-        optimizer = optim.Adam(self.net.parameters(), lr=self.lr)
-        return [optimizer]
+        dvq_optimizer = self.dvq.configure_optimizers()
+        gpt_optimizer = self.gpt.configure_optimizers()
+        return [dvq_optimizer, gpt_optimizer]
 
     def _dataloader(self) -> DataLoader:
         """Initialize the Replay Buffer dataset used for retrieving experiences"""
@@ -381,6 +423,87 @@ class LearnMax(pl.LightningModule):
 
         return arg_parser
 
+    def beam_search(self, z_buff, a_buff, beam_batch_size=64):
+        """
+        Beam width should be batch size unless transformers combine batch + sequence trunk with the torch.tril mask
+
+        We want total path interestingness (deviation) in the 50-70th percentile of all path costs.
+
+        We should keep track of total interestingness along all paths searched, then go the 50-70th percentile of
+        current paths.
+
+        deviation = [
+              0    1    2    3
+        0    [0.1, 0.2, 0.3, 0.4],
+        1    [0.2, 0.9, 0.1, 0.1],
+        2    [0.1, 0.2, 0.1, 0.1],
+        3    [0.2, 0.2, 0.3, 0.1],]
+
+        #     0.6  1.5  0.8  0.7
+
+        q = 0.2=(0,1), 0.3=(0,2)
+
+        totals = [0.1, 1.1, 0.4, 0.4]
+
+        q = 0.1=(2,2), 0.1=(1,3)
+
+        totals = [0.1, 1.1, 0.5, 0.5]
+
+        q = 0.1=(0,2), 0.1=(1,3)
+
+        totals = [0.1, 1.1, 0.8, 0.6]
+
+        * take the transformer's input sequence of z,a embeddings and output deviations as input to beam search
+          (note that deviation is the predicted output prob change and is the proxy we are using for uncertainty)
+        * for saliency level zero, just concatenate state and action embeddings for input to the transformer,
+          get the action that corresponds to each output state by forwarding it through the dvq decoder. We need to
+          learn an action embedding for this.
+          in batch(es) and getting the closest action embedding to the decoded one
+        * sum the z deviations to the appropriate trajectories to get total deviation.
+        * add these deviations to _all_ encountered sorted deviations
+            * try naive unoptimal way first though since we don't have that many branches)
+            * If we need to optimize, use TORCH.SEARCHSORTED
+                * insert new action_deviations with torch.cat - but also keep track of the associated sequence index in another
+                  (unsorted) dimension of the the action_deviations pool
+            * sequences just get appended to and are not sorted, so sequence index can be static.
+        * get topk_interesting(action_deviations, k) output indexes - (nb. interesting is defined as within 50-75pct
+          uncertainty)
+        * feed the corresponding z,a embeddings at those indexes back into the transformer at the end of the
+          current sequence (nb. we are simulating the env in the transformer)
+        * get new states and deviations for the next level of the tree
+        * when we build up a pool of transformer i/o that reaches some desired max size in GPU memory, get the most
+          interesting trajectory and select the return the first action of that trajectory
+        * for the zeroth saliency level, just get the action part of the embedding, for higher levels, run the embedding through
+          the dvq for that level to get the representation for the level below, and so on until level zero.
+        * we can now throw away the search tree
+        * once the action is taken, we will get one new state to train on
+        * with that state, we shift the sequence window of the transformer forward and train one new batch
+        * now get updated transformer output with the current sequence and can repeat the above
+        * in tandem, we should be storing new observations from the environment in a pool that will be used as
+          a batch to train the dvq online. this will mean that the embedding centroids will change and that the transformer
+          will be associating moving centroids (different points) with the same output indexes over time. if this is
+          a problem, we will need to train the dvq on bigger batches and try to pretrain it with some videos
+          https://arxiv.org/abs/1805.11592 or pretrained agents perhaps
+          (TODO: Ask Aditya Ramesh about this as he tried it with DALL-E and didn't notice improvement, but if it still
+           worked then is great for us as our data is not I.I.D.).
+        """
+
+        # TODO:
+        #   - Get action embeddings
+        #   - Concatenate with z from dvq
+
+        action_emb = self.action_emb(a_buff)
+
+        deviations = run_through_transformer()
+
+        beam_i = topk_interesting(deviations, k=beam_batch_size)
+        # get actions associated with beam_i using decoder IN A BATCH
+        # add these actions to appropriate sequences
+        # add the new deviations for actions _after_ i.
+
+        #    0.6  0.8  0.8  0.7
+        pass
+
 
 def cli_main():
     parser = argparse.ArgumentParser()
@@ -406,6 +529,7 @@ def cli_main():
     parser = pl.Trainer.add_argparse_args(parser)
     args = parser.parse_args()
 
+    wandb.init(entity='crizcraig', save_code=True)  # TODO: Try comet for code saving, it looks like it saves and does diffs on everything, not just this file
     wandb.watch(model)
 
     wandb_logger = WandbLogger()
@@ -415,7 +539,7 @@ def cli_main():
     """
     Algo
 
-    Fill up replay buffer for a while, taking random actions to start.
+    Fill up replay buffer for a while, taking random actions to start. .populate()
 
     Train the dvq on the replay buffer randomly shuffled.
 
@@ -425,7 +549,7 @@ def cli_main():
 
     # annealing schedules for lots of constants
     callbacks = [ModelCheckpoint(monitor='val_recon_loss', mode='min'), DecayLR()]
-    if args.vq_flavor == 'gumbel':  # Not used yet
+    if False and args.dvq_vq_flavor == 'gumbel':  # Not used yet
        callbacks.extend([DecayTemperature(), RampBeta()])
     trainer = pl.Trainer.from_argparse_args(args, callbacks=callbacks, max_steps=100_000_000, logger=wandb_logger)
 
@@ -448,9 +572,6 @@ def cli_main():
     t1 = time.time()
     log.info("%d epochs took %fs, or %fs/epoch" % (args.num_epochs, t1 - t0, (t1 - t0) / args.num_epochs))
 
-
-
-
     # save checkpoints based on avg_reward
     checkpoint_callback = ModelCheckpoint(save_top_k=1, monitor="max_interesting", mode="max", period=1, verbose=True)
 
@@ -460,6 +581,36 @@ def cli_main():
     trainer.fit(model)
 
     # end standard mingpt training
+
+
+class ProcessFrame84Color(ObservationWrapper):
+    """preprocessing images from env"""
+
+    def __init__(self, env=None):
+        if not _OPENCV_AVAILABLE:  # pragma: no cover
+            raise ModuleNotFoundError('This class uses OpenCV which it is not installed yet.')
+
+        super(ProcessFrame84Color, self).__init__(env)
+        self.observation_space = gym.spaces.Box(low=0, high=255, shape=(84, 84, 3), dtype=np.uint8)
+
+    def observation(self, obs):
+        """preprocess the obs"""
+        return ProcessFrame84Color.process(obs)
+
+    @staticmethod
+    def process(frame):
+        """image preprocessing, formats to 84x84"""
+        if frame.size == 210 * 160 * 3:
+            img = np.reshape(frame, [210, 160, 3]).astype(np.float32)
+        elif frame.size == 250 * 160 * 3:
+            img = np.reshape(frame, [250, 160, 3]).astype(np.float32)
+        else:
+            assert False, "Unknown resolution."
+        # img = img[:, :, 0] * 0.299 + img[:, :, 1] * 0.587 + img[:, :, 2] * 0.114
+        resized_screen = cv2.resize(img, (84, 110), interpolation=cv2.INTER_AREA)
+        x_t = resized_screen[18:102, :]
+        # x_t = np.reshape(x_t, [84, 84, 3])
+        return x_t  # .astype(np.uint8)  # we convert to float32 in ScaledFloatFrame so just leave as float
 
 if __name__ == '__main__':
     cli_main()

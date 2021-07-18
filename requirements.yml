@@ -1,7 +1,7 @@
 name: lm
 # conda env create -f requirements.yml
-# then conda activate dl
-# to remove, simply do conda env remove -n dl
+# then conda activate lm
+# to remove, simply do conda env remove -n lm
 channels:
 - anaconda # default one
 - pytorch # necessary for pytorch and torchvision
@@ -18,3 +18,5 @@ dependencies:
 - pip:
   - scikit-learn==0.20.0
   - opencv-contrib-python==4.0.0.21
+  - pytorch-lightning
+  - scipy

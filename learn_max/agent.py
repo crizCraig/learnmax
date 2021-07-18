@@ -1,32 +1,38 @@
+import os
 from collections import deque
 from typing import List
 
 import numpy as np
 import torch
-import torch.nn.functional as F
-from pl_bolts.models.rl.common.agents import Agent
-
-from learn_max.dvq.vqvae import VQVAE
-from learn_max.mingpt.model import GPT
 
 
 class LearnMaxAgent:
     """ Learn max agent that takes most interesting action using prediction uncertainty """
 
-    def __init__(self, dvq: VQVAE, gpt: GPT, num_search_steps=10):
-        self.dvq = dvq
-        self.gpt = gpt
-        self.z_buff = deque(maxlen=gpt.block_size)  # History of states for transformer
+    def __init__(self, model,
+                 num_actions: int,  # Number of discrete actions available
+                 num_environments: int = 1,
+                 num_search_steps: int = 10,  # Number of steps to beam search into predicted trajectories
+                 ):
+        self.model = model
+        self.num_actions = num_actions
+        self.num_search_steps = num_search_steps
+        self.s_buff = deque(maxlen=model.gpt_block_size)  # History of states for dvq
+        self.z_buff = deque(maxlen=model.gpt_block_size)  # History of states for transformer
+        self.a_buff = deque(maxlen=model.gpt_block_size)  # History of actions
+        self.num_environments = num_environments
 
     @torch.no_grad()
-    def __call__(self, states: torch.Tensor, prev_actions: torch.Tensor, device: str) -> List[int]:
+    def __call__(self, states: torch.Tensor, device: str, use_transformer: bool = False) -> List[int]:
         """
         Takes in the current state and returns the action based on the agents policy
 
         Args:
             states: current state of the environment
-            prev_actions: previous actions taken that led to `states`
             device: the device used for the current batch
+            use_transformer: Whether to get actions from transformer or just pick random actions for populating. This is
+                currently unused, but it may be worth moving the buffer logic into the model and keeping the agent
+                simple.
 
         Returns:
             action defined by policy
@@ -40,11 +46,6 @@ class LearnMaxAgent:
 
         # TODO: Ensure that we pass an action state to each Env and aren't passing actions to one env and states to
         #   another, etc...
-        action_states = torch.cat((prev_actions, states), 0)
-
-        # Get compressed / quantized action-state representation from discrete auto-encoder
-        x_hat, z_q_emb, latent_loss, z_q_ind = self.dvq(action_states)
-        z_buff.append(z_q_emb)
 
         # Ways to measure uncertainty / interestingness
         # - We have a deviation head on the transformer that tries to just learn this from prob changes over time
@@ -57,17 +58,24 @@ class LearnMaxAgent:
         #   the more keys a count dictionary would contain and the lower their constituent counts would be. This can
         #   be used to check the above heuristics.
 
-        # If we haven't filled buffer of actions, just return no-op
-        if len(z_buff) < z_buff.maxlen:
-            return noops()
+        # TODO: Consider moving this up to the lightning model
+        self.s_buff.append(states)
+        wait_to_init_dvq = self.model.training and len(self.s_buff) < self.s_buff.maxlen
+        if wait_to_init_dvq:
+            dvq_x = states
+        else:
+            dvq_x = torch.cat(tuple(self.s_buff))  # Stack states in 0th (batch) dimension
+        x_hat, z_q_emb, latent_loss, z_q_ind = self.model.dvq(dvq_x, wait_to_init=wait_to_init_dvq)
+        if not wait_to_init_dvq:
+            # z_q_emb will just be output of random weights before this
+            z_buff.append(z_q_emb)
 
-
-
-
-        # TODO: Search through tree of predicted action states to find most interesting future
-        #   Then forward that z=(a,s) through the decoder to get the action
-
-
+        # Return a random action if we haven't filled buffer of z states.
+        if len(self.z_buff) < self.z_buff.maxlen:
+            ret = self.get_random_action(states)
+        else:
+            # Search through tree of predicted z,a to find most interesting future
+            ret = self.model.beam_search(z_buff, self.a_buff)
 
         # # get the logits and pass through softmax for probability distribution
         # probabilities = F.softmax(self.net(states)).squeeze(dim=-1)
@@ -75,5 +83,18 @@ class LearnMaxAgent:
         #
         # # take the numpy values and randomly select action based on prob distribution
         # actions = [np.random.choice(len(prob), p=prob) for prob in prob_np]
+
+        # return actions
+        self.a_buff.append(ret)
+
+        return ret
+
+    def get_random_action(self, state: torch.Tensor) -> List[int]:
+        """returns a random action"""
+        actions = []
+
+        for i in range(len(state)):
+            action = np.random.randint(0, self.num_actions)
+            actions.append(action)
 
         return actions

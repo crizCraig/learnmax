@@ -61,9 +61,9 @@ class VQVAE(nn.Module):
         }[loss_flavor]
         self.recon_loss = ReconLoss
 
-    def forward(self, x):
+    def forward(self, x, wait_to_init=True):
         z = self.encoder(x)
-        z_q, latent_loss, ind = self.quantizer(z)
+        z_q, latent_loss, ind = self.quantizer(z, wait_to_init)
         x_hat = self.decoder(z_q)
         return x_hat, z_q, latent_loss, ind
 

@@ -87,18 +87,18 @@ class GPT(nn.Module):
 
     def __init__(self,
                  # model definition args
-                 vocab_size: int, # size of the vocabulary (number of possible tokens)
-                 block_size: int, # length of the model's context window in time
-                 n_layer: int, # depth of the model; number of Transformer blocks in sequence
-                 n_embd: int, # the "width" of the model, number of channels in each Transformer
-                 n_head: int, # number of heads in each multi-head attention inside each Transformer block
+                 vocab_size: int,  # size of the vocabulary (number of possible tokens)
+                 block_size: int,  # length of the model's context window in time
+                 n_layer: int,  # depth of the model; number of Transformer blocks in sequence
+                 embedding_dim: int,  # the "width" of the model, number of channels in each Transformer
+                 n_head: int,  # number of heads in each multi-head attention inside each Transformer block
                  # model optimization args
-                 learning_rate: float = 3e-4, # the base learning rate of the model
-                 weight_decay: float = 0.1, # amount of regularizing L2 weight decay on MatMul ops
-                 betas: Tuple[float, float] = (0.9, 0.95), # momentum terms (betas) for the Adam optimizer
-                 embd_pdrop: float = 0.1, # \in [0,1]: amount of dropout on input embeddings
-                 resid_pdrop: float = 0.1, # \in [0,1]: amount of dropout in each residual connection
-                 attn_pdrop: float = 0.1, # \in [0,1]: amount of dropout on the attention matrix
+                 learning_rate: float = 3e-4,  # the base learning rate of the model
+                 weight_decay: float = 0.1,  # amount of regularizing L2 weight decay on MatMul ops
+                 betas: Tuple[float, float] = (0.9, 0.95),  # momentum terms (betas) for the Adam optimizer
+                 embd_pdrop: float = 0.1,  # \in [0,1]: amount of dropout on input embeddings
+                 resid_pdrop: float = 0.1,  # \in [0,1]: amount of dropout in each residual connection
+                 attn_pdrop: float = 0.1,  # \in [0,1]: amount of dropout on the attention matrix
                  ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -109,15 +109,15 @@ class GPT(nn.Module):
         self.betas = betas
 
         # input embedding stem: drop(content + position)
-        self.tok_emb = nn.Embedding(vocab_size, n_embd)
-        self.pos_emb = nn.Parameter(torch.zeros(1, block_size, n_embd))
+        self.tok_emb = nn.Embedding(vocab_size, embedding_dim)
+        self.pos_emb = nn.Parameter(torch.zeros(1, block_size, embedding_dim))
         self.drop = nn.Dropout(embd_pdrop)
         # deep transformer: just a sequence of transformer blocks
-        self.blocks = nn.Sequential(*[Block(n_embd, block_size, n_head, attn_pdrop, resid_pdrop) for _ in range(n_layer)])
+        self.blocks = nn.Sequential(*[Block(embedding_dim, block_size, n_head, attn_pdrop, resid_pdrop) for _ in range(n_layer)])
         # decoder: at the end one more layernorm and decode the answers
-        self.ln_f = nn.LayerNorm(n_embd)
-        self.logit_p_head = nn.Linear(n_embd, vocab_size, bias=False) # no need for extra bias due to one in ln_f
-        self.deviation_head = nn.Linear(n_embd, vocab_size, bias=False)   # mean deviation
+        self.ln_f = nn.LayerNorm(embedding_dim)
+        self.logit_p_head = nn.Linear(embedding_dim, vocab_size, bias=False) # no need for extra bias due to one in ln_f
+        self.deviation_head = nn.Linear(embedding_dim, vocab_size, bias=False)   # mean deviation
 
         self.block_size = block_size
         self.apply(self._init_weights)
@@ -189,6 +189,7 @@ class GPT(nn.Module):
             {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0.0},
         ]
         optimizer = torch.optim.AdamW(optim_groups, lr=self.learning_rate, betas=self.betas)
+        self.optimizer = optimizer
         return optimizer
 
     def count_trajectories(self, targets):

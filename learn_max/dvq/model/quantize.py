@@ -35,7 +35,10 @@ class VQVAEQuantize(nn.Module):
 
         self.register_buffer('data_initialized', torch.zeros(1))
 
-    def forward(self, z):
+        # TODO: If we train the transformer and auto-encoder jointly, consider doing weight initialization in
+        #  the same way for both. Right now pytorch does the dvq, with the quantizer initialized with k-means.
+
+    def forward(self, z, wait_to_init):
         B, C, H, W = z.size()
 
         # project and flatten out space, so (B, C, H, W) -> (B*H*W, C)
@@ -44,7 +47,10 @@ class VQVAEQuantize(nn.Module):
         flatten = z_e.reshape(-1, self.embedding_dim)
 
         # DeepMind def does not do this but I find I have to... ;\
-        if self.training and self.data_initialized.item() == 0:
+        if not wait_to_init and self.training and self.data_initialized.item() == 0:
+            # TODO: We need to do this on the batch after performing some random actions, or just try random init.
+            #  If that doesn't work, we can try youtube videos, or use randomly drawn samples from a large replay
+            #  buffer to retrain.
             print('running kmeans!!') # data driven initialization for the embeddings
             rp = torch.randperm(flatten.size(0))
             kd = kmeans2(flatten[rp[:20000]].data.cpu().numpy(), self.n_embed, minit='points')
