@@ -2,8 +2,6 @@ import os
 import sys
 from datetime import datetime
 
-import neptune.new as neptune
-
 BLOCK_SIZE = 128  # spatial extent of the model for its context
 # NEPTUNE_RUN = neptune.init(project='crizcraig/safeobjective', api_token=os.environ['NEPTUNE_CREDS'])
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))

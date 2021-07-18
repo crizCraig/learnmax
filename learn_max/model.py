@@ -423,7 +423,7 @@ class LearnMax(pl.LightningModule):
 
         return arg_parser
 
-    def beam_search(self, z_buff, a_buff, beam_batch_size=64):
+    def beam_search(self, z_q_emb, a_buff, beam_batch_size=64):
         """
         Beam width should be batch size unless transformers combine batch + sequence trunk with the torch.tril mask
 
@@ -492,7 +492,7 @@ class LearnMax(pl.LightningModule):
         #   - Get action embeddings
         #   - Concatenate with z from dvq
 
-        action_emb = self.action_emb(a_buff)
+        action_emb = self.action_emb(torch.tensor(a_buff)).squeeze()  # B, emb_dim = 128, 512
 
         deviations = run_through_transformer()
 

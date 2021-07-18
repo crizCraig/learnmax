@@ -25,8 +25,8 @@ class VQVAEQuantize(nn.Module):
     def __init__(self, num_hiddens, n_embed, embedding_dim):
         super().__init__()
 
-        self.embedding_dim = embedding_dim
-        self.n_embed = n_embed
+        self.embedding_dim = embedding_dim  #  512
+        self.n_embed = n_embed  # 512
 
         self.kld_scale = 10.0
 
@@ -41,8 +41,8 @@ class VQVAEQuantize(nn.Module):
     def forward(self, z, wait_to_init):
         B, C, H, W = z.size()
 
-        # project and flatten out space, so (B, C, H, W) -> (B*H*W, C)
-        z_e = self.proj(z)
+        # project and flatten out space, so (B, out_conv_channels=128, H, W) -> (B*H*W, embedding_dim)
+        z_e = self.proj(z)  # C=128 => C=512
         z_e = z_e.permute(0, 2, 3, 1) # make (B, H, W, C)
         flatten = z_e.reshape(-1, self.embedding_dim)
 

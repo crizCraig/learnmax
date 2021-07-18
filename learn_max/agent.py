@@ -17,10 +17,17 @@ class LearnMaxAgent:
         self.model = model
         self.num_actions = num_actions
         self.num_search_steps = num_search_steps
-        self.s_buff = deque(maxlen=model.gpt_block_size)  # History of states for dvq
-        self.z_buff = deque(maxlen=model.gpt_block_size)  # History of states for transformer
+        self.s_buff = deque(maxlen=model.gpt_block_size)  # History of states
         self.a_buff = deque(maxlen=model.gpt_block_size)  # History of actions
+
+        # Start with noop:
+        #  https://github.com/mgbellemare/Arcade-Learning-Environment/blob/master/docs/manual/manual.pdf
+        self.a_buff.append([0] * num_environments)
+
         self.num_environments = num_environments
+
+        # Training stuff
+        self.dvq_ready = False
 
     @torch.no_grad()
     def __call__(self, states: torch.Tensor, device: str, use_transformer: bool = False) -> List[int]:
@@ -42,7 +49,6 @@ class LearnMaxAgent:
 
         if not isinstance(states, torch.Tensor):
             states = torch.tensor(states, device=device)
-        z_buff = self.z_buff
 
         # TODO: Ensure that we pass an action state to each Env and aren't passing actions to one env and states to
         #   another, etc...
@@ -60,22 +66,22 @@ class LearnMaxAgent:
 
         # TODO: Consider moving this up to the lightning model
         self.s_buff.append(states)
-        wait_to_init_dvq = self.model.training and len(self.s_buff) < self.s_buff.maxlen
-        if wait_to_init_dvq:
-            dvq_x = states
-        else:
+        dvq_batch_ready = self.model.training and len(self.s_buff) == self.s_buff.maxlen
+        if dvq_batch_ready:
             dvq_x = torch.cat(tuple(self.s_buff))  # Stack states in 0th (batch) dimension
-        x_hat, z_q_emb, latent_loss, z_q_ind = self.model.dvq(dvq_x, wait_to_init=wait_to_init_dvq)
-        if not wait_to_init_dvq:
-            # z_q_emb will just be output of random weights before this
-            z_buff.append(z_q_emb)
+            self.s_buff.clear()
+            self.dvq_ready = True  # dvq outputs are now based on some training
+        else:
+            dvq_x = states
+
+        x_hat, z_q_emb, latent_loss, z_q_ind = self.model.dvq(dvq_x, wait_to_init=not self.dvq_ready)
 
         # Return a random action if we haven't filled buffer of z states.
-        if len(self.z_buff) < self.z_buff.maxlen:
+        if not dvq_batch_ready:
             ret = self.get_random_action(states)
         else:
             # Search through tree of predicted z,a to find most interesting future
-            ret = self.model.beam_search(z_buff, self.a_buff)
+            ret = self.model.beam_search(z_q_emb, self.a_buff)
 
         # # get the logits and pass through softmax for probability distribution
         # probabilities = F.softmax(self.net(states)).squeeze(dim=-1)

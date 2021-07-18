@@ -3,23 +3,22 @@ Defines the full (PyTorch Lightning module) VQVAE, which incorporates an
 encoder, decoder and a quantize layer in the middle for the discrete bottleneck.
 """
 
-import os
 import math
 from argparse import ArgumentParser
 
-import torch
-from torch import nn, einsum
-import torch.nn.functional as F
-
 import pytorch_lightning as pl
+import torch
+import torch.nn.functional as F
 from pytorch_lightning.callbacks import ModelCheckpoint
+from torch import nn
 
 # from learn_max.dvq.data.cifar10 import CIFAR10Data
 from learn_max.dvq.model.deepmind_enc_dec import DeepMindEncoder, DeepMindDecoder
-from learn_max.dvq.model.openai_enc_dec import OpenAIEncoder, OpenAIDecoder
-from learn_max.dvq.model.openai_enc_dec import Conv2d as PatchedConv2d
-from learn_max.dvq.model.quantize import VQVAEQuantize, GumbelQuantize
 from learn_max.dvq.model.loss import Normal, LogitLaplace
+from learn_max.dvq.model.openai_enc_dec import Conv2d as PatchedConv2d
+from learn_max.dvq.model.openai_enc_dec import OpenAIEncoder, OpenAIDecoder
+from learn_max.dvq.model.quantize import VQVAEQuantize, GumbelQuantize
+
 
 # -----------------------------------------------------------------------------
 
@@ -78,7 +77,8 @@ class VQVAE(nn.Module):
         x, y = batch # hate that i have to do this here in the model
         x_hat, z_q, latent_loss, ind = self.forward(x)
         recon_loss = self.recon_loss.nll(x, x_hat)
-        self.log('val_recon_loss', recon_loss, prog_bar=True)
+        self.log('dvq_val_recon_loss', recon_loss, prog_bar=True)
+        self.log('dvq_latent_loss', latent_loss, prog_bar=True)
 
         # debugging: cluster perplexity. when perplexity == num_embeddings then all clusters are used exactly equally
         encodings = F.one_hot(ind, self.quantizer.n_embed).float().reshape(-1, self.quantizer.n_embed)
@@ -86,8 +86,8 @@ class VQVAE(nn.Module):
         print(avg_probs)
         perplexity = (-(avg_probs * torch.log(avg_probs + 1e-10)).sum()).exp()
         cluster_use = torch.sum(avg_probs > 0)
-        self.log('val_perplexity', perplexity, prog_bar=True)
-        self.log('val_cluster_use', cluster_use, prog_bar=True)
+        self.log('dvq_val_perplexity', perplexity, prog_bar=True)
+        self.log('dvq_val_cluster_use', cluster_use, prog_bar=True)
 
     def configure_optimizers(self):
 
