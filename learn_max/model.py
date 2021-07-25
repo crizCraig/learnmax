@@ -459,33 +459,32 @@ class LearnMax(pl.LightningModule):
           get the action that corresponds to each output state by forwarding it through the dvq decoder. We need to
           learn an action embedding for this.
           in batch(es) and getting the closest action embedding to the decoded one
-        * sum the z deviations to the appropriate trajectories to get total deviation.
-        * add these deviations to _all_ encountered sorted deviations
+        * add deviations to _all_ encountered sorted deviations
             * try naive unoptimal way first though since we don't have that many branches)
             * If we need to optimize, use TORCH.SEARCHSORTED
                 * insert new action_deviations with torch.cat - but also keep track of the associated sequence index in another
                   (unsorted) dimension of the the action_deviations pool
             * sequences just get appended to and are not sorted, so sequence index can be static.
         * get topk_interesting(action_deviations, k) output indexes - (nb. interesting is defined as within 50-75pct
-          uncertainty)
+          uncertainty) - however we may need to do 50-100pct to avoid state starvation
+        * limit the initial actions in the trajectory to ones with a predicted state that close to the one received from the sim
         * feed the corresponding z,a embeddings at those indexes back into the transformer at the end of the
-          current sequence (nb. we are simulating the env in the transformer)
-        * get new states and deviations for the next level of the tree
+          current sequence (nb. we are simulating the env in multiple future branches)
+        * get new states and deviations for the next level of the tree and add them to the sorted list according to above
         * when we build up a pool of transformer i/o that reaches some desired max size in GPU memory, get the most
-          interesting trajectory and select the return the first action of that trajectory
+          interesting trajectory and return the first action of that trajectory.
         * for the zeroth saliency level, just get the action part of the embedding, for higher levels, run the embedding through
           the dvq for that level to get the representation for the level below, and so on until level zero.
         * we can now throw away the search tree
-        * once the action is taken, we will get one new state to train on
-        * with that state, we shift the sequence window of the transformer forward and train one new batch
-        * now get updated transformer output with the current sequence and can repeat the above
-        * in tandem, we should be storing new observations from the environment in a pool that will be used as
-          a batch to train the dvq online. this will mean that the embedding centroids will change and that the transformer
-          will be associating moving centroids (different points) with the same output indexes over time. if this is
-          a problem, we will need to train the dvq on bigger batches and try to pretrain it with some videos
+        * add the previous state and action to the training batch for the transformer
+        * repeat the above search for the next action
+        * in tandem, store new observations from the environment in a batch to train the dvq online. this will mean
+          that the embedding centroids will change and that the transformer will be associating moving centroids
+          (different points) with the same output indexes over time. if this is a problem, we will need to train the
+          dvq on bigger batches and try to pretrain it with some videos
           https://arxiv.org/abs/1805.11592 or pretrained agents perhaps
-          (TODO: Ask Aditya Ramesh about this as he tried it with DALL-E and didn't notice improvement, but if it still
-           worked then is great for us as our data is not I.I.D.).
+          (TODO: Ask Aditya Ramesh about this as he tried training jointly with DALL-E and didn't notice improvement,
+           We don't need improvement, we just need this to deal with shifting input distributions.
         """
 
         # TODO:

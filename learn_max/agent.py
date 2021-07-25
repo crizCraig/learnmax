@@ -60,6 +60,9 @@ class LearnMaxAgent:
         #   This has the problem that some actions are just inherently stochastic. So it'd be addictive the way gambling
         #   is addictive to humans. This as opposed to the above, where we've already seen that uncertainty decreases
         #   over time even in the presence of random training data.
+        # - Compare the current window with the masked predictions for intermediate steps in the window, this gives us
+        #   the current uncertainty for the recent past. This is more useful for OOD / anomaly detection saying, okay
+        #   I'm in a really uncommon trajectory - stop, get help, or lower learning rate.
         # - Another way is a brute force - trajectory counting approach. The longer such trajectories are, the bigger
         #   the more keys a count dictionary would contain and the lower their constituent counts would be. This can
         #   be used to check the above heuristics.

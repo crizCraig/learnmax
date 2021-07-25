@@ -32,11 +32,16 @@ class DeepMindEncoder(nn.Module):
         super().__init__()
 
         self.net = nn.Sequential(
-            nn.Conv2d(input_channels, n_hid, 4, stride=2, padding=1),
+            nn.Conv2d(input_channels, n_hid,   4, stride=2, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(n_hid, 2*n_hid, 4, stride=2, padding=1),
+            nn.Conv2d(n_hid,          2*n_hid, 4, stride=2, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(2*n_hid, 2*n_hid, 3, padding=1),
+
+            # Extra conv to reduce image patch vocab size from 21x21 to 10x10
+            nn.Conv2d(2*n_hid,        2*n_hid, 4, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(2*n_hid,        2*n_hid, 3, padding=1),
             nn.ReLU(),
             ResBlock(2*n_hid, 2*n_hid//4),
             ResBlock(2*n_hid, 2*n_hid//4),
