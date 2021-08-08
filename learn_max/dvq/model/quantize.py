@@ -4,6 +4,7 @@ The critical quantization layers that we sandwich in the middle of the autoencod
 variable bottleneck and use various tricks (softening / straight-through estimators)
 to backpropagate through the sampling process.
 """
+import os
 
 import torch
 from torch import nn, einsum
@@ -22,59 +23,110 @@ class VQVAEQuantize(nn.Module):
     https://github.com/deepmind/sonnet/blob/v2/sonnet/src/nets/vqvae.py
     https://github.com/deepmind/sonnet/blob/v2/examples/vqvae_example.ipynb
     """
-    def __init__(self, num_hiddens, n_embed, embedding_dim):
+    def __init__(self, num_hiddens, n_embed, embedding_dim, patch_width=None):
         super().__init__()
 
-        self.embedding_dim = embedding_dim  #  512
-        self.n_embed = n_embed  # 512
+        self.embedding_dim = embedding_dim
+        self.n_embed = n_embed
 
         self.kld_scale = 10.0
 
-        self.proj = nn.Conv2d(num_hiddens, embedding_dim, 1)
+        self.output_proj = embedding_dim
+
+        if 'SINGLE_TOKEN' in os.environ:
+            self.proj = nn.Linear(embedding_dim, embedding_dim)  # Perhaps could be removed
+        else:
+            if 'SINGLE_TOKEN2' in os.environ:
+                self.output_proj = embedding_dim // patch_width ** 2
+            self.proj = nn.Conv2d(num_hiddens, self.output_proj, 1)
         self.embed = nn.Embedding(n_embed, embedding_dim)
 
         self.register_buffer('data_initialized', torch.zeros(1))
+
+        self.data_init_buffer = []
+        self.data_init_points = 0
 
         # TODO: If we train the transformer and auto-encoder jointly, consider doing weight initialization in
         #  the same way for both. Right now pytorch does the dvq, with the quantizer initialized with k-means.
 
     def forward(self, z, wait_to_init):
-        B, C, H, W = z.size()
+        if 'SINGLE_TOKEN' in os.environ:
+            B, E = z.size()  # B, Embed dim
+            z_e = self.proj(z)
+            flatten = z_e
+        else:
+            B, C, H, W = z.size()
+            z_e = self.proj(z)  #  (B, E, H, W)  # Output proj channels = E
+            z_e = z_e.permute(0, 2, 3, 1)  # make (B, H, W, E)  128, 8, 8, 64
+            if 'SINGLE_TOKEN2' in os.environ:
+                # Enlarge token size (embedding_dim) so that we get one image per token,
+                # instead of a grid of image patch tokens
+                z_e = z_e.reshape(B, self.embedding_dim)  # B * H * W, E => B, H * W * E
+                flatten = z_e
+            else:
+                flatten = z_e.reshape(-1, self.embedding_dim)  # 8192 (128*8*8), 64  and flatten out space, so (B, E, H, W) -> (B*H*W, E) - a bunch of embeddings
 
-        # project and flatten out space, so (B, out_conv_channels=128, H, W) -> (B*H*W, embedding_dim)
-        z_e = self.proj(z)  # C=128 => C=512
-        z_e = z_e.permute(0, 2, 3, 1) # make (B, H, W, C)
-        flatten = z_e.reshape(-1, self.embedding_dim)
-
-        # DeepMind def does not do this but I find I have to... ;\
+        # DeepMind def does not do this but I find I have to... ;/
+        # Works just as well with one point per cluster in single token regime which is somewhat sus.
         if not wait_to_init and self.training and self.data_initialized.item() == 0:
             # TODO: We need to do this on the batch after performing some random actions, or just try random init.
             #  If that doesn't work, we can try youtube videos, or use randomly drawn samples from a large replay
             #  buffer to retrain.
-            print('running kmeans!!') # data driven initialization for the embeddings
-            rp = torch.randperm(flatten.size(0))
-            kd = kmeans2(flatten[rp[:20000]].data.cpu().numpy(), self.n_embed, minit='points')
-            self.embed.weight.data.copy_(torch.from_numpy(kd[0]))
-            self.data_initialized.fill_(1)
+            print(f'kmeans batch {round(self.data_init_points/(self.n_embed * 64) * 100)}%')
+            if self.data_init_points < self.n_embed * 64:  # Let's ensure 64 points per cluster like Karpathy originally had
+                self.data_init_buffer.append(flatten)
+                self.data_init_points += flatten.size(0)
+            else:
+                # Stack data inits into tensor
+                print('running kmeans!!') # data driven initialization for the embeddings
+                init_data = torch.cat(self.data_init_buffer, dim=0)
+                # rp = torch.randperm(init_data.size(0))
+                kd = kmeans2(init_data.data.cpu().numpy(), self.n_embed, minit='points')  # flatten: 512,1024 vs 8192,64
+                # kd = kmeans2(init_data[rp[:20000]].data.cpu().numpy(), self.n_embed, minit='points')  # flatten: 512,1024 vs 8192,64
+                self.embed.weight.data.copy_(torch.from_numpy(kd[0]))
+                self.data_init_buffer.clear()
+                self.data_initialized.fill_(1)
             # TODO: this won't work in multi-GPU setups
 
+        # Extract indexes from embedding and computes distance (similar to k-means here?)
         dist = (
             flatten.pow(2).sum(1, keepdim=True)
             - 2 * flatten @ self.embed.weight.t()
             + self.embed.weight.pow(2).sum(1, keepdim=True).t()
         )
         _, ind = (-dist).max(1)
-        ind = ind.view(B, H, W)
+        if 'SINGLE_TOKEN' not in os.environ and 'SINGLE_TOKEN2' not in os.environ:
+            # tensor([[[371, 371, 371,  ..., 371, 371, 371],
+            #          [371, 371, 371,  ..., 371, 371, 371],
+            #          [371, 371, 371,  ..., 371, 371, 371]]], device='cuda:0')
+            ind = ind.view(B, H, W)  # (128, 8, 8)
+        # Single token initial 128
+        # tensor([411, 411, 411, 411, 411, 411, 411, 411, 411, 411, 411, 411, 411, 411,
+        #         411, 411, 411, 411, 411, 411, 411, 411, 411, 411, 411, 411, 411, 411,
+        #         411, 411, 411, 411, 411, 411, 411, 411, 411, 411, 411, 411, 411, 411,
+        #         411, 411, 411, 411, 411, 411, 411, 411, 411, 411, 411, 411, 411, 411,
+        #         411, 411, 411, 411, 411, 411, 411, 411, 411, 411, 411, 411, 411, 411,
+        #         411, 411, 411, 411, 411, 411, 411, 411, 411, 411, 411, 411, 411, 411,
+        #         411, 411, 411, 411, 411, 411, 411, 411, 411, 411, 411, 411, 411, 411,
+        #         411, 411, 411, 411, 411, 411, 411, 411, 411, 411, 411, 411, 411, 411,
+        #         411, 411, 411, 411, 411, 411, 411, 411, 411, 411, 411, 411, 411, 411,
+        #         411, 411], device='cuda:0')
 
         # vector quantization cost that trains the embedding vectors
-        z_q = self.embed_code(ind) # (B, H, W, C)
+        z_q = self.embed_code(ind) # (B, H, W, C) (128, 8, 8, 64) OR ST2=> (B, E) (128, 4096)
         commitment_cost = 0.25
-        diff = commitment_cost * (z_q.detach() - z_e).pow(2).mean() + (z_q - z_e.detach()).pow(2).mean()
-        diff *= self.kld_scale
+        latent_loss = commitment_cost * (z_q.detach() - z_e).pow(2).mean() + (z_q - z_e.detach()).pow(2).mean()
+        latent_loss *= self.kld_scale
 
         z_q = z_e + (z_q - z_e).detach() # noop in forward pass, straight-through gradient estimator in backward pass
-        z_q = z_q.permute(0, 3, 1, 2) # stack encodings into channels again: (B, C, H, W)
-        return z_q, diff, ind
+        if 'SINGLE_TOKEN2' in os.environ:
+            # Had 128 * 64 = B * W **2, E
+            # Now we have B, W ** 2 * C = 128,
+            z_q = z_q.reshape(B, H, W, self.output_proj)  # (B, E) = (B, H*W*C) => (B, H, W, C)
+        if 'SINGLE_TOKEN' not in os.environ:
+            z_q = z_q.permute(0, 3, 1, 2) # stack encodings into channels again: (B, C, H, W)
+
+        return z_q, latent_loss, ind
 
     def embed_code(self, embed_id):
         return F.embedding(embed_id, self.embed.weight)

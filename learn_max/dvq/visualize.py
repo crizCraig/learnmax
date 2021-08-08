@@ -1,10 +1,13 @@
 
 # ok here we go
+import os
+
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
 
-from dvq.data.cifar10 import CIFAR10Data
+from learn_max.dvq.constants import SINGLE_TOKEN2_NUM_EMBEDDINGS
+from learn_max.data.cifar10 import CIFAR10Data
 
 class FakeArgs:
     pass
@@ -18,28 +21,41 @@ data_module = CIFAR10Data(args)
 val_loader = data_module.val_dataloader()
 x, y = next(iter(val_loader))
 
-
 plt.imshow(x[0].permute(1, 2, 0))
+# plt.imshow(x[0].permute(1, 2, 0) + 0.5)
 
 
-plt.imshow(x[0].permute(1, 2, 0) + 0.5)
-
-
-from vqvae import VQVAE#, DEFAULT_EMBEDDING_DIM, DEFAULT_NUM_EMBEDDINGS, DEFAULT_LOSS_FLAVOR, DEFAULT_NUM_HIDDEN
+from learn_max.dvq.vqvae import VQVAE#, DEFAULT_EMBEDDING_DIM, DEFAULT_NUM_EMBEDDINGS, DEFAULT_LOSS_FLAVOR, DEFAULT_NUM_HIDDEN
 args.vq_flavor = 'vqvae'
 args.enc_dec_flavor = 'deepmind'
-args.embedding_dim = 64
-args.num_embeddings = 512
+if 'SINGLE_TOKEN' in os.environ:
+    args.embedding_dim = 1024
+    args.num_embeddings = 8192
+elif 'SINGLE_TOKEN2' in os.environ:
+    args.embedding_dim = 4096
+    args.num_embeddings = SINGLE_TOKEN2_NUM_EMBEDDINGS
+else:
+    args.embedding_dim = 64
+    args.num_embeddings = 512
 args.loss_flavor = 'l2'
 args.n_hid = 64
-model = VQVAE.load_from_checkpoint('/home/c2/src/deep-vector-quantization/lightning_logs/version_40_clean_fix/checkpoints/epoch=99-step=38999.ckpt', args=args)
+
+if 'SINGLE_TOKEN' in os.environ:
+    model = VQVAE.load_from_checkpoint('/home/c2/src/deep-vector-quantization/lightning_logs/version_100/checkpoints/epoch=58-step=5722.ckpt', args=args)
+elif 'SINGLE_TOKEN2' in os.environ:
+    model = VQVAE.load_from_checkpoint('/home/c2/src/deep-vector-quantization/lightning_logs/version_152/checkpoints/epoch=54-step=21449.ckpt', args=args)
+
+else:
+    model = VQVAE.load_from_checkpoint(
+        '/home/c2/src/deep-vector-quantization/lightning_logs/version_151/checkpoints/epoch=98-step=38609.ckpt',
+        args=args)
 
 
 model.cuda()
 x = x.cuda()
 
 
-x_hat, z_q, latent_loss, ind = model(x)
+x_hat, latent_loss, ind = model(x)
 
 
 xcols = torch.cat([x, x_hat], axis=2) # side by side x_pre and xhat
@@ -47,7 +63,7 @@ xrows = torch.cat([xcols[i] for i in range(x.size(0))], axis=2)
 
 
 plt.figure(figsize=(20, 5))
-plt.imshow((xrows.data.cpu().permute(1, 2, 0)).clamp(0, 1))
+plt.imshow((xrows.data.cpu().permute(1, 2, 0)+0.5).clamp(0, 1))
 plt.axis('off')
 
 plt.show()

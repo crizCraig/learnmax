@@ -3,22 +3,24 @@ Defines the full (PyTorch Lightning module) VQVAE, which incorporates an
 encoder, decoder and a quantize layer in the middle for the discrete bottleneck.
 """
 
+import os
 import math
 from argparse import ArgumentParser
 
-import pytorch_lightning as pl
 import torch
+from torch import nn, einsum
 import torch.nn.functional as F
+
+import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
-from torch import nn
 
-# from learn_max.dvq.data.cifar10 import CIFAR10Data
+from learn_max.dvq.constants import SINGLE_TOKEN2_NUM_EMBEDDINGS
+from learn_max.data.cifar10 import CIFAR10Data
 from learn_max.dvq.model.deepmind_enc_dec import DeepMindEncoder, DeepMindDecoder
-from learn_max.dvq.model.loss import Normal, LogitLaplace
-from learn_max.dvq.model.openai_enc_dec import Conv2d as PatchedConv2d
 from learn_max.dvq.model.openai_enc_dec import OpenAIEncoder, OpenAIDecoder
+from learn_max.dvq.model.openai_enc_dec import Conv2d as PatchedConv2d
 from learn_max.dvq.model.quantize import VQVAEQuantize, GumbelQuantize
-
+from learn_max.dvq.model.loss import Normal, LogitLaplace
 
 # -----------------------------------------------------------------------------
 
@@ -42,15 +44,24 @@ class VQVAE(nn.Module):
             'deepmind': (DeepMindEncoder, DeepMindDecoder),
             'openai': (OpenAIEncoder, OpenAIDecoder),
         }[enc_dec_flavor]
-        self.encoder = Encoder(input_channels=input_channels, n_hid=n_hid)
-        self.decoder = Decoder(n_init=embedding_dim, n_hid=n_hid, output_channels=input_channels)
+        self.encoder = Encoder(input_channels=input_channels, n_hid=n_hid, input_width=32,
+                               embedding_dim=embedding_dim)
+
+        if 'SINGLE_TOKEN2' in os.environ:
+            decoder_init = embedding_dim // self.encoder.out_width ** 2
+        else:
+            decoder_init = embedding_dim
+
+        self.decoder = Decoder(encoder=self.encoder, n_init=decoder_init, n_hid=n_hid,
+                               output_channels=input_channels, embedding_dim=embedding_dim)
 
         # the quantizer module sandwiched between them, +contributes a KL(posterior || prior) loss to ELBO
         QuantizerModule = {
             'vqvae': VQVAEQuantize,
             'gumbel': GumbelQuantize,
         }[vq_flavor]
-        self.quantizer = QuantizerModule(self.encoder.output_channels, num_embeddings, embedding_dim)
+        self.quantizer = QuantizerModule(self.encoder.output_channels, num_embeddings, embedding_dim,
+                                         patch_width=self.encoder.out_width)
 
         # the data reconstruction loss in the ELBO
         ReconLoss = {
@@ -62,8 +73,11 @@ class VQVAE(nn.Module):
 
     def forward(self, x, wait_to_init=True):
         z = self.encoder(x)
-        z_q, latent_loss, ind = self.quantizer(z, wait_to_init)
-        x_hat = self.decoder(z_q)
+        z_q, latent_loss, ind = self.quantizer(z, wait_to_init)  # zq 128, 64, 8, 8 vs 128, 1024
+        if self.training or 'SINGLE_TOKEN2' not in os.environ:
+            x_hat = self.decoder(z_q)  # zq is B, Embed dim, H, W
+        else:
+            x_hat = self.decoder(z)
         return x_hat, z_q, latent_loss, ind
 
     def training_step(self, batch, batch_idx):
@@ -115,8 +129,9 @@ class VQVAE(nn.Module):
         inter_params = decay & no_decay
         union_params = decay | no_decay
         assert len(inter_params) == 0, "parameters %s made it into both decay/no_decay sets!" % (str(inter_params), )
-        assert len(param_dict.keys() - union_params) == 0, "parameters %s were not separated into either decay/no_decay set!" \
-                                                    % (str(param_dict.keys() - union_params), )
+        assert (len(param_dict.keys() - union_params) == 0,
+                "parameters %s were not separated into either decay/no_decay set!" % (
+                str(param_dict.keys() - union_params),))
 
         # create the pytorch optimizer object
         optim_groups = [
@@ -136,8 +151,18 @@ class VQVAE(nn.Module):
         parser.add_argument("--enc_dec_flavor", type=str, default='deepmind', choices=['deepmind', 'openai'])
         parser.add_argument("--loss_flavor", type=str, default='l2', choices=['l2', 'logit_laplace'])
         # model size
-        parser.add_argument("--num_embeddings", type=int, default=512, help="vocabulary size; number of possible discrete states")
-        parser.add_argument("--embedding_dim", type=int, default=64, help="size of the vector of the embedding of each discrete token")
+        if 'SINGLE_TOKEN' in os.environ:
+            default_embedding_dim = 1024
+            default_num_embeddings = 8192
+        elif 'SINGLE_TOKEN2' in os.environ:
+            default_embedding_dim = 4096
+            default_num_embeddings = SINGLE_TOKEN2_NUM_EMBEDDINGS
+        else:
+            default_embedding_dim = 64
+            default_num_embeddings = 512
+
+        parser.add_argument("--num_embeddings", type=int, default=default_num_embeddings, help="vocabulary size; number of possible discrete states")
+        parser.add_argument("--embedding_dim", type=int, default=default_embedding_dim, help="size of the vector of the embedding of each discrete token")
         parser.add_argument("--n_hid", type=int, default=64, help="number of channels controlling the size of the model")
         return parser
 
@@ -187,7 +212,7 @@ def cli_main():
     # dataloader related
     parser.add_argument("--data_dir", type=str, default='/apcv/users/akarpathy/cifar10')
     parser.add_argument("--batch_size", type=int, default=128)
-    parser.add_argument("--num_workers", type=int, default=8)
+    parser.add_argument("--num_workers", type=int, default=0)
     # done!
     args = parser.parse_args()
     # -------------------------------------------------------------------------
@@ -197,7 +222,7 @@ def cli_main():
 
     # annealing schedules for lots of constants
     callbacks = []
-    callbacks.append(ModelCheckpoint(monitor='val_recon_loss', mode='min'))
+    callbacks.append(ModelCheckpoint(monitor='dvq_val_recon_loss', mode='min', save_top_k=3))
     callbacks.append(DecayLR())
     if args.vq_flavor == 'gumbel':
        callbacks.extend([DecayTemperature(), RampBeta()])

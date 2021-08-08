@@ -104,6 +104,7 @@ class OpenAIEncoder(nn.Module):
         ]))
 
         self.output_channels = 8 * self.n_hid
+        # self.output_stide = 8
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if len(x.shape) != 4:

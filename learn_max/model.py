@@ -493,7 +493,7 @@ class LearnMax(pl.LightningModule):
 
         action_emb = self.action_emb(torch.tensor(a_buff)).squeeze()  # B, emb_dim = 128, 512
 
-        deviations = run_through_transformer()
+        deviations = self.gpt()
 
         beam_i = topk_interesting(deviations, k=beam_batch_size)
         # get actions associated with beam_i using decoder IN A BATCH
