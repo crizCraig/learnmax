@@ -80,7 +80,7 @@ class LearnMaxAgent:
         x_hat, z_q_emb, latent_loss, z_q_ind = self.model.dvq(dvq_x, wait_to_init=not self.dvq_ready)
 
         # Return a random action if we haven't filled buffer of z states.
-        if not dvq_batch_ready:
+        if True or not dvq_batch_ready:
             ret = self.get_random_action(states)
         else:
             # Search through tree of predicted z,a to find most interesting future

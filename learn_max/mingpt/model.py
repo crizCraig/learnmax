@@ -25,19 +25,21 @@ class CausalSelfAttention(nn.Module):
     explicit implementation to show that there is nothing too scary here.
     """
 
-    def __init__(self, n_embd, block_size, n_head, attn_pdrop, resid_pdrop):
+    def __init__(self, embedding_dim, block_size, n_head, attn_pdrop, resid_pdrop, out_embedding_dim=None):
         super().__init__()
-        assert n_embd % n_head == 0
+        assert embedding_dim % n_head == 0
+        if out_embedding_dim is None:
+            out_embedding_dim = embedding_dim
         self.n_head = n_head
         # key, query, value projections for all heads
-        self.key = nn.Linear(n_embd, n_embd)
-        self.query = nn.Linear(n_embd, n_embd)
-        self.value = nn.Linear(n_embd, n_embd)
+        self.key = nn.Linear(embedding_dim, embedding_dim)
+        self.query = nn.Linear(embedding_dim, embedding_dim)
+        self.value = nn.Linear(embedding_dim, embedding_dim)
         # regularization
         self.attn_drop = nn.Dropout(attn_pdrop)
         self.resid_drop = nn.Dropout(resid_pdrop)
         # output projection
-        self.proj = nn.Linear(n_embd, n_embd)
+        self.proj = nn.Linear(embedding_dim, out_embedding_dim)
         # causal mask to ensure that attention is only applied to the left in the input sequence
         self.register_buffer("mask", torch.tril(torch.ones(block_size, block_size))
                                      .view(1, 1, block_size, block_size))
@@ -65,15 +67,15 @@ class CausalSelfAttention(nn.Module):
 class Block(nn.Module):
     """ an unassuming Transformer block """
 
-    def __init__(self, n_embd, block_size, n_head, attn_pdrop, resid_pdrop):
+    def __init__(self, embedding_dim, block_size, n_head, attn_pdrop, resid_pdrop, out_embedding_dim=None):
         super().__init__()
-        self.ln1 = nn.LayerNorm(n_embd)
-        self.ln2 = nn.LayerNorm(n_embd)
-        self.attn = CausalSelfAttention(n_embd, block_size, n_head, attn_pdrop, resid_pdrop)
+        self.ln1 = nn.LayerNorm(embedding_dim)
+        self.ln2 = nn.LayerNorm(embedding_dim)
+        self.attn = CausalSelfAttention(embedding_dim, block_size, n_head, attn_pdrop, resid_pdrop, out_embedding_dim)
         self.mlp = nn.Sequential(
-            nn.Linear(n_embd, 4 * n_embd),
+            nn.Linear(embedding_dim, 4 * embedding_dim),
             nn.GELU(),
-            nn.Linear(4 * n_embd, n_embd),
+            nn.Linear(4 * embedding_dim, embedding_dim),
             nn.Dropout(resid_pdrop),
         )
 
@@ -113,7 +115,8 @@ class GPT(nn.Module):
         self.pos_emb = nn.Parameter(torch.zeros(1, block_size, embedding_dim))
         self.drop = nn.Dropout(embd_pdrop)
         # deep transformer: just a sequence of transformer blocks
-        self.blocks = nn.Sequential(*[Block(embedding_dim, block_size, n_head, attn_pdrop, resid_pdrop) for _ in range(n_layer)])
+        self.blocks, self.scaling = self.init_blocks(attn_pdrop, block_size, embedding_dim, n_head, n_layer, resid_pdrop)
+
         # decoder: at the end one more layernorm and decode the answers
         self.ln_f = nn.LayerNorm(embedding_dim)
         self.logit_p_head = nn.Linear(embedding_dim, vocab_size, bias=False) # no need for extra bias due to one in ln_f
@@ -127,6 +130,26 @@ class GPT(nn.Module):
         self.max_trajectory_count = 0
 
         log.info("number of parameters: %e", sum(p.numel() for p in self.parameters()))
+
+    def init_blocks(self, attn_pdrop, block_size, embedding_dim, n_head, n_layer, resid_pdrop):
+        """
+        Here we allow different in/out neuron counts in each transformer layer aka block. Transformers usually
+        keep the same number of neurons at every layer, but a la Perceiver IO, these types of things can be changed
+        like any MLP. This was originally motivated here by OOM where reducing the output of the first layer
+        reduces the amount of memory used in all subsequent layers that use the reduced layer width.
+        """
+        blocks = []
+        approx_scale = [0.25] + [1] * (n_layer - 1)  # TODO: Allow passing this in
+        assert len(approx_scale) == n_layer
+        for l_i in range(n_layer):
+            if embedding_dim % n_head != 0:
+                # Make embedding dim divisible by number of heads
+                embedding_dim -= embedding_dim % n_head
+            out_embedding_dim = int(approx_scale[l_i] * embedding_dim)
+
+            blocks.append(Block(embedding_dim, block_size, n_head, attn_pdrop, resid_pdrop, out_embedding_dim))
+            embedding_dim = out_embedding_dim
+        return nn.Sequential(*blocks), approx_scale
 
     def get_block_size(self):
         return self.block_size

@@ -6,7 +6,7 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 
-from learn_max.dvq.constants import SINGLE_TOKEN2_NUM_EMBEDDINGS
+from learn_max.dvq.constants import SINGLE_TOKEN2_NUM_EMBEDDINGS, SINGLE_TOKEN2_EMBEDDING_DIM
 from learn_max.data.cifar10 import CIFAR10Data
 
 class FakeArgs:
@@ -32,7 +32,7 @@ if 'SINGLE_TOKEN' in os.environ:
     args.embedding_dim = 1024
     args.num_embeddings = 8192
 elif 'SINGLE_TOKEN2' in os.environ:
-    args.embedding_dim = 4096
+    args.embedding_dim = SINGLE_TOKEN2_EMBEDDING_DIM
     args.num_embeddings = SINGLE_TOKEN2_NUM_EMBEDDINGS
 else:
     args.embedding_dim = 64
@@ -47,7 +47,7 @@ elif 'SINGLE_TOKEN2' in os.environ:
 
 else:
     model = VQVAE.load_from_checkpoint(
-        '/home/c2/src/deep-vector-quantization/lightning_logs/version_151/checkpoints/epoch=98-step=38609.ckpt',
+        '/home/c2/src/learnmax/learn_max/lightning_logs/version_5/checkpoints/epoch=40-step=15989.ckpt',
         args=args)
 
 
@@ -55,7 +55,7 @@ model.cuda()
 x = x.cuda()
 
 
-x_hat, latent_loss, ind = model(x)
+x_hat, z_q, latent_loss, ind = model(x)
 
 
 xcols = torch.cat([x, x_hat], axis=2) # side by side x_pre and xhat

@@ -12,6 +12,7 @@ import pytorch_lightning as pl
 import torch
 import torch.backends.cudnn
 import wandb
+import matplotlib.pyplot as plt
 from gym import Env, ObservationWrapper
 from loguru import logger as log
 from pl_bolts.datamodules import ExperienceSourceDataset
@@ -38,29 +39,32 @@ from learn_max.mingpt.model import GPT
 class LearnMax(pl.LightningModule):
     def __init__(
             self,
-            embedding_dim: int = 512,  # length of embedding vectors output by dvq to transformers
+            # dvq_embedding_dim: int = 4410,  # length of embedding vectors output by dvq to transformers
+            embedding_dim: int = 4410,  # length we project dvq vectors to for processing within the transformer
+            num_embeddings: int = 512,  # Number of possible discrete states shared between dvq and gpt
 
             # TODO: Add more levels of transformers for salient events
 
             # dvq args - dvq = deep vector quantization
             dvq_n_hid: int = 64,  # number of channels controlling the size of the model
-            dvq_num_embeddings: int = 512,  # vocabulary size; number of possible discrete states
+            # dvq_num_embeddings: int = 512,   # now num_embeddings,  vocabulary size; number of possible discrete states
             dvq_loss_flavor: str = 'l2',  # `l2` or `logit_laplace`
             dvq_input_channels: int = 3,  # 3 for RGB
             dvq_enc_dec_flavor: str = 'deepmind',  # Deepmind VQVAE or OpenAI Dall-E dVAE
             dvq_vq_flavor: str = 'vqvae',  # `vqvae` or `gumbel`
+            dvq_quantize_proj: int = None,
 
             # mingpt model definition args
             # size of the vocabulary (number of possible tokens) -
             #  64 for Shakespeare
             #  8,192 in DALL·E images
             #  16,384 for DALL·E words
-            gpt_vocab_size: int = 64,
+            # gpt_vocab_size: int = 64,  # now num_embeddings
 
             # length of the model's context window in time
             gpt_block_size: int = 128,
             gpt_n_layer: int = 8,  # depth of the model; number of Transformer blocks in sequence
-            gpt_n_head: int = 8,  # number of heads in each multi-head attention inside each Transformer block
+            gpt_n_head: int = 10,  # number of heads in each multi-head attention inside each Transformer block
 
             # mingpt model optimization args
             gpt_learning_rate: float = 3e-4,  # the base learning rate of the model
@@ -83,6 +87,7 @@ class LearnMax(pl.LightningModule):
             # Standard stuff
             num_workers: int = 0,  # data loader workers
             data_dir: str = SAVE_DIR,  # place to save tfboard logs and checkpoints
+            batch_size: int = 32,  # do we have a batch size? or are gpt and dvq batch sizes adequate?
     ):
         """
         Maximizing learning by predicting interesting actions
@@ -110,7 +115,7 @@ class LearnMax(pl.LightningModule):
         # Hyperparameters
         self.dvq_embedding_dim = embedding_dim  # size of the embedding vector representing a cluster of embeddings
         self.dvq_n_hid = dvq_n_hid
-        self.dvq_num_embeddings = dvq_num_embeddings
+        self.dvq_num_embeddings = num_embeddings
         self.dvq_loss_flavor = dvq_loss_flavor
         self.dvq_input_channels = dvq_input_channels
         self.dvq_enc_dec_flavor = dvq_enc_dec_flavor
@@ -135,14 +140,26 @@ class LearnMax(pl.LightningModule):
         self.env_id = env_id
         self.warm_start_size = warm_start_size
         self.batches_per_epoch = batches_per_epoch
+
+        # RL / sensorimotor stuff
         self.num_workers = num_workers
         self.data_dir = data_dir
+        self.batch_size = batch_size
+        self.total_steps = 0
+        self.total_rewards = []
+        self.total_episode_steps = []
 
         self.save_hyperparameters()
 
+        self.dvq_optimizer = None
+        self.gpt_optimizer = None
+
+        # We use multiple optimizers so need to manually backward each one separately
+        self.automatic_optimization = False
+
         def make_env(_env_id):
             _env = gym.make(_env_id)
-            _env = MaxAndSkipEnv(_env)
+            # _env = MaxAndSkipEnv(_env)
             _env = FireResetEnv(_env)
 
             # These wrappers also convert to grayscale, which I think was done
@@ -171,6 +188,12 @@ class LearnMax(pl.LightningModule):
         self.obs_shape = self.env.observation_space.shape
         self.n_actions = self.env.action_space.n
 
+        # This action embedding will be concatenated with the dvq output. The first saliency level transformer
+        #  will then enumerate all actions for all possible dvq tokens for n_actions * n_embd total possible
+        #  outputs from the softmax. This allows selecting actions with the known next state.
+        #  Saliency levels above that will have abstract actions and therefore can't be enumerated.
+        #  Abstract actions will live in combined tokens along with abstract states. These tokens will be generated
+        #  by dvq's which take in z,a's below them.
         self.action_emb = nn.Embedding(self.n_actions, embedding_dim)
 
         self.apply(_init_weights)  # Should only be action embeddings, other weights are in dvq and gpt
@@ -186,10 +209,11 @@ class LearnMax(pl.LightningModule):
 
         self.state = self.env.reset()
 
-        self.dvq = VQVAE(n_hid=dvq_n_hid, num_embeddings=dvq_num_embeddings, embedding_dim=self.dvq_embedding_dim,
+        self.dvq = VQVAE(n_hid=dvq_n_hid, num_embeddings=num_embeddings, embedding_dim=self.dvq_embedding_dim,
                          loss_flavor=dvq_loss_flavor, input_channels=dvq_input_channels,
-                         enc_dec_flavor=dvq_enc_dec_flavor, vq_flavor=dvq_vq_flavor)
-        self.gpt = GPT(vocab_size=gpt_vocab_size, block_size=gpt_block_size, n_layer=gpt_n_layer,
+                         enc_dec_flavor=dvq_enc_dec_flavor, vq_flavor=dvq_vq_flavor, quantize_proj=dvq_quantize_proj)
+
+        self.gpt = GPT(vocab_size=num_embeddings, block_size=gpt_block_size, n_layer=gpt_n_layer,
                        embedding_dim=self.gpt_embedding_dim, n_head=gpt_n_head, learning_rate=gpt_learning_rate,
                        weight_decay=gpt_weight_decay, betas=gpt_betas, embd_pdrop=gpt_embd_pdrop,
                        resid_pdrop=gpt_resid_pdrop, attn_pdrop=gpt_attn_pdrop)
@@ -249,6 +273,8 @@ class LearnMax(pl.LightningModule):
         Returns:
             q values
         """
+
+        # Real forward is in agent currently.
         output = self.net(x)
         return output
 
@@ -298,7 +324,7 @@ class LearnMax(pl.LightningModule):
             if self.total_steps % self.batches_per_epoch == 0:
                 break
 
-    def training_step(self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx) -> OrderedDict:
+    def training_step(self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx, optimizer_idx) -> torch.Tensor:
         """
         Calculates loss based on the minibatch received
 
@@ -313,42 +339,53 @@ class LearnMax(pl.LightningModule):
         # calculates training loss
         # loss = dqn_loss(batch, self.net, self.target_net, self.gamma)
 
-        dvq_loss = self.dvq.training_step(batch, batch_idx)
-        self.gpt.step_('train', )
+        dvq_loss, recon_loss, latent_loss, x_hat = self.dvq.training_step(batch, batch_idx)
+
+        # We use multiple optimizers so need to manually backward each one separately
+        self.dvq_optimizer.zero_grad()
+        self.manual_backward(dvq_loss)
+        self.dvq_optimizer.step()
+
+        # self.gpt.step_('train', )
+
+        loss = dvq_loss
 
         if self.trainer.use_dp or self.trainer.use_ddp2:
             loss = loss.unsqueeze(0)
 
         self.log_dict({
-            "total_reward": self.total_rewards[-1],
+            "total_reward": self.total_rewards[-1] if self.total_rewards else 0,
             "avg_reward": self.avg_rewards,
             "train_loss": loss,
             "episodes": self.done_episodes,
-            "episode_steps": self.total_episode_steps[-1]
+            "episode_steps": self.total_episode_steps[-1] if self.total_episode_steps else 0,
+            "dvq_recon_loss": recon_loss,
+            "dvq_latent_loss": latent_loss,
         })
 
-        return OrderedDict[{
-            "loss": loss,
-            "avg_reward": self.avg_rewards,
-        }]
+        # return loss
+        # return OrderedDict({
+        #     "loss": loss,
+        #     "avg_reward": self.avg_rewards,
+        # })
 
-    def test_step(self, *args, **kwargs) -> Dict[str, torch.Tensor]:
-        """Evaluate the agent for 10 episodes"""
-        test_reward = self.run_n_episodes(self.test_env, 1, 0)
-        avg_reward = sum(test_reward) / len(test_reward)
-        return {"test_reward": avg_reward}
-
-    def test_epoch_end(self, outputs) -> Dict[str, torch.Tensor]:
-        """Log the avg of the test results"""
-        rewards = [x["test_reward"] for x in outputs]
-        avg_reward = sum(rewards) / len(rewards)
-        self.log("avg_test_reward", avg_reward)
-        return {"avg_test_reward": avg_reward}
+    # def test_step(self, *args, **kwargs) -> Dict[str, torch.Tensor]:
+    #     """Evaluate the agent for 10 episodes"""
+    #     test_reward = self.run_n_episodes(self.test_env, 1, 0)
+    #     avg_reward = sum(test_reward) / len(test_reward)
+    #     return {"test_reward": avg_reward}
+    #
+    # def test_epoch_end(self, outputs) -> Dict[str, torch.Tensor]:
+    #     """Log the avg of the test results"""
+    #     rewards = [x["test_reward"] for x in outputs]
+    #     avg_reward = sum(rewards) / len(rewards)
+    #     self.log("avg_test_reward", avg_reward)
+    #     return {"avg_test_reward": avg_reward}
 
     def configure_optimizers(self) -> List[Optimizer]:
-        dvq_optimizer = self.dvq.configure_optimizers()
-        gpt_optimizer = self.gpt.configure_optimizers()
-        return [dvq_optimizer, gpt_optimizer]
+        self.dvq_optimizer = self.dvq.configure_optimizers()
+        self.gpt_optimizer = self.gpt.configure_optimizers()
+        return [self.dvq_optimizer, self.gpt_optimizer]
 
     def _dataloader(self) -> DataLoader:
         """Initialize the Replay Buffer dataset used for retrieving experiences"""
@@ -387,6 +424,12 @@ class LearnMax(pl.LightningModule):
         return env
 
     @staticmethod
+    def add_model_specific_args(arg_parser: argparse.ArgumentParser, ) -> argparse.ArgumentParser:
+        # TODO: Add the VQVAE and GPT args here as well
+        arg_parser.add_argument("--dvq_quantize_proj", type=int, default=None)
+        return arg_parser
+
+    @staticmethod
     def add_reinforcement_learning_args(arg_parser: argparse.ArgumentParser, ) -> argparse.ArgumentParser:
         """
         Adds arguments for DQN model
@@ -406,7 +449,7 @@ class LearnMax(pl.LightningModule):
         arg_parser.add_argument(
             "--warm_start_size",
             type=int,
-            default=10_000,
+            default=int(os.getenv('WARM_START', 10_000)),
             help="how many samples do we use to fill our buffer at the start of training",
         )
 
@@ -504,12 +547,44 @@ class LearnMax(pl.LightningModule):
         pass
 
 
+def viz_dvq():
+    # model = LearnMax.load_from_checkpoint('/home/c2/src/learnmax/learn_max/wandb/run-20210819_112836-2sk8562w/files/learnmax-learn_max/2sk8562w/checkpoints/epoch=0-step=1179.ckpt')
+    # model = LearnMax.load_from_checkpoint('/home/c2/src/learnmax/learn_max/wandb/run-20210821_213732-ujs1wtib/files/learnmax-learn_max/ujs1wtib/checkpoints/epoch=0-step=1299.ckpt')
+    # model = LearnMax.load_from_checkpoint('/home/c2/src/learnmax/learn_max/wandb/run-20210822_114404-1hl1r5gh/files/learnmax-learn_max/1hl1r5gh/checkpoints/epoch=0-step=79.ckpt')
+    # model = LearnMax.load_from_checkpoint('/home/c2/src/learnmax/learn_max/wandb/run-20210822_122545-1vpms2wc/files/learnmax-learn_max/1vpms2wc/checkpoints/epoch=0-step=999.ckpt')
+    # model = LearnMax.load_from_checkpoint('/home/c2/src/learnmax/learn_max/wandb/run-20210823_122845-19bx2g56/files/learnmax-learn_max/19bx2g56/checkpoints/epoch=3-step=38899.ckpt')
+    model = LearnMax.load_from_checkpoint('/home/c2/src/learnmax/learn_max/wandb/run-20210824_140120-2w1glywq/files/learnmax-learn_max/2w1glywq/checkpoints/epoch=0-step=7399.ckpt')
+    model.cuda()
+    # model.cuda()
+
+    test_loader = model.test_dataloader()
+    x = next(iter(test_loader))
+    x = [t.cuda() for t in x]
+    loss, recon_loss, latent_loss, x_hat = model.dvq.training_step(x, 0)
+    # states, actions, rewards, dones, new_states = next(iter(test_loader))
+    # x = torch.cat([states, new_states])
+    xcols = torch.cat([x[0], x_hat[:32]], axis=2)  # side by side x_pre and xhat
+    xrows = torch.cat([xcols[i] for i in range(x[0].size(0))], axis=2)
+
+    plt.figure(figsize=(20, 5))
+    plt.imshow((xrows.data.cpu().permute(1, 2, 0) + 0.5).clamp(0, 1))
+    plt.axis('off')
+
+    plt.show()
+
 def cli_main():
     parser = argparse.ArgumentParser()
 
     # model args
     parser = LearnMax.add_reinforcement_learning_args(parser)
+    parser = LearnMax.add_model_specific_args(parser)
+    parser.add_argument('--viz_dvq', type=str, help="visualize dvq images", default=None)
     args = parser.parse_args()
+    
+    if args.viz_dvq is not None:
+        return viz_dvq()
+    else:
+        delattr(args, 'viz_dvq')
 
     torch.backends.cudnn.benchmark = True  # autotune kernels
 
@@ -525,6 +600,8 @@ def cli_main():
     parser.add_argument('-g', '--num_gpus', type=int, default=1, help="number of gpus to train on")
     parser.add_argument('-n', '--num_workers', type=int, default=0, help="number of workers for dataloading")
     parser.add_argument('-p', '--pin_memory', type=int, default=0, help="pin memory on dataloaders?")
+
+
     parser = pl.Trainer.add_argparse_args(parser)
     args = parser.parse_args()
 
@@ -534,6 +611,9 @@ def cli_main():
     wandb_logger = WandbLogger()
 
     log.info(json.dumps(vars(args), indent=0))
+
+
+
 
     """
     Algo
@@ -547,13 +627,14 @@ def cli_main():
     # -------------------- Standard dvq training
 
     # annealing schedules for lots of constants
-    callbacks = [ModelCheckpoint(monitor='val_recon_loss', mode='min'), DecayLR()]
+    callbacks = [ModelCheckpoint(monitor='dvq_recon_loss', mode='min', every_n_train_steps=100), DecayLR()]
     if False and args.dvq_vq_flavor == 'gumbel':  # Not used yet
        callbacks.extend([DecayTemperature(), RampBeta()])
     trainer = pl.Trainer.from_argparse_args(args, callbacks=callbacks, max_steps=100_000_000, logger=wandb_logger)
 
     trainer.fit(model)
 
+    return # TODO: GPT stuff below
 
     # -------------------- Standard mingpt training
     log.info("preparing the learning rate schedule")

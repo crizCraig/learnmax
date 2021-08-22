@@ -14,7 +14,7 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
 
-from learn_max.dvq.constants import SINGLE_TOKEN2_NUM_EMBEDDINGS
+from learn_max.dvq.constants import SINGLE_TOKEN2_NUM_EMBEDDINGS, SINGLE_TOKEN2_EMBEDDING_DIM
 from learn_max.data.cifar10 import CIFAR10Data
 from learn_max.dvq.model.deepmind_enc_dec import DeepMindEncoder, DeepMindDecoder
 from learn_max.dvq.model.openai_enc_dec import OpenAIEncoder, OpenAIDecoder
@@ -22,12 +22,17 @@ from learn_max.dvq.model.openai_enc_dec import Conv2d as PatchedConv2d
 from learn_max.dvq.model.quantize import VQVAEQuantize, GumbelQuantize
 from learn_max.dvq.model.loss import Normal, LogitLaplace
 
+if 'TRAIN_DVQ_ONLY' in os.environ:
+    dvq_module = pl.LightningModule
+else:
+    dvq_module = nn.Module
+
 # -----------------------------------------------------------------------------
 
-class VQVAE(nn.Module):
+class VQVAE(dvq_module):
 
     def __init__(self, n_hid=64, num_embeddings=512, embedding_dim=64, loss_flavor='l2',
-                 input_channels=3, enc_dec_flavor='deepmind', vq_flavor='vqvae'):
+                 input_channels=3, enc_dec_flavor='deepmind', vq_flavor='vqvae', quantize_proj=None):
         """
         @type n_hid: number of channels controlling the size of the model
         @type num_embeddings: vocabulary size; number of possible discrete states
@@ -47,12 +52,12 @@ class VQVAE(nn.Module):
         self.encoder = Encoder(input_channels=input_channels, n_hid=n_hid, input_width=32,
                                embedding_dim=embedding_dim)
 
-        if 'SINGLE_TOKEN2' in os.environ:
-            decoder_init = embedding_dim // self.encoder.out_width ** 2
-        else:
-            decoder_init = embedding_dim
+        # if 'SINGLE_TOKEN2' in os.environ:
+        #     decoder_init = embedding_dim // self.encoder.out_width ** 2
+        # else:
+        #     decoder_init = embedding_dim
 
-        self.decoder = Decoder(encoder=self.encoder, n_init=decoder_init, n_hid=n_hid,
+        self.decoder = Decoder(encoder=self.encoder, n_init=quantize_proj, n_hid=n_hid,
                                output_channels=input_channels, embedding_dim=embedding_dim)
 
         # the quantizer module sandwiched between them, +contributes a KL(posterior || prior) loss to ELBO
@@ -61,7 +66,7 @@ class VQVAE(nn.Module):
             'gumbel': GumbelQuantize,
         }[vq_flavor]
         self.quantizer = QuantizerModule(self.encoder.output_channels, num_embeddings, embedding_dim,
-                                         patch_width=self.encoder.out_width)
+                                         patch_width=self.encoder.out_width, output_proj=quantize_proj)
 
         # the data reconstruction loss in the ELBO
         ReconLoss = {
@@ -71,21 +76,25 @@ class VQVAE(nn.Module):
         }[loss_flavor]
         self.recon_loss = ReconLoss
 
-    def forward(self, x, wait_to_init=True):
+    def forward(self, x, wait_to_init=False):
         z = self.encoder(x)
         z_q, latent_loss, ind = self.quantizer(z, wait_to_init)  # zq 128, 64, 8, 8 vs 128, 1024
-        if self.training or 'SINGLE_TOKEN2' not in os.environ:
+        if True or self.training or 'SINGLE_TOKEN2' not in os.environ:
             x_hat = self.decoder(z_q)  # zq is B, Embed dim, H, W
         else:
             x_hat = self.decoder(z)
         return x_hat, z_q, latent_loss, ind
 
     def training_step(self, batch, batch_idx):
-        x, y = batch # hate that i have to do this here in the model
+        if len(batch) == 5:
+            s, a, r, d, s_next = batch
+            x = torch.cat([s, s_next])
+        else:
+            x, y = batch # hate that i have to do this here in the model
         x_hat, z_q, latent_loss, ind = self.forward(x)
         recon_loss = self.recon_loss.nll(x, x_hat)
         loss = recon_loss + latent_loss
-        return loss
+        return loss, recon_loss, latent_loss, x_hat
 
     def validation_step(self, batch, batch_idx):
         x, y = batch # hate that i have to do this here in the model
@@ -155,7 +164,7 @@ class VQVAE(nn.Module):
             default_embedding_dim = 1024
             default_num_embeddings = 8192
         elif 'SINGLE_TOKEN2' in os.environ:
-            default_embedding_dim = 4096
+            default_embedding_dim = SINGLE_TOKEN2_EMBEDDING_DIM
             default_num_embeddings = SINGLE_TOKEN2_NUM_EMBEDDINGS
         else:
             default_embedding_dim = 64
@@ -164,6 +173,7 @@ class VQVAE(nn.Module):
         parser.add_argument("--num_embeddings", type=int, default=default_num_embeddings, help="vocabulary size; number of possible discrete states")
         parser.add_argument("--embedding_dim", type=int, default=default_embedding_dim, help="size of the vector of the embedding of each discrete token")
         parser.add_argument("--n_hid", type=int, default=64, help="number of channels controlling the size of the model")
+        parser.add_argument("--dvq_quantize_proj", type=int, default=None)
         return parser
 
 # -----------------------------------------------------------------------------
@@ -196,7 +206,7 @@ class DecayLR(pl.Callback):
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx, dataloader_idx):
         # The step size is annealed from 1e10−4 to 1.25e10−6 over 1,200,000 updates. I use 3e-4
         t = cos_anneal(0, 1200000, 3e-4, 1.25e-6, trainer.global_step)
-        for g in pl_module.optimizer.param_groups:
+        for g in pl_module.dvq_optimizer.param_groups:
             g['lr'] = t
 
 def cli_main():
@@ -213,12 +223,14 @@ def cli_main():
     parser.add_argument("--data_dir", type=str, default='/apcv/users/akarpathy/cifar10')
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--num_workers", type=int, default=0)
+
     # done!
     args = parser.parse_args()
     # -------------------------------------------------------------------------
 
     data = CIFAR10Data(args)
-    model = VQVAE(args)
+    model = VQVAE(n_hid=args.n_hid, num_embeddings=args.num_embeddings, embedding_dim=args.embedding_dim,
+                  loss_flavor=args.loss_flavor, vq_flavor=args.vq_flavor, quantize_proj=args.dvq_quantize_proj)
 
     # annealing schedules for lots of constants
     callbacks = []
@@ -226,7 +238,7 @@ def cli_main():
     callbacks.append(DecayLR())
     if args.vq_flavor == 'gumbel':
        callbacks.extend([DecayTemperature(), RampBeta()])
-    trainer = pl.Trainer.from_argparse_args(args, callbacks=callbacks, max_steps=3000000)
+    trainer = pl.Trainer.from_argparse_args(args, callbacks=callbacks, max_steps=1) # 3000000)
 
     trainer.fit(model, data)
 

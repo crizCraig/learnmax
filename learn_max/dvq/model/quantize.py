@@ -23,7 +23,7 @@ class VQVAEQuantize(nn.Module):
     https://github.com/deepmind/sonnet/blob/v2/sonnet/src/nets/vqvae.py
     https://github.com/deepmind/sonnet/blob/v2/examples/vqvae_example.ipynb
     """
-    def __init__(self, num_hiddens, n_embed, embedding_dim, patch_width=None):
+    def __init__(self, num_hiddens, n_embed, embedding_dim, patch_width=None, output_proj=None):
         super().__init__()
 
         self.embedding_dim = embedding_dim
@@ -32,12 +32,17 @@ class VQVAEQuantize(nn.Module):
         self.kld_scale = 10.0
 
         self.output_proj = embedding_dim
+        self.patch_width = patch_width
 
         if 'SINGLE_TOKEN' in os.environ:
             self.proj = nn.Linear(embedding_dim, embedding_dim)  # Perhaps could be removed
         else:
             if 'SINGLE_TOKEN2' in os.environ:
-                self.output_proj = embedding_dim // patch_width ** 2
+                # self.output_proj = 16  #patch_width ** 2
+                if output_proj is not None:
+                    self.output_proj = output_proj
+                else:
+                    self.output_proj = embedding_dim // patch_width ** 2
             self.proj = nn.Conv2d(num_hiddens, self.output_proj, 1)
         self.embed = nn.Embedding(n_embed, embedding_dim)
 
@@ -61,19 +66,28 @@ class VQVAEQuantize(nn.Module):
             if 'SINGLE_TOKEN2' in os.environ:
                 # Enlarge token size (embedding_dim) so that we get one image per token,
                 # instead of a grid of image patch tokens
+
+                # 128, 8, 8, 64 CIFAR
+                # B, 21, 21, 8 Atari
+                # We want to get a batch of embeddings, so n 4096. We shouldn't project down so much, number 1.
+                # Fastest thing to do would be to resize, but CIFAR is 32x32 and we start out 84x84.
+                # So instead of proj going down from 64 to 8, we should go 64 to 10. Then the token size can be
+                # 10 * 441 = 4410.
                 z_e = z_e.reshape(B, self.embedding_dim)  # B * H * W, E => B, H * W * E
+
                 flatten = z_e
             else:
                 flatten = z_e.reshape(-1, self.embedding_dim)  # 8192 (128*8*8), 64  and flatten out space, so (B, E, H, W) -> (B*H*W, E) - a bunch of embeddings
 
         # DeepMind def does not do this but I find I have to... ;/
         # Works just as well with one point per cluster in single token regime which is somewhat sus.
-        if not wait_to_init and self.training and self.data_initialized.item() == 0:
+        if False and not wait_to_init and self.training and self.data_initialized.item() == 0:
             # TODO: We need to do this on the batch after performing some random actions, or just try random init.
             #  If that doesn't work, we can try youtube videos, or use randomly drawn samples from a large replay
             #  buffer to retrain.
-            print(f'kmeans batch {round(self.data_init_points/(self.n_embed * 64) * 100)}%')
-            if self.data_init_points < self.n_embed * 64:  # Let's ensure 64 points per cluster like Karpathy originally had
+            kmeans_points_per_cluster_init = 1 if os.getenv('QUICK_KMEANS') else 32 #  orig was 64 but i think even 1 works haha.
+            print(f'kmeans batch {round(self.data_init_points/(self.n_embed * kmeans_points_per_cluster_init) * 100)}%')
+            if self.data_init_points < self.n_embed * kmeans_points_per_cluster_init:  # Ensure enough points per cluster
                 self.data_init_buffer.append(flatten)
                 self.data_init_points += flatten.size(0)
             else:
