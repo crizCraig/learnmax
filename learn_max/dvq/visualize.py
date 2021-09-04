@@ -1,4 +1,4 @@
-
+# TODO: Delete this file. We do this in viz_dvq now to avoid fake args and stuff.
 # ok here we go
 import os
 
