@@ -40,8 +40,9 @@ class LearnMax(pl.LightningModule):
     def __init__(
             self,
             # dvq_embedding_dim: int = 4410,  # length of embedding vectors output by dvq to transformers
-            embedding_dim: int = 4410,  # length we project dvq vectors to for processing within the transformer
-            num_embeddings: int = 512,  # Number of possible discrete states shared between dvq and gpt
+
+            embedding_dim: int = None,
+            num_embeddings: int = None,  # Number of possible discrete states shared between dvq and gpt
 
             # TODO: Add more levels of transformers for salient events
 
@@ -111,7 +112,11 @@ class LearnMax(pl.LightningModule):
         [1] https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0036399
         """
         super().__init__()
+        self.is_single_token2 = single_token2
+        default_num_embeddings, default_embedding_dim = get_default_embeddings(self.is_single_token2)
 
+        if num_embeddings is None:
+            num_embeddings, embedding_dim = default_num_embeddings, default_embedding_dim
         # Hyperparameters
         self.dvq_embedding_dim = embedding_dim  # size of the embedding vector representing a cluster of embeddings
         self.dvq_n_hid = dvq_n_hid
@@ -691,6 +696,21 @@ class ProcessFrame84Color(ObservationWrapper):
         x_t = resized_screen[18:102, :]
         # x_t = np.reshape(x_t, [84, 84, 3])
         return x_t  # .astype(np.uint8)  # we convert to float32 in ScaledFloatFrame so just leave as float
+
+
+def get_default_embeddings(is_single_token2=False):
+    if is_single_token2:
+        # length we project dvq vectors to for processing within the transformer
+        # (large due to whole image reshaped into single token, no patches)
+        default_embedding_dim = 4410
+        # default_num_embeddings = 512
+        default_num_embeddings = 4096
+        # default_num_embeddings = 10 ** 4
+    else:
+        default_embedding_dim = 64
+        default_num_embeddings = 512
+    return default_num_embeddings, default_embedding_dim
+
 
 if __name__ == '__main__':
     cli_main()
