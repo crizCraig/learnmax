@@ -645,10 +645,10 @@ def cli_main():
     # -------------------- Standard dvq training
 
     # annealing schedules for lots of constants
-    callbacks = [ModelCheckpoint(monitor='dvq_recon_loss', mode='min', every_n_train_steps=100), DecayLR()]
+    callbacks = [ModelCheckpoint(monitor='dvq_recon_loss', mode='min', every_n_train_steps=1000, save_top_k=3), DecayLR()]
     if False and args.dvq_vq_flavor == 'gumbel':  # Not used yet
        callbacks.extend([DecayTemperature(), RampBeta()])
-    trainer = pl.Trainer.from_argparse_args(args, callbacks=callbacks, max_steps=100_000_000, logger=wandb_logger)
+    trainer = pl.Trainer.from_argparse_args(args, callbacks=callbacks, max_steps=5000, logger=wandb_logger, gpus=1)
 
     trainer.fit(model)
 
