@@ -30,7 +30,7 @@ from torch.utils.data import DataLoader
 
 from learn_max.agent import LearnMaxAgent
 from learn_max.utils import topk_interesting, _init_weights
-from learn_max.constants import SAVE_DIR, SEED
+from learn_max.constants import SAVE_DIR, SEED, DEBUGGING
 from learn_max.dvq.vqvae import VQVAE, DecayLR, DecayTemperature, RampBeta
 from learn_max.mingpt.lr_decay import WarmupCosineLearningRateDecay
 from learn_max.mingpt.model import GPT
@@ -80,13 +80,13 @@ class LearnMax(pl.LightningModule):
             epoch_len: int = 1000,  # how many batches before pseudo epoch
             gamma: float = 1,  # discount factor - only used for evaluation metrics right now
             n_steps: int = 1,  # number of steps to return from each environment at once
-            replay_size: int = 100_000,  # number of steps in the replay buffer
+            replay_size: int = 30_000,  # number of steps in the replay buffer - tune w/ system memory
             env_id: str = 'MontezumaRevenge-v0',  # gym environment tag
             warm_start_size: int = 10_000,  # how many samples do we use to fill our buffer at the start of training
             batches_per_epoch: int = 10_000,  # number of batches per pseudo (RL) epoch
 
             # Standard stuff
-            num_workers: int = 0,  # data loader workers
+            num_workers: int = 0 if DEBUGGING else 5,  # data loader workers - pycharm has issues debugging these
             data_dir: str = SAVE_DIR,  # place to save tfboard logs and checkpoints
             batch_size: int = 32,  # do we have a batch size? or are gpt and dvq batch sizes adequate?
 
@@ -319,6 +319,7 @@ class LearnMax(pl.LightningModule):
             exp = Experience(state=self.state, action=action[0], reward=r, done=is_done, new_state=next_state)
 
             self.buffer.append(exp)
+            # print(f'bufflen {len(self.buffer)}')
             self.state = next_state
 
             if is_done:
@@ -334,6 +335,11 @@ class LearnMax(pl.LightningModule):
 
             for idx, _ in enumerate(dones):
                 yield states[idx], actions[idx], rewards[idx], dones[idx], new_states[idx]
+
+            if self.total_steps % 1000 == 0:
+                from guppy import hpy
+                h = hpy()
+                print('heap stats', h.heap())
 
             # Simulates epochs
             if self.total_steps % self.batches_per_epoch == 0:
@@ -459,7 +465,7 @@ class LearnMax(pl.LightningModule):
         arg_parser.add_argument(
             "--replay_size",
             type=int,
-            default=100_000,
+            default=30_000,  # Tune with system memory
             help="capacity of the replay buffer",
         )
         arg_parser.add_argument(
@@ -570,7 +576,9 @@ def viz_dvq():
     # model = LearnMax.load_from_checkpoint('/home/c2/src/learnmax/learn_max/wandb/run-20210822_122545-1vpms2wc/files/learnmax-learn_max/1vpms2wc/checkpoints/epoch=0-step=999.ckpt')
     # model = LearnMax.load_from_checkpoint('/home/c2/src/learnmax/learn_max/wandb/run-20210823_122845-19bx2g56/files/learnmax-learn_max/19bx2g56/checkpoints/epoch=3-step=38899.ckpt')
     # model = LearnMax.load_from_checkpoint('/home/c2/src/learnmax/learn_max/wandb/run-20210824_140120-2w1glywq/files/learnmax-learn_max/2w1glywq/checkpoints/epoch=0-step=7399.ckpt')
-    model = LearnMax.load_from_checkpoint('/home/c2/src/learnmax/learn_max/wandb/run-20210904_101152-lem9tos6/files/learnmax-learn_max/lem9tos6/checkpoints/epoch=0-step=4799.ckpt')
+    ckpt = '/home/c2/src/learnmax/learn_max/wandb/run-20210906_120330-2y37nll3/files/learnmax-learn_max/2y37nll3/checkpoints/epoch=36-step=369999.ckpt'
+    print(f'visualizing {ckpt}')
+    model = LearnMax.load_from_checkpoint(ckpt)
     model.cuda()
     wandb.init(entity='crizcraig')
 
@@ -624,7 +632,7 @@ def cli_main():
 
     wandb.init(entity='crizcraig', save_code=True, name=input('\n\nExperiment name?\n\n'))  # TODO: Try comet for code saving, it looks like it saves and does diffs on everything, not just this file
 
-    wandb.watch(model)
+    # wandb.watch(model)  # causes OOM https://github.com/wandb/client/issues/2644
 
     wandb_logger = WandbLogger()
 
@@ -648,7 +656,14 @@ def cli_main():
     callbacks = [ModelCheckpoint(monitor='dvq_recon_loss', mode='min', every_n_train_steps=1000, save_top_k=3), DecayLR()]
     if False and args.dvq_vq_flavor == 'gumbel':  # Not used yet
        callbacks.extend([DecayTemperature(), RampBeta()])
-    trainer = pl.Trainer.from_argparse_args(args, callbacks=callbacks, max_steps=5000, logger=wandb_logger, gpus=1)
+
+    # Things to try
+    # More steps cos anneal goes to 1.2M! Not helping
+    # Fewer clusters, we're only using ~50 out of 4096: Resulted in blurry images
+    # Do k-means throughout training, not just once: works great! went from 10/20 to 19.5/20 correct images
+    # Output image, we can count images that are obviously wrong
+    # 10 points per cluster seemed to work better than 20, try 15, etc...: 15 works pretty well vs 20 and 10
+    trainer = pl.Trainer.from_argparse_args(args, callbacks=callbacks, max_steps=int(1.2e6), logger=wandb_logger, gpus=1)
 
     trainer.fit(model)
 
@@ -718,6 +733,7 @@ def get_default_embeddings(is_single_token2=False):
         default_embedding_dim = 4410
         # default_num_embeddings = 512
         default_num_embeddings = 4096
+        # default_num_embeddings = 64: Works horribly on zuma
         # default_num_embeddings = 10 ** 4
     else:
         default_embedding_dim = 64

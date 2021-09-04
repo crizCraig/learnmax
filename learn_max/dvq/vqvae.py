@@ -217,7 +217,7 @@ class DecayLR(pl.Callback):
             g['lr'] = t
 
 def cli_main():
-    # TODO: Delete this. Run VQVAE through its paraent LearnMax now
+    # TODO: Delete this. Run VQVAE through its parent LearnMax now
     pl.seed_everything(1337)
 
     # -------------------------------------------------------------------------

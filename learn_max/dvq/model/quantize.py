@@ -94,7 +94,7 @@ class VQVAEQuantize(nn.Module):
             # TODO: We need to do this on the batch after performing some random actions, or just try random init.
             #  If that doesn't work, we can try youtube videos, or use randomly drawn samples from a large replay
             #  buffer to retrain.
-            kmeans_points_per_cluster_init = 1 if os.getenv('QUICK_KMEANS') else 20 #  orig was 64 but i think even 1 works haha.
+            kmeans_points_per_cluster_init = 1 if os.getenv('QUICK_KMEANS') else 15 #  orig was 64 but i think even 1 works haha.
             print(f'kmeans batch {round(self.data_init_points/(self.n_embed * kmeans_points_per_cluster_init) * 100, 2)}%')
             if self.data_init_points < (self.n_embed * kmeans_points_per_cluster_init):  # Ensure enough points per cluster
                 self.data_init_buffer.append(flatten)
@@ -111,8 +111,14 @@ class VQVAEQuantize(nn.Module):
                 log.info(f'initial_centroid_spread {self.initial_centroid_spread}')
                 self.initial_point_spread = None # reset so we get post-kmeans
                 self.data_init_buffer.clear()
+                self.data_init_points = 0
                 self.data_initialized.fill_(1)
             # TODO: this won't work in multi-GPU setups
+
+        if self.forward_iter % 4000 == 0:
+            # This actually ends up happening every 2000 updates due to validation iters or something
+            # TODO: Use the global train step through a lightning hook like the learning rate
+            self.data_initialized.fill_(0)
 
         if self.initial_centroid_spread is not None:
             wandb.log({'initial_centroid_spread': self.initial_centroid_spread})
