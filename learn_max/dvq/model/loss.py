@@ -58,4 +58,7 @@ class Normal:
 
     @classmethod
     def nll(cls, x, mu):
+        # TODO: Try perceptual loss with RL bot. We cube here as Zuma has a mostly static background so outliers are important.
+        # return abs(((x - mu)**2).mean() / (2 * cls.data_variance)) #+ math.log(math.sqrt(2 * math.pi * cls.data_variance))
+        # Cubing did not work, made image green!
         return ((x - mu)**2).mean() / (2 * cls.data_variance) #+ math.log(math.sqrt(2 * math.pi * cls.data_variance))
