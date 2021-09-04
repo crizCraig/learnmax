@@ -33,15 +33,17 @@ class Normal:
     which I have added to the normalizer of the reconstruction loss in nll(), we'll report
     number that is half of what we expect in their jupyter notebook
     """
-    # data_variance = 0.06327039811675479 # cifar-10 data variance, from deepmind sonnet code
-    data_variance = 0.000006327039811675479 # cifar-10 data variance, from deepmind sonnet code
+    data_variance = 0.06327039811675479 # cifar-10 data variance, from deepmind sonnet code
+    # data_variance = 0.000006327039811675479 # cifar-10 data variance, from deepmind sonnet code
     # Currently we get distinct images flattening to single token with CFAR. Changing the
     # data variance gets us _more_ distinct images. This has the effect of increasing the reconstruction
     # importance in the loss. So it makes sense the reconstructions get better. But what is the
     # effect on the quantization? It means the distance to the cluster center is bigger perhaps.
-    # TODO: Try enabling k-means
-    # TODO: First try another 10x reduction in variance. THEN, try increasing quick kmeans points per cluster.
-    # THEN try changing the vocab size
+    # Turns out that reconstruction and latent loss get far worse with the data variance reduced so much.
+    # SO, we may try perceptual loss re the Learning Neural Representations DeepMind paper.
+    # This will involve training a patch based dvq with the original setup. Then we can hopefully
+    # get the same types of reconstructions in the single token regime.
+    # So this wasn't needed. We just needed more points per cluster in the k-means init
     mean = 0.5
 
     class InMap:
