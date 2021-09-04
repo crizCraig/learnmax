@@ -93,7 +93,8 @@ class VQVAE(dvq_module):
             x, y = batch # hate that i have to do this here in the model
         x_hat, z_q, latent_loss, ind = self.forward(x)
         recon_loss = self.recon_loss.nll(x, x_hat)
-        loss = recon_loss + latent_loss
+        quant_loss_mult = float(os.getenv('QUANT_LOSS_MULT', 1))
+        loss = recon_loss + quant_loss_mult * latent_loss
         return loss, recon_loss, latent_loss, x_hat
 
     def validation_step(self, batch, batch_idx):
