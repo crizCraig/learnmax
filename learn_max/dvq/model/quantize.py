@@ -80,14 +80,15 @@ class VQVAEQuantize(nn.Module):
                 flatten = z_e.reshape(-1, self.embedding_dim)  # 8192 (128*8*8), 64  and flatten out space, so (B, E, H, W) -> (B*H*W, E) - a bunch of embeddings
 
         # DeepMind def does not do this but I find I have to... ;/
-        # Works just as well with one point per cluster in single token regime which is somewhat sus.
-        if False and not wait_to_init and self.training and self.data_initialized.item() == 0:
+        # Works just as well with one point per cluster in single token CIFAR which is somewhat sus.
+        # HOWEVER, super important for Montezuma
+        if 'DISABLE_KMEANS' not in os.environ and self.training and self.data_initialized.item() == 0:
             # TODO: We need to do this on the batch after performing some random actions, or just try random init.
             #  If that doesn't work, we can try youtube videos, or use randomly drawn samples from a large replay
             #  buffer to retrain.
-            kmeans_points_per_cluster_init = 1 if os.getenv('QUICK_KMEANS') else 32 #  orig was 64 but i think even 1 works haha.
-            print(f'kmeans batch {round(self.data_init_points/(self.n_embed * kmeans_points_per_cluster_init) * 100)}%')
-            if self.data_init_points < self.n_embed * kmeans_points_per_cluster_init:  # Ensure enough points per cluster
+            kmeans_points_per_cluster_init = 1 if os.getenv('QUICK_KMEANS') else 20 #  orig was 64 but i think even 1 works haha.
+            print(f'kmeans batch {round(self.data_init_points/(self.n_embed * kmeans_points_per_cluster_init) * 100, 2)}%')
+            if self.data_init_points < (self.n_embed * kmeans_points_per_cluster_init):  # Ensure enough points per cluster
                 self.data_init_buffer.append(flatten)
                 self.data_init_points += flatten.size(0)
             else:
@@ -98,18 +99,32 @@ class VQVAEQuantize(nn.Module):
                 kd = kmeans2(init_data.data.cpu().numpy(), self.n_embed, minit='points')  # flatten: 512,1024 vs 8192,64
                 # kd = kmeans2(init_data[rp[:20000]].data.cpu().numpy(), self.n_embed, minit='points')  # flatten: 512,1024 vs 8192,64
                 self.embed.weight.data.copy_(torch.from_numpy(kd[0]))
+                self.initial_centroid_spread = self.get_centroid_spread()
+                log.info(f'initial_centroid_spread {self.initial_centroid_spread}')
+                self.initial_point_spread = None # reset so we get post-kmeans
                 self.data_init_buffer.clear()
                 self.data_initialized.fill_(1)
             # TODO: this won't work in multi-GPU setups
+
+        if self.initial_centroid_spread is not None:
+            wandb.log({'initial_centroid_spread': self.initial_centroid_spread})
 
         # Extract indexes from embedding and computes distance (similar to k-means here?)
         dist = (
             flatten.pow(2).sum(1, keepdim=True)
             - 2 * flatten @ self.embed.weight.t()
             + self.embed.weight.pow(2).sum(1, keepdim=True).t()
-        )
+        )  # this is the distance that's learned by the embedding table between each token and each centroid
+        # dimensions are (num_tokens, num_embeddings)
+        # TODO: First just see if we can set latent loss to zero and get good single token performance
+
         _, ind = (-dist).max(1)
-        if 'SINGLE_TOKEN' not in os.environ and 'SINGLE_TOKEN2' not in os.environ:
+        wandb.log({'unique_closest_clusters': torch.unique(ind).numel()})
+        if self.forward_iter % 100 == 0:
+            wandb.log({'centroid_spread': self.get_centroid_spread()})
+        # Dist between centroids
+        # Avg Dist betweeen points
+        if 'SINGLE_TOKEN' not in os.environ and not self.is_single_token2:
             # tensor([[[371, 371, 371,  ..., 371, 371, 371],
             #          [371, 371, 371,  ..., 371, 371, 371],
             #          [371, 371, 371,  ..., 371, 371, 371]]], device='cuda:0')
@@ -128,6 +143,13 @@ class VQVAEQuantize(nn.Module):
 
         # vector quantization cost that trains the embedding vectors
         z_q = self.embed_code(ind) # (B, H, W, C) (128, 8, 8, 64) OR ST2=> (B, E) (128, 4096)
+        point_spread = self.get_point_spread(z_e, z_q)
+        wandb.log({'point_spread': point_spread})
+        if self.initial_point_spread is None:
+            self.initial_point_spread = point_spread
+            log.info(f'initial_point_spread {self.initial_point_spread}')
+        wandb.log({'initial_point_spread': self.initial_point_spread})
+
         commitment_cost = 0.25
         latent_loss = commitment_cost * (z_q.detach() - z_e).pow(2).mean() + (z_q - z_e.detach()).pow(2).mean()
         latent_loss *= self.kld_scale
@@ -140,7 +162,16 @@ class VQVAEQuantize(nn.Module):
         if 'SINGLE_TOKEN' not in os.environ:
             z_q = z_q.permute(0, 3, 1, 2) # stack encodings into channels again: (B, C, H, W)
 
+        self.forward_iter += 1
         return z_q, latent_loss, ind
+
+    def get_point_spread(self, z_e, z_q):
+        return ((z_q - z_e) ** 2).sum(axis=1).sqrt().mean()
+
+    def get_centroid_spread(self):
+        num_distances_not_self = (self.n_embed ** 2 - self.n_embed)
+        centroid_spread = torch.cdist(self.embed.weight, self.embed.weight).sum() / num_distances_not_self
+        return centroid_spread
 
     def embed_code(self, embed_id):
         return F.embedding(embed_id, self.embed.weight)
