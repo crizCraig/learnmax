@@ -89,6 +89,8 @@ class LearnMax(pl.LightningModule):
             num_workers: int = 0,  # data loader workers
             data_dir: str = SAVE_DIR,  # place to save tfboard logs and checkpoints
             batch_size: int = 32,  # do we have a batch size? or are gpt and dvq batch sizes adequate?
+
+            single_token2: bool = False,
     ):
         """
         Maximizing learning by predicting interesting actions
@@ -214,14 +216,22 @@ class LearnMax(pl.LightningModule):
 
         self.state = self.env.reset()
 
-        self.dvq = VQVAE(n_hid=dvq_n_hid, num_embeddings=num_embeddings, embedding_dim=self.dvq_embedding_dim,
-                         loss_flavor=dvq_loss_flavor, input_channels=dvq_input_channels,
-                         enc_dec_flavor=dvq_enc_dec_flavor, vq_flavor=dvq_vq_flavor, quantize_proj=dvq_quantize_proj)
+        if self.is_single_token2:
+            self.dvq = VQVAE(n_hid=dvq_n_hid, num_embeddings=num_embeddings, embedding_dim=self.dvq_embedding_dim,
+                loss_flavor=dvq_loss_flavor, input_channels=dvq_input_channels,
+                enc_dec_flavor=dvq_enc_dec_flavor, vq_flavor=dvq_vq_flavor, quantize_proj=dvq_quantize_proj,
+                is_single_token2=self.is_single_token2)
+        else:
+            # TODO: Need to test that distance between clusters is further than avg distance between points in a cluster
+            self.dvq = VQVAE(n_hid=dvq_n_hid, num_embeddings=num_embeddings, embedding_dim=self.dvq_embedding_dim,
+                loss_flavor=dvq_loss_flavor, input_channels=dvq_input_channels,
+                enc_dec_flavor=dvq_enc_dec_flavor, vq_flavor=dvq_vq_flavor, quantize_proj=None,
+                is_single_token2=self.is_single_token2)
 
         self.gpt = GPT(vocab_size=num_embeddings, block_size=gpt_block_size, n_layer=gpt_n_layer,
-                       embedding_dim=self.gpt_embedding_dim, n_head=gpt_n_head, learning_rate=gpt_learning_rate,
-                       weight_decay=gpt_weight_decay, betas=gpt_betas, embd_pdrop=gpt_embd_pdrop,
-                       resid_pdrop=gpt_resid_pdrop, attn_pdrop=gpt_attn_pdrop)
+            embedding_dim=self.gpt_embedding_dim, n_head=gpt_n_head, learning_rate=gpt_learning_rate,
+            weight_decay=gpt_weight_decay, betas=gpt_betas, embd_pdrop=gpt_embd_pdrop,
+            resid_pdrop=gpt_resid_pdrop, attn_pdrop=gpt_attn_pdrop)
 
         self.agent = LearnMaxAgent(model=self, num_actions=self.env.action_space.n)
 
@@ -432,6 +442,7 @@ class LearnMax(pl.LightningModule):
     def add_model_specific_args(arg_parser: argparse.ArgumentParser, ) -> argparse.ArgumentParser:
         # TODO: Add the VQVAE and GPT args here as well
         arg_parser.add_argument("--dvq_quantize_proj", type=int, default=None)
+        arg_parser.add_argument("--single_token2", action='store_true', default=False)
         return arg_parser
 
     @staticmethod
@@ -558,9 +569,10 @@ def viz_dvq():
     # model = LearnMax.load_from_checkpoint('/home/c2/src/learnmax/learn_max/wandb/run-20210822_114404-1hl1r5gh/files/learnmax-learn_max/1hl1r5gh/checkpoints/epoch=0-step=79.ckpt')
     # model = LearnMax.load_from_checkpoint('/home/c2/src/learnmax/learn_max/wandb/run-20210822_122545-1vpms2wc/files/learnmax-learn_max/1vpms2wc/checkpoints/epoch=0-step=999.ckpt')
     # model = LearnMax.load_from_checkpoint('/home/c2/src/learnmax/learn_max/wandb/run-20210823_122845-19bx2g56/files/learnmax-learn_max/19bx2g56/checkpoints/epoch=3-step=38899.ckpt')
-    model = LearnMax.load_from_checkpoint('/home/c2/src/learnmax/learn_max/wandb/run-20210824_140120-2w1glywq/files/learnmax-learn_max/2w1glywq/checkpoints/epoch=0-step=7399.ckpt')
+    # model = LearnMax.load_from_checkpoint('/home/c2/src/learnmax/learn_max/wandb/run-20210824_140120-2w1glywq/files/learnmax-learn_max/2w1glywq/checkpoints/epoch=0-step=7399.ckpt')
+    model = LearnMax.load_from_checkpoint('/home/c2/src/learnmax/learn_max/wandb/run-20210904_101152-lem9tos6/files/learnmax-learn_max/lem9tos6/checkpoints/epoch=0-step=4799.ckpt')
     model.cuda()
-    # model.cuda()
+    wandb.init(entity='crizcraig')
 
     test_loader = model.test_dataloader()
     x = next(iter(test_loader))
@@ -610,7 +622,8 @@ def cli_main():
     parser = pl.Trainer.add_argparse_args(parser)
     args = parser.parse_args()
 
-    wandb.init(entity='crizcraig', save_code=True)  # TODO: Try comet for code saving, it looks like it saves and does diffs on everything, not just this file
+    wandb.init(entity='crizcraig', save_code=True, name=input('\n\nExperiment name?\n\n'))  # TODO: Try comet for code saving, it looks like it saves and does diffs on everything, not just this file
+
     wandb.watch(model)
 
     wandb_logger = WandbLogger()

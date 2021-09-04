@@ -32,7 +32,8 @@ else:
 class VQVAE(dvq_module):
 
     def __init__(self, n_hid=64, num_embeddings=512, embedding_dim=64, loss_flavor='l2',
-                 input_channels=3, enc_dec_flavor='deepmind', vq_flavor='vqvae', quantize_proj=None):
+                 input_channels=3, enc_dec_flavor='deepmind', vq_flavor='vqvae', quantize_proj=None,
+                 is_single_token2=False):
         """
         @type n_hid: number of channels controlling the size of the model
         @type num_embeddings: vocabulary size; number of possible discrete states
@@ -44,21 +45,24 @@ class VQVAE(dvq_module):
         """
         super().__init__()
 
+        self.is_single_token2 = is_single_token2
+
         # encoder/decoder module pair
         Encoder, Decoder = {
             'deepmind': (DeepMindEncoder, DeepMindDecoder),
             'openai': (OpenAIEncoder, OpenAIDecoder),
         }[enc_dec_flavor]
         self.encoder = Encoder(input_channels=input_channels, n_hid=n_hid, input_width=32,
-                               embedding_dim=embedding_dim)
+                               embedding_dim=embedding_dim, is_single_token2=self.is_single_token2)
 
-        # if 'SINGLE_TOKEN2' in os.environ:
-        #     decoder_init = embedding_dim // self.encoder.out_width ** 2
-        # else:
-        #     decoder_init = embedding_dim
+        if is_single_token2:
+            decoder_init = quantize_proj  # embedding_dim // self.encoder.out_width ** 2
+        else:
+            decoder_init = embedding_dim
 
-        self.decoder = Decoder(encoder=self.encoder, n_init=quantize_proj, n_hid=n_hid,
-                               output_channels=input_channels, embedding_dim=embedding_dim)
+        self.decoder = Decoder(encoder=self.encoder, n_init=decoder_init, n_hid=n_hid,
+                               output_channels=input_channels, embedding_dim=embedding_dim,
+                               is_single_token2=self.is_single_token2)
 
         # the quantizer module sandwiched between them, +contributes a KL(posterior || prior) loss to ELBO
         QuantizerModule = {
@@ -66,7 +70,8 @@ class VQVAE(dvq_module):
             'gumbel': GumbelQuantize,
         }[vq_flavor]
         self.quantizer = QuantizerModule(self.encoder.output_channels, num_embeddings, embedding_dim,
-                                         patch_width=self.encoder.out_width, output_proj=quantize_proj)
+                                         patch_width=self.encoder.out_width, output_proj=quantize_proj,
+                                         is_single_token2=self.is_single_token2)
 
         # the data reconstruction loss in the ELBO
         ReconLoss = {
@@ -79,10 +84,11 @@ class VQVAE(dvq_module):
     def forward(self, x, wait_to_init=False):
         z = self.encoder(x)
         z_q, latent_loss, ind = self.quantizer(z, wait_to_init)  # zq 128, 64, 8, 8 vs 128, 1024
-        if True or self.training or 'SINGLE_TOKEN2' not in os.environ:
-            x_hat = self.decoder(z_q)  # zq is B, Embed dim, H, W
-        else:
+        if 'TRY_NON_QUANTIZED' in os.environ:
             x_hat = self.decoder(z)
+        else:
+            x_hat = self.decoder(z_q)  # zq is B, Embed dim, H, W
+
         return x_hat, z_q, latent_loss, ind
 
     def training_step(self, batch, batch_idx):

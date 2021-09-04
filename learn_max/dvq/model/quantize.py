@@ -7,8 +7,10 @@ to backpropagate through the sampling process.
 import os
 
 import torch
+import wandb
 from torch import nn, einsum
 import torch.nn.functional as F
+from loguru import logger as log
 
 from scipy.cluster.vq import kmeans2
 
@@ -23,7 +25,7 @@ class VQVAEQuantize(nn.Module):
     https://github.com/deepmind/sonnet/blob/v2/sonnet/src/nets/vqvae.py
     https://github.com/deepmind/sonnet/blob/v2/examples/vqvae_example.ipynb
     """
-    def __init__(self, num_hiddens, n_embed, embedding_dim, patch_width=None, output_proj=None):
+    def __init__(self, num_hiddens, n_embed, embedding_dim, patch_width=None, output_proj=None, is_single_token2=False):
         super().__init__()
 
         self.embedding_dim = embedding_dim
@@ -34,10 +36,14 @@ class VQVAEQuantize(nn.Module):
         self.output_proj = embedding_dim
         self.patch_width = patch_width
 
+        self.is_single_token2 = is_single_token2
+        self.forward_iter = 0
+
         if 'SINGLE_TOKEN' in os.environ:
             self.proj = nn.Linear(embedding_dim, embedding_dim)  # Perhaps could be removed
         else:
-            if 'SINGLE_TOKEN2' in os.environ:
+            if self.is_single_token2:
+                # TODO: We are projecting down quite a bit from w/o single token, from 64 to 10 channels, try more channels!
                 # self.output_proj = 16  #patch_width ** 2
                 if output_proj is not None:
                     self.output_proj = output_proj
@@ -50,6 +56,8 @@ class VQVAEQuantize(nn.Module):
 
         self.data_init_buffer = []
         self.data_init_points = 0
+        self.initial_point_spread = None
+        self.initial_centroid_spread = None
 
         # TODO: If we train the transformer and auto-encoder jointly, consider doing weight initialization in
         #  the same way for both. Right now pytorch does the dvq, with the quantizer initialized with k-means.
@@ -63,11 +71,11 @@ class VQVAEQuantize(nn.Module):
             B, C, H, W = z.size()
             z_e = self.proj(z)  #  (B, E, H, W)  # Output proj channels = E
             z_e = z_e.permute(0, 2, 3, 1)  # make (B, H, W, E)  128, 8, 8, 64
-            if 'SINGLE_TOKEN2' in os.environ:
+            if self.is_single_token2:
                 # Enlarge token size (embedding_dim) so that we get one image per token,
                 # instead of a grid of image patch tokens
 
-                # 128, 8, 8, 64 CIFAR
+                # B,  8, 8, 64 CIFAR
                 # B, 21, 21, 8 Atari
                 # We want to get a batch of embeddings, so n 4096. We shouldn't project down so much, number 1.
                 # Fastest thing to do would be to resize, but CIFAR is 32x32 and we start out 84x84.
@@ -155,7 +163,7 @@ class VQVAEQuantize(nn.Module):
         latent_loss *= self.kld_scale
 
         z_q = z_e + (z_q - z_e).detach() # noop in forward pass, straight-through gradient estimator in backward pass
-        if 'SINGLE_TOKEN2' in os.environ:
+        if self.is_single_token2:
             # Had 128 * 64 = B * W **2, E
             # Now we have B, W ** 2 * C = 128,
             z_q = z_q.reshape(B, H, W, self.output_proj)  # (B, E) = (B, H*W*C) => (B, H, W, C)

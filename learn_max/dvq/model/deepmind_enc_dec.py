@@ -30,8 +30,10 @@ class ResBlock(nn.Module):
 
 class DeepMindEncoder(nn.Module):
 
-    def __init__(self, input_channels=3, n_hid=64, input_width=32, embedding_dim=64):
+    def __init__(self, input_channels=3, n_hid=64, input_width=32, embedding_dim=64, is_single_token2=False):
         super().__init__()
+
+        self.is_single_token2 = is_single_token2
 
         strides = [2,2]
         down_sample = np.prod(1/np.array(strides))
@@ -52,7 +54,7 @@ class DeepMindEncoder(nn.Module):
                 # TODO: Add to n_embd as well to match expressivity of 8x8 patches in 512 vocab
             )
         else:
-            if 'SINGLE_TOKEN2' in os.environ:
+            if self.is_single_token2:
                 self.output_channels = n_hid  # Want to see what decoding the encoder vs quantized looks like
                 self.net = nn.Sequential(
                     nn.Conv2d(input_channels, n_hid, 4, stride=strides[0], padding=1),
@@ -87,8 +89,9 @@ class DeepMindEncoder(nn.Module):
 
 class DeepMindDecoder(nn.Module):
 
-    def __init__(self, encoder, n_init=32, n_hid=64, output_channels=3, embedding_dim=64):
+    def __init__(self, encoder, n_init=32, n_hid=64, output_channels=3, embedding_dim=64, is_single_token2=False):
         super().__init__()
+        self.is_single_token2 = is_single_token2
 
         if 'SINGLE_TOKEN' in os.environ:
             self.net = nn.Sequential(
