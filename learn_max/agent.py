@@ -1,13 +1,32 @@
 import os
 from collections import deque
-from typing import List
+from dataclasses import dataclass
+from typing import List, Tuple
 
 import numpy as np
 import torch
+from torch import nn
+
+@dataclass
+class AgentState:
+    dvq_x: torch.Tensor = None
+    dvq_x_hat: torch.Tensor = None
+    dvq_z_q_emb: torch.Tensor = None
+    dvq_z_q_flat: torch.Tensor = None # same as dvq_z_q_emb just flattened for use as single token
+    dvq_z_q_ind: torch.Tensor = None
+    dvq_latent_loss: torch.Tensor = None
+    dvq_recon_loss: torch.Tensor = None
+    dvq_loss: torch.Tensor = None
+
+    def dict(self):
+        return self.__dict__
 
 
 class LearnMaxAgent:
-    """ Learn max agent that takes most interesting action using prediction uncertainty """
+    """ Learn max agent that takes most interesting action using prediction uncertainty
+        This object conforms with pytorch lightning bolts conventions on agents in RL setups.
+        It's really just a dynamics function right now which maps from external states to internal states and actions.
+    """
 
     def __init__(self, model,
                  num_actions: int,  # Number of discrete actions available
