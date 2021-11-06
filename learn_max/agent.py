@@ -54,7 +54,7 @@ class LearnMaxAgent:
         #   another, etc...
 
         # Ways to measure uncertainty / interestingness
-        # - We have a deviation head on the transformer that tries to just learn this from prob changes over time
+        # - We have a deviation head on the transformer that tries to just learn this from prob changes over time.
         # - We can also group predicted next z(a,s) by the action - using a dict to map z's to actions, then
         #   we can pursue actions that have the lowest variance - i.e. we are least confident about their next state
         #   This has the problem that some actions are just inherently stochastic. So it'd be addictive the way gambling
@@ -62,7 +62,8 @@ class LearnMaxAgent:
         #   over time even in the presence of random training data.
         # - Compare the current window with the masked predictions for intermediate steps in the window, this gives us
         #   the current uncertainty for the recent past. This is more useful for OOD / anomaly detection saying, okay
-        #   I'm in a really uncommon trajectory - stop, get help, or lower learning rate.
+        #   I'm in a really uncommon trajectory - stop, get help, or lower learning rate. This doesn't allow beam searching
+        #   for forward uncertainty though.
         # - Another way is a brute force - trajectory counting approach. The longer such trajectories are, the bigger
         #   the more keys a count dictionary would contain and the lower their constituent counts would be. This can
         #   be used to check the above heuristics.
