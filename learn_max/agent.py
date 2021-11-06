@@ -30,20 +30,19 @@ class LearnMaxAgent:
         self.dvq_ready = False
 
     @torch.no_grad()
-    def __call__(self, states: torch.Tensor, device: str, use_transformer: bool = False) -> List[int]:
+    def __call__(self, states: torch.Tensor, device: str) -> Tuple[List[int], AgentState]:
         """
         Takes in the current state and returns the action based on the agents policy
 
         Args:
             states: current state of the environment
             device: the device used for the current batch
-            use_transformer: Whether to get actions from transformer or just pick random actions for populating. This is
-                currently unused, but it may be worth moving the buffer logic into the model and keeping the agent
-                simple.
 
         Returns:
-            action defined by policy
+            action defined by policy and AgentState (agent's internal state)
         """
+        states, agent_states = states  # Internal and external states
+
         if not isinstance(states, list):
             states = [states]
 
@@ -70,16 +69,24 @@ class LearnMaxAgent:
         # - DVQ reconstruction loss - if the image hasn't been seen before, we will do a really bad job at reconstructing,
         #   esp. if it's a new level in zuma for example
 
-        # TODO: Consider moving this up to the lightning model
-        self.s_buff.append(states)
-        dvq_batch_ready = self.model.training and len(self.s_buff) == self.s_buff.maxlen
-        if dvq_batch_ready:
-            dvq_x = torch.cat(tuple(self.s_buff))  # Stack states in 0th (batch) dimension
-            self.s_buff.clear()
-            self.dvq_ready = True  # dvq outputs are now based on some training
-        else:
-            dvq_x = states
-        x, x_hat, z_q_emb, z_q_flat, latent_loss, z_q_ind = self.model.dvq(dvq_x, wait_to_init=not self.dvq_ready)
+        dvq_x = states
+
+        if not self.model.training_gpt:
+            # TODO: We have already forwarded these through the model, so there's no reason to re-forward. We just
+            #   need to compute the average loss and run the manual backward.
+            self.s_buff.append(states)
+            dvq_batch_ready = self.model.training and len(self.s_buff) == self.s_buff.maxlen
+            if dvq_batch_ready:
+                dvq_x = torch.cat(tuple(self.s_buff))  # Stack states in 0th (batch) dimension
+                self.s_buff.clear()
+                self.dvq_ready = True  # dvq outputs are now based on some training
+
+        x, x_hat, z_q_emb, z_q_flat, latent_loss, recon_loss, dvq_loss, z_q_ind = self.model.dvq(
+            dvq_x, wait_to_init=not self.dvq_ready)
+
+        agent_state = AgentState(dvq_x=x, dvq_x_hat=x_hat, dvq_z_q_emb=z_q_emb, dvq_z_q_flat=z_q_flat,
+                                 dvq_latent_loss=latent_loss, dvq_recon_loss=recon_loss, dvq_loss=dvq_loss,
+                                 dvq_z_q_ind=z_q_ind)
 
         # Return a random action if we haven't filled buffer of z states.
         if True or not dvq_batch_ready:
@@ -98,7 +105,7 @@ class LearnMaxAgent:
         # return actions
         self.a_buff.append(ret)
 
-        return ret
+        return ret, agent_state
 
     def get_random_action(self, state: torch.Tensor) -> List[int]:
         """returns a random action"""

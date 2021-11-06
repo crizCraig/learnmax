@@ -2,8 +2,11 @@ import math
 
 import pytorch_lightning as pl
 
+from learn_max import dvq
+from learn_max.utils import get_batch_vars
 
-class WarmupCosineLearningRateDecay(pl.Callback):
+
+class GptWarmupCosineLearningRateDecay(pl.Callback):
     """
     based on the number of tokens seen during training will adjust the learning rate:
     1. first it will start at zero and gradually ramp up to full learning rate
@@ -19,8 +22,10 @@ class WarmupCosineLearningRateDecay(pl.Callback):
         self.tokens = 0
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx=None, dataloader_idx=None):
-        _, y = batch  # y needs to be target indexes which is currently not passed by train_batch, do so when training_gpt as we have them!
-        self.tokens += (y >= 0).sum()  # y == -100 is "ignore", so don't count these
+        # y needs to be target indexes which is currently not passed by train_batch, do so when training_gpt as we have them! Also, need to emulate -100 thing when stars align
+        gpt_x, z_q_ind_x, z_q_ind_y = get_batch_vars(batch, return_agent_state=True, populate_gpt=True)
+        # _, y = batch
+        self.tokens += (z_q_ind_y >= 0).sum()  # y == -100 is "ignore", so don't count these
         if self.tokens < self.warmup_tokens:
             # linear warmup
             lr_mult = float(self.tokens) / float(max(1, self.warmup_tokens))

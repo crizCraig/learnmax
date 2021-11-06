@@ -241,7 +241,7 @@ class GPT(nn.Module):
             print('max_trajectory_count: ', self.max_trajectory_count)
 
     def forward(self, idx_or_embed):
-        if len(idx_or_embed.size()) == 3:  # TODO: Use self.should_input_embed here
+        if self.should_input_embed:
             b, t, embed = idx_or_embed.size()
         else:
             b, t = idx_or_embed.size()
@@ -272,7 +272,7 @@ class GPT(nn.Module):
         return logits, expected_deviation
 
     def step_(self, split, batch, batch_idx=None):
-        embed, idx, target_idx = batch  # So this is like  x, x_idx, y = batch
+        embed, idx, target_idx = batch  # i.e.  x, x_idx, y = batch
         x = embed if self.should_input_embed else idx
         logits, expected_deviation = self(x)
 

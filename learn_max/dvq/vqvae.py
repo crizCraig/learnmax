@@ -22,6 +22,8 @@ from learn_max.dvq.model.openai_enc_dec import OpenAIEncoder, OpenAIDecoder
 from learn_max.dvq.model.openai_enc_dec import Conv2d as PatchedConv2d
 from learn_max.dvq.model.quantize import VQVAEQuantize, GumbelQuantize
 from learn_max.dvq.model.loss import Normal, LogitLaplace
+from learn_max import dvq
+from learn_max.utils import get_batch_vars
 
 if 'TRAIN_DVQ_ONLY' in os.environ:
     dvq_module = pl.LightningModule
@@ -93,43 +95,31 @@ class VQVAE(dvq_module):
             x_hat = self.decoder(z)
         else:
             x_hat = self.decoder(z_q_emb)  # zq is B, Embed dim, H, W
-        return x, x_hat, z_q_emb, z_q_flat, latent_loss, z_q_ind  # Return x as we do a view on it
+
+        recon_loss = self.recon_loss.nll(x, x_hat)
+        quant_loss_mult = float(os.getenv('QUANT_LOSS_MULT', 1))
+        dvq_loss = recon_loss + quant_loss_mult * latent_loss
+
+        return x, x_hat, z_q_emb, z_q_flat, latent_loss, recon_loss, dvq_loss, z_q_ind  # Return x as we do a view on it
 
     def set_enable_kmeans(self, value):
         self.enable_kmeans = value
         self.quantizer.enable_kmeans = value
 
     def training_step(self, batch, batch_idx):
-        if len(batch) == 5:
-            s, a, r, d, s_next = batch
-            x = torch.cat([s, s_next])
-        else:
-            x, y = batch # hate that i have to do this here in the model
-
-        x, x_hat, z_q_emb, z_q_flat, latent_loss, z_q_ind = self.forward(x)
-        recon_loss = self.recon_loss.nll(x, x_hat)
-        quant_loss_mult = float(os.getenv('QUANT_LOSS_MULT', 1))
-        loss = recon_loss + quant_loss_mult * latent_loss
+        x = get_batch_vars(batch, use_next=True)
+        x, x_hat, z_q_emb, z_q_flat, latent_loss, recon_loss, dvq_loss, z_q_ind = self.forward(x)
+        loss = dvq_loss  # weird lightning need to call this "loss"?
         return loss, recon_loss, latent_loss, x_hat
 
     def validation_step(self, batch, batch_idx):
-        if len(batch) == 5:
-            s, a, r, d, s_next = batch
-            # x = torch.cat([s, s_next])  # doubles batch size
-            x = s
-        else:
-            x, y = batch # hate that i have to do this here in the model
-
+        x = get_batch_vars(batch)
         if len(x.shape) == 5:  # B, block_size, C, H, W
             # Includes gpt block size in shape, flatten first two dimensions
             x = x.view(x.shape[0] * x.shape[1], x.shape[2], x.shape[3], x.shape[4])
-        x, x_hat, z_q_emb, z_q_flat, latent_loss, z_q_ind = self.forward(x)
-        recon_loss = self.recon_loss.nll(x, x_hat)
+        x, x_hat, z_q_emb, z_q_flat, latent_loss, recon_loss, dvq_loss, z_q_ind = self.forward(x)
         wandb.log({'dvq_val_recon_loss': recon_loss})
         wandb.log({'dvq_val_latent_loss': latent_loss})
-
-        quant_loss_mult = float(os.getenv('QUANT_LOSS_MULT', 1))
-        loss = recon_loss + quant_loss_mult * latent_loss
 
         # debugging: cluster perplexity. when perplexity == num_embeddings then all clusters are used exactly equally
         encodings = F.one_hot(z_q_ind, self.quantizer.n_embed).float().reshape(-1, self.quantizer.n_embed)
@@ -138,7 +128,7 @@ class VQVAE(dvq_module):
         cluster_use = torch.sum(avg_probs > 0)
         wandb.log({'dvq_val_perplexity': perplexity})
         wandb.log({'dvq_val_cluster_use': cluster_use})
-        return loss, recon_loss, latent_loss, x_hat, z_q_ind, z_q_flat
+        return dvq_loss, recon_loss, latent_loss, x_hat, z_q_ind, z_q_flat
 
     def configure_optimizers(self):
 
@@ -203,6 +193,7 @@ class VQVAE(dvq_module):
         parser.add_argument("--n_hid", type=int, default=64, help="number of channels controlling the size of the model")
         parser.add_argument("--dvq_quantize_proj", type=int, default=None)
         return parser
+
 
 # -----------------------------------------------------------------------------
 def cos_anneal(e0, e1, t0, t1, e):

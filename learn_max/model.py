@@ -3,6 +3,7 @@ import json
 import math
 import os
 import time
+from collections import namedtuple
 from copy import copy
 from typing import Tuple, List, OrderedDict, Dict, Optional
 
@@ -29,12 +30,13 @@ from torch import nn
 from torch.optim.optimizer import Optimizer
 from torch.utils.data import DataLoader
 
-from learn_max.agent import LearnMaxAgent
+from learn_max import dvq
+from learn_max.agent import LearnMaxAgent, AgentState
 from learn_max.dvq.model.deepmind_enc_dec import ResBlock
-from learn_max.utils import topk_interesting, _init_weights
+from learn_max.utils import topk_interesting, _init_weights, get_batch_vars
 from learn_max.constants import SAVE_DIR, SEED, DEBUGGING
 from learn_max.dvq.vqvae import VQVAE, DecayLR, DecayTemperature, RampBeta
-from learn_max.mingpt.lr_decay import WarmupCosineLearningRateDecay
+from learn_max.mingpt.lr_decay import GptWarmupCosineLearningRateDecay
 from learn_max.mingpt.model import GPT
 
 
@@ -230,7 +232,7 @@ class LearnMax(pl.LightningModule):
         self.batch_states = []
         self.batch_actions = []
 
-        self.state = self.env.reset()
+        self.state = self.reset()
 
         if self.is_single_token2:
             self.dvq = VQVAE(n_hid=dvq_n_hid, num_embeddings=num_embeddings, embedding_dim=self.dvq_embedding_dim,
@@ -251,6 +253,9 @@ class LearnMax(pl.LightningModule):
 
         self.agent = LearnMaxAgent(model=self, num_actions=self.env.action_space.n)
 
+    def reset(self):
+        return self.env.reset(), AgentState()
+
     def run_n_episodes(self, env, n_epsiodes: int = 1, epsilon: float = 1.0) -> List[int]:
         """
         Carries out N episodes of the environment with the current agent
@@ -269,7 +274,7 @@ class LearnMax(pl.LightningModule):
 
             while not done:
                 self.agent.epsilon = epsilon
-                action = self.agent(episode_state, self.device)
+                action, agent_state = self.agent(episode_state, self.device)
                 next_state, reward, done, _ = env.step(action[0])
                 episode_state = next_state
                 episode_reward += reward
@@ -281,18 +286,19 @@ class LearnMax(pl.LightningModule):
     def populate(self, warm_start: int) -> None:
         """Populates the buffer with initial experience"""
         if warm_start > 0:
-            self.state = self.env.reset()
+            self.state = self.reset()
 
             for _ in range(warm_start):
                 self.agent.epsilon = 1.0
-                action = self.agent(self.state, self.device)
+                action, agent_state = self.agent(self.state, self.device)
                 next_state, reward, done, _ = self.env.step(action[0])
-                exp = Experience(state=self.state, action=action[0], reward=reward, done=done, new_state=next_state)
+                new_state = (next_state, agent_state)
+                exp = Experience(state=self.state, action=action[0], reward=reward, done=done, new_state=new_state)
                 self.buffer.append(exp)
-                self.state = next_state
+                self.state = new_state
 
                 if done:
-                    self.state = self.env.reset()
+                    self.state = self.reset()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -319,11 +325,15 @@ class LearnMax(pl.LightningModule):
         episode_reward = 0
         episode_steps = 0
 
+        self.profile_cuda_usage_tensors()
+
         while True:
             self.total_steps += 1
-            action = self.agent(self.state, self.device)
+            action, agent_state = self.agent(self.state, self.device)
 
             next_state, r, is_done, _ = self.env.step(action[0])
+
+            new_state = (next_state, agent_state)
 
             # TODO: Subtract 0.5 from image so that we - map [0,1] range to [-0.5, 0.5]
 
@@ -332,34 +342,37 @@ class LearnMax(pl.LightningModule):
             episode_reward += r
             episode_steps += 1
 
-            exp = Experience(state=self.state, action=action[0], reward=r, done=is_done, new_state=next_state)
+            exp = Experience(state=self.state, action=action[0], reward=r, done=is_done, new_state=new_state)
 
             self.buffer.append(exp)
             # print(f'bufflen {len(self.buffer)}')
-            self.state = next_state
+            self.state = new_state
 
             if is_done:
                 self.done_episodes += 1
                 self.total_rewards.append(episode_reward)
                 self.total_episode_steps.append(episode_steps)
                 self.avg_rewards = float(np.mean(self.total_rewards[-self.avg_reward_len:]))
-                self.state = self.env.reset()
+                self.state = self.reset()
                 episode_steps = 0
                 episode_reward = 0
 
             if self.training_gpt:
                 # Sample sequentially from replay buffer
-                states, actions, rewards, dones, new_states = self.sample_latest_sequential()
-
+                # If training GPT, we need to return the dvq state indexes as well to be used in on_train_batch_end
+                #   in lr_decay _, y = batch
+                states, actions, rewards, dones, new_states, agent_states = self.sample_latest_sequential()
             else:
                 # Sample randomly from replay buffer
                 states, actions, rewards, dones, new_states = self.buffer.sample(self.batch_size)  # TODO: Change to dvq_batch_size?
+                # TODO: Test extracting agent_states
+                states, _ = states
+                new_states, agent_states = new_states
+
             for idx, _ in enumerate(dones):
-                yield states[idx], actions[idx], rewards[idx], dones[idx], new_states[idx]
-
-
-            # TODO: If training GPT, we need to return the dvq state indexes as well to be used in on_train_batch_end
-            #   in lr_decay _, y = batch
+                # Lightning wants tensors, numpy arrays, numbers, dicts or lists in batch
+                agent_states_idx = [_.dict() for _ in agent_states[idx]]
+                yield states[idx], actions[idx], rewards[idx], dones[idx], new_states[idx], agent_states_idx
 
             # if self.total_steps % 1000 == 0:
             #     from guppy import hpy
@@ -370,22 +383,39 @@ class LearnMax(pl.LightningModule):
             if self.total_steps % self.batches_per_epoch == 0:
                 break
 
+    def profile_cuda_usage_tensors(self):
+        import torch
+        import gc
+        log.info('Profiling torch objects')
+        log.info('-----------------------')
+        for obj in gc.get_objects():
+            try:
+                if torch.is_tensor(obj) or (hasattr(obj, 'data') and torch.is_tensor(obj.data)):
+                    log.info(type(obj), obj.size())
+            except:
+                pass
+        log.info('Done profiling torch objects')
+        log.info('-----------------------')
+
     def sample_latest_sequential(self):
         """Get batch size X gpt_block_size windows for GPT"""
-        start_indices = np.random.choice(len(self.buffer), self.gpt_batch_size, replace=False)
+        start_indices = np.random.choice(len(self.buffer) - self.gpt_block_size + 1, self.gpt_batch_size, replace=False)
         ret_states = []
+        ret_agent_states = []
         ret_actions = []
         ret_rewards = []
         ret_dones = []
         ret_next_states = []
         for _ in start_indices:
-            indices = np.array(list(range(len(self.buffer)-1)[-self.gpt_block_size:]))
+            # TODO: pad with -100 when last index? We just avoid by making sure we sample early enough in the buffer
+            indices = np.array(list(range(len(self.buffer) - 1)[-self.gpt_block_size:]))
             states, actions, rewards, dones, next_states = zip(*[self.buffer.buffer[idx] for idx in indices])
-            ret_states.append(states)
+            ret_states.append([s[0] for s in states])
             ret_actions.append(actions)
             ret_rewards.append(rewards)
             ret_dones.append(dones)
-            ret_next_states.append(next_states)
+            ret_next_states.append([s[0] for s in next_states])
+            ret_agent_states.append([s[1] for s in next_states])
         # TODO: Speed this up with numba?
         ret = (
             np.array(ret_states),
@@ -393,6 +423,7 @@ class LearnMax(pl.LightningModule):
             np.array(ret_rewards, dtype=np.float32),
             np.array(ret_dones, dtype=np.bool),
             np.array(ret_next_states),
+            ret_agent_states,
         )
         return ret
 
@@ -419,24 +450,10 @@ class LearnMax(pl.LightningModule):
         #   on the other network. We'll just have to see what works.
 
         if self.training_gpt:
-            with torch.no_grad():
-                self.dvq.set_enable_kmeans(False)
-                dvq_loss, recon_loss, latent_loss, x_hat, z_q_ind, z_q_flat = self.dvq.validation_step(batch, batch_idx)
-            # here we need to get the cluster indexes OR we could feed in the actual token as it already has semantic
-            # information and is the right size tensor. Regardless, the gpt targets will be integers.
-            # Feeding in the index allows the size of the token to vary.
-            # There's a question as to whether inputting centroids vs centroid indexes will make the model more
-            # robust to changes in centroids over time. It seems that the indexes are arbitrary, but they will
-            # be consistent most likely in terms of their semantic meaning. Although, feeding the whole centroid
-            # tensor would be even better.
+            self.dvq.set_enable_kmeans(False)
+            gpt_x, z_q_ind_x, z_q_ind_y = get_batch_vars(batch, return_agent_state=True, populate_gpt=True)
 
-            # Okay, then we just need to shift the targets so that we are predicting the next token
-
-            gpt_x = z_q_flat.view(self.batch_size, z_q_flat.shape[0] // self.batch_size, -1)
-            z_q_ind = z_q_ind.view(self.batch_size, z_q_flat.shape[0] // self.batch_size, -1)
-            # idx_or_embed = idx_or_embed.view(int(idx_or_embed.shape[0] / self.block_size) - 1, self.block_size,
-            #                                  idx_or_embed.shape[1])
-            gpt_loss = self.gpt.training_step(batch=(gpt_x[:, :-1], z_q_ind[:, :-1], z_q_ind[:, 1:]), batch_idx=batch_idx)  # Train gpt on dvq tokens shifted for prediction
+            gpt_loss = self.gpt.training_step(batch=(gpt_x, z_q_ind_x, z_q_ind_y), batch_idx=batch_idx)  # Train gpt on dvq tokens shifted for prediction
 
             # We use multiple optimizers so need to manually backward each one separately
             self.gpt_optimizer.zero_grad()
@@ -453,7 +470,6 @@ class LearnMax(pl.LightningModule):
             loss = gpt_loss['loss']
             if self.trainer.use_dp or self.trainer.use_ddp2:
                 loss = loss.unsqueeze(0)
-
         else:
             latent_loss, dvq_loss, recon_loss = self._train_step_dvq(batch, batch_idx)
             loss = dvq_loss
@@ -477,7 +493,16 @@ class LearnMax(pl.LightningModule):
 
     def _train_step_dvq(self, batch, batch_idx):
         self.dvq.set_enable_kmeans(True)
-        dvq_loss, recon_loss, latent_loss, x_hat = self.dvq.training_step(batch, batch_idx)
+
+        _, agent_state = get_batch_vars(batch, return_agent_state=True)
+
+        # TODO: No need to call training_step again, just need to get the average loss from the batch.
+        dvq_loss = torch.mean(torch.Tensor([a["dvq_loss"].mean() for a in agent_state]))
+        recon_loss = torch.mean(torch.Tensor([a["recon_loss"].mean() for a in agent_state]))
+        latent_loss = torch.mean(torch.Tensor([a["latent_loss"].mean() for a in agent_state]))
+
+        # dvq_loss, recon_loss, latent_loss, x_hat = self.dvq.training_step(batch, batch_idx)
+
         # We use multiple optimizers so need to manually backward each one separately
         self.dvq_optimizer.zero_grad()
         self.manual_backward(dvq_loss)
@@ -529,7 +554,7 @@ class LearnMax(pl.LightningModule):
         self.dataset = ExperienceSourceDataset(self.train_batch)
 
         return DataLoader(dataset=self.dataset, batch_size=batch_size, num_workers=self.num_workers,
-                          drop_last=True, pin_memory=True)
+                          drop_last=True, pin_memory=False)  # Images on GPU already so pin_memory raises exception
 
     def train_dataloader(self) -> DataLoader:
         """Get train loader"""
@@ -566,6 +591,9 @@ class LearnMax(pl.LightningModule):
         arg_parser.add_argument('-n', '--num_workers', type=int, default=None, help="number of workers for dataloading")
         arg_parser.add_argument('--viz_dvq', type=str, help="visualize dvq images", default=None)
         arg_parser.add_argument('--dvq_checkpoint', type=str, help="Checkpoint to restore", default=None)
+        arg_parser.add_argument('--gpt_batch_size', type=int, help="GPT batch size", default=4)
+        arg_parser.add_argument('--gpt_block_size', type=int, default=80,
+                            help="block size for the model (length of window of context)")
         return arg_parser
 
     @staticmethod
@@ -737,7 +765,6 @@ def set_net_weights(source, target):
         if not isinstance(target[i], LOAD_LAYER_TYPES):
             raise ValueError('Unexpected layer type, add support for new layers here')
 
-
 def cli_main():
     torch.backends.cudnn.benchmark = True  # autotune kernels
     torch.multiprocessing.set_start_method('spawn')
@@ -767,8 +794,6 @@ def cli_main():
     # common = {'batch_size': args.gpt_batch_size, 'pin_memory': bool(args.pin_memory), 'num_workers': args.num_workers}
     # trainer args  # TODO: Check that our defaults above are preserved for overlapping things like pin-memory
     parser.add_argument('-x', '--num_epochs', type=int, default=2, help="number of epochs to train for")
-    parser.add_argument('-b', '--gpt_batch_size', type=int, default=16, help="batch size to train gpt with")
-    parser.add_argument('-l', '--gpt_block_size', type=int, default=80, help="block size for the model (length of window of context)")
     parser.add_argument('-g', '--num_gpus', type=int, default=1, help="number of gpus to train on")
     parser.add_argument('-p', '--pin_memory', type=bool, default=True, help="pin memory on dataloaders?")
     parser = pl.Trainer.add_argparse_args(parser)
@@ -778,6 +803,8 @@ def cli_main():
         wandb_name = None
         wandb_mode = 'disabled'
         fast_dev_run = True
+        if os.environ.get('DEBUG_GPU', 'n') == 'n':
+            args.num_gpus = 0
     else:
         wandb_name = input('\n\nExperiment name?\n\n')
         wandb_mode = 'online'
@@ -806,13 +833,13 @@ def cli_main():
     # number of tokens backpropped in one iteration, need to reduce for zuma vs char as tokens are 10x larger
     iter_tokens = args.gpt_batch_size * args.gpt_block_size
     epoch_tokens = math.ceil(args.batches_per_epoch * iter_tokens)
-    lr_decay = WarmupCosineLearningRateDecay(learning_rate=6e-4,
-                                             warmup_tokens=512 * 20,  # epoch_tokens // 2,
+    lr_decay = GptWarmupCosineLearningRateDecay(learning_rate=6e-4,
+                                                warmup_tokens=512 * 20,  # epoch_tokens // 2,
 
-                                             final_tokens=args.num_epochs * epoch_tokens)
+                                                final_tokens=args.num_epochs * epoch_tokens)
     t0 = time.time()
     log.info("training...")
-    checkpoint_callback = ModelCheckpoint(monitor='gpt_train_loss', mode='min', every_n_train_steps=1000, save_top_k=3,
+    checkpoint_callback = ModelCheckpoint(monitor='train_loss', mode='min', every_n_train_steps=1000, save_top_k=3,
                                           verbose=True)
     trainer = pl.Trainer(gpus=args.num_gpus, max_epochs=args.num_epochs, gradient_clip_val=1.0,
                          callbacks=[lr_decay, checkpoint_callback],

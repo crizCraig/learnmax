@@ -120,5 +120,57 @@ def wandb_try_log(msg_dict):
     except:
         pass
 
+def get_batch_vars(batch, use_next=False, return_agent_state=False, populate_gpt=False):
+    agent_state = None
+    if len(batch) == 5:
+        s, a, r, d, s_next = batch
+        if use_next:
+            x = torch.cat([s, s_next])  # doubles batch size which we don't want with GPT as there's OOM
+        else:
+            x = s
+    elif len(batch) == 6:
+        s, a, r, d, s_next, agent_state = batch
+        x = s
+    else:
+        x, y = batch # hate that i have to do this here in the model
+    dvq_batch = x
+    if return_agent_state:
+        dvq_batch = x, agent_state
+    if not populate_gpt:
+        return dvq_batch
+    else:
+        dvq_loss = torch.mean(torch.Tensor([a['dvq_loss'].mean() for a in agent_state]))
+        # dvq_x_hat = torch.Tensor([a['dvq_x_hat'] for a in agent_state])
+        z_q_ind = torch.stack([a['dvq_z_q_ind'] for a in agent_state])
+        z_q_flat = torch.stack([a['dvq_z_q_flat'] for a in agent_state])
+
+        # print(f'{dvq_loss=}')
+        # print(f'dvq_loss_avg={sum([a["dvq_loss"].mean() for a in agent_state]) / len(agent_state)}')
+
+        # here we need to get the cluster indexes OR we could feed in the actual token as it already has semantic
+        # information and is the right size tensor. Regardless, the gpt targets will be integers.
+        # Feeding in the index allows the size of the token to vary.
+        # There's a question as to whether inputting centroids vs centroid indexes will make the model more
+        # robust to changes in centroids over time. It seems that the indexes are arbitrary, but they will
+        # be consistent most likely in terms of their semantic meaning. Although, feeding the whole centroid
+        # tensor would be even better.
+
+        # Okay, then we just need to shift the targets so that we are predicting the next token
+
+        batch_size = batch[0].shape[0]
+
+        # 80, 16, 1, 4410 => 16, 80, 4410
+        gpt_x = z_q_flat.squeeze().permute(1, 0, 2)[:, :-1, :]
+        # gpt_x = z_q_flat.view(batch_size, z_q_flat.shape[0] // batch_size, -1)[:, :-1, :]
+
+        z_q_ind = z_q_ind.squeeze().permute(1, 0)
+        # z_q_ind = z_q_ind.view(batch_size, z_q_flat.shape[0] // batch_size, -1)
+        z_q_ind_x = z_q_ind[:, :-1]
+        z_q_ind_y = z_q_ind[:, 1:]
+        return gpt_x, z_q_ind_x, z_q_ind_y
+        # idx_or_embed = idx_or_embed.view(int(idx_or_embed.shape[0] / self.block_size) - 1, self.block_size,
+        #                                  idx_or_embed.shape[1])
+
+
 if __name__ == '__main__':
     test_topk_interesting()
