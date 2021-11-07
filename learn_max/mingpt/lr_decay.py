@@ -19,7 +19,7 @@ class WarmupCosineLearningRateDecay(pl.Callback):
         self.tokens = 0
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx=None, dataloader_idx=None):
-        _, y = batch
+        _, y = batch  # y needs to be target indexes which is currently not passed by train_batch, do so when training_gpt as we have them!
         self.tokens += (y >= 0).sum()  # y == -100 is "ignore", so don't count these
         if self.tokens < self.warmup_tokens:
             # linear warmup

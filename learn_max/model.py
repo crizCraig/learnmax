@@ -3,6 +3,7 @@ import json
 import math
 import os
 import time
+from copy import copy
 from typing import Tuple, List, OrderedDict, Dict, Optional
 
 import cv2
@@ -29,6 +30,7 @@ from torch.optim.optimizer import Optimizer
 from torch.utils.data import DataLoader
 
 from learn_max.agent import LearnMaxAgent
+from learn_max.dvq.model.deepmind_enc_dec import ResBlock
 from learn_max.utils import topk_interesting, _init_weights
 from learn_max.constants import SAVE_DIR, SEED, DEBUGGING
 from learn_max.dvq.vqvae import VQVAE, DecayLR, DecayTemperature, RampBeta
@@ -54,6 +56,7 @@ class LearnMax(pl.LightningModule):
             dvq_enc_dec_flavor: str = 'deepmind',  # Deepmind VQVAE or OpenAI Dall-E dVAE
             dvq_vq_flavor: str = 'vqvae',  # `vqvae` or `gumbel`
             dvq_quantize_proj: int = None,
+            dvq_checkpoint: str = None,  # pretrained dvq checkpoint
 
             # mingpt model definition args
             # size of the vocabulary (number of possible tokens) -
@@ -63,9 +66,10 @@ class LearnMax(pl.LightningModule):
             # gpt_vocab_size: int = 64,  # now num_embeddings
 
             # length of the model's context window in time
-            gpt_block_size: int = 128,
+            gpt_block_size: int = 80,
             gpt_n_layer: int = 8,  # depth of the model; number of Transformer blocks in sequence
             gpt_n_head: int = 10,  # number of heads in each multi-head attention inside each Transformer block
+            gpt_batch_size: int = 16,  # with such large embeddings (4410) needs to be small now to fit on rtx 2080
 
             # mingpt model optimization args
             gpt_learning_rate: float = 3e-4,  # the base learning rate of the model
@@ -74,6 +78,11 @@ class LearnMax(pl.LightningModule):
             gpt_embd_pdrop: float = 0.1,  # \in [0,1]: amount of dropout on input embeddings
             gpt_resid_pdrop: float = 0.1,  # \in [0,1]: amount of dropout in each residual connection
             gpt_attn_pdrop: float = 0.1,  # \in [0,1]: amount of dropout on the attention matrix
+
+            # Whether to use embeddings or indexes as input to first layer. With characters, we learn an embedding
+            # from the ascii index, but with dvq inputs, the embeddings are high dimensional and
+            # semantically meaningful so we use those as input.
+            gpt_input_embed: bool = True,
 
             # RL type stuff
             avg_reward_len: int = 100,  # how many episodes to take into account when calculating the avg reward
@@ -86,9 +95,10 @@ class LearnMax(pl.LightningModule):
             batches_per_epoch: int = 10_000,  # number of batches per pseudo (RL) epoch
 
             # Standard stuff
-            num_workers: int = 0 if DEBUGGING else 5,  # data loader workers - pycharm has issues debugging these
+            num_workers: int = 0,  # data loader workers - pycharm has issues debugging these. also gen batch requires NN for action so can't use > 0 at runtime either yet
             data_dir: str = SAVE_DIR,  # place to save tfboard logs and checkpoints
             batch_size: int = 32,  # do we have a batch size? or are gpt and dvq batch sizes adequate?
+            # checkpoint: str = None, # Checkpoint to restore from
 
             single_token2: bool = False,
     ):
@@ -114,6 +124,7 @@ class LearnMax(pl.LightningModule):
         [1] https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0036399
         """
         super().__init__()
+        log.info(f'{num_workers=}')
         self.is_single_token2 = single_token2
         default_num_embeddings, default_embedding_dim = get_default_embeddings(self.is_single_token2)
 
@@ -127,9 +138,12 @@ class LearnMax(pl.LightningModule):
         self.dvq_input_channels = dvq_input_channels
         self.dvq_enc_dec_flavor = dvq_enc_dec_flavor
         self.dvq_vq_flavor = dvq_vq_flavor
+        self.dvq_checkpoint = dvq_checkpoint
+        self.training_gpt = True if self.dvq_checkpoint is not None else False
 
         self.gpt_embedding_dim = embedding_dim  # the "width" of the model (embedding_dim), number of channels in each Transformer
         self.gpt_block_size = gpt_block_size
+        self.gpt_batch_size = gpt_batch_size
         self.gpt_n_layer = gpt_n_layer
         self.gpt_n_head = gpt_n_head
         self.gpt_learning_rate = gpt_learning_rate
@@ -151,7 +165,9 @@ class LearnMax(pl.LightningModule):
         # RL / sensorimotor stuff
         self.num_workers = num_workers
         self.data_dir = data_dir
-        self.batch_size = batch_size
+
+        self.batch_size = gpt_batch_size if self.training_gpt else batch_size
+
         self.total_steps = 0
         self.total_rewards = []
         self.total_episode_steps = []
@@ -229,9 +245,9 @@ class LearnMax(pl.LightningModule):
                 is_single_token2=self.is_single_token2)
 
         self.gpt = GPT(vocab_size=num_embeddings, block_size=gpt_block_size, n_layer=gpt_n_layer,
-            embedding_dim=self.gpt_embedding_dim, n_head=gpt_n_head, learning_rate=gpt_learning_rate,
-            weight_decay=gpt_weight_decay, betas=gpt_betas, embd_pdrop=gpt_embd_pdrop,
-            resid_pdrop=gpt_resid_pdrop, attn_pdrop=gpt_attn_pdrop)
+                       embedding_dim=self.gpt_embedding_dim, n_head=gpt_n_head, learning_rate=gpt_learning_rate,
+                       weight_decay=gpt_weight_decay, betas=gpt_betas, embd_pdrop=gpt_embd_pdrop,
+                       resid_pdrop=gpt_resid_pdrop, attn_pdrop=gpt_attn_pdrop, should_input_embed=gpt_input_embed)
 
         self.agent = LearnMaxAgent(model=self, num_actions=self.env.action_space.n)
 
@@ -331,19 +347,54 @@ class LearnMax(pl.LightningModule):
                 episode_steps = 0
                 episode_reward = 0
 
-            states, actions, rewards, dones, new_states = self.buffer.sample(self.batch_size)
+            if self.training_gpt:
+                # Sample sequentially from replay buffer
+                states, actions, rewards, dones, new_states = self.sample_latest_sequential()
 
+            else:
+                # Sample randomly from replay buffer
+                states, actions, rewards, dones, new_states = self.buffer.sample(self.batch_size)  # TODO: Change to dvq_batch_size?
             for idx, _ in enumerate(dones):
                 yield states[idx], actions[idx], rewards[idx], dones[idx], new_states[idx]
 
-            if self.total_steps % 1000 == 0:
-                from guppy import hpy
-                h = hpy()
-                print('heap stats', h.heap())
+
+            # TODO: If training GPT, we need to return the dvq state indexes as well to be used in on_train_batch_end
+            #   in lr_decay _, y = batch
+
+            # if self.total_steps % 1000 == 0:
+            #     from guppy import hpy
+            #     h = hpy()
+            #     print('heap stats', h.heap())
 
             # Simulates epochs
             if self.total_steps % self.batches_per_epoch == 0:
                 break
+
+    def sample_latest_sequential(self):
+        """Get batch size X gpt_block_size windows for GPT"""
+        start_indices = np.random.choice(len(self.buffer), self.gpt_batch_size, replace=False)
+        ret_states = []
+        ret_actions = []
+        ret_rewards = []
+        ret_dones = []
+        ret_next_states = []
+        for _ in start_indices:
+            indices = np.array(list(range(len(self.buffer)-1)[-self.gpt_block_size:]))
+            states, actions, rewards, dones, next_states = zip(*[self.buffer.buffer[idx] for idx in indices])
+            ret_states.append(states)
+            ret_actions.append(actions)
+            ret_rewards.append(rewards)
+            ret_dones.append(dones)
+            ret_next_states.append(next_states)
+        # TODO: Speed this up with numba?
+        ret = (
+            np.array(ret_states),
+            np.array(ret_actions),
+            np.array(ret_rewards, dtype=np.float32),
+            np.array(ret_dones, dtype=np.bool),
+            np.array(ret_next_states),
+        )
+        return ret
 
     def training_step(self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx, optimizer_idx) -> torch.Tensor:
         """
@@ -360,19 +411,55 @@ class LearnMax(pl.LightningModule):
         # calculates training loss
         # loss = dqn_loss(batch, self.net, self.target_net, self.gamma)
 
-        dvq_loss, recon_loss, latent_loss, x_hat = self.dvq.training_step(batch, batch_idx)
+        # TODO: We should train the dvq for a while, or load a checkpoint. Then train the GPT for a while on the learned
+        #   tokens. The alt. would be to train everything in parallel which would be cool, but the transformer would
+        #   need to adjust to the distribution shift, i.e. token centroids changing. The DVQ could always be trained
+        #   online with the replay buffer. Keeping it frozen for the gpt would be like the target network in DQN.
+        #   The target network was needed because the loss was dependent on it. Here it's the input that's dependent
+        #   on the other network. We'll just have to see what works.
 
-        # We use multiple optimizers so need to manually backward each one separately
-        self.dvq_optimizer.zero_grad()
-        self.manual_backward(dvq_loss)
-        self.dvq_optimizer.step()
+        if self.training_gpt:
+            with torch.no_grad():
+                self.dvq.set_enable_kmeans(False)
+                dvq_loss, recon_loss, latent_loss, x_hat, z_q_ind, z_q_flat = self.dvq.validation_step(batch, batch_idx)
+            # here we need to get the cluster indexes OR we could feed in the actual token as it already has semantic
+            # information and is the right size tensor. Regardless, the gpt targets will be integers.
+            # Feeding in the index allows the size of the token to vary.
+            # There's a question as to whether inputting centroids vs centroid indexes will make the model more
+            # robust to changes in centroids over time. It seems that the indexes are arbitrary, but they will
+            # be consistent most likely in terms of their semantic meaning. Although, feeding the whole centroid
+            # tensor would be even better.
 
-        # self.gpt.step_('train', )
+            # Okay, then we just need to shift the targets so that we are predicting the next token
 
-        loss = dvq_loss
+            gpt_x = z_q_flat.view(self.batch_size, z_q_flat.shape[0] // self.batch_size, -1)
+            z_q_ind = z_q_ind.view(self.batch_size, z_q_flat.shape[0] // self.batch_size, -1)
+            # idx_or_embed = idx_or_embed.view(int(idx_or_embed.shape[0] / self.block_size) - 1, self.block_size,
+            #                                  idx_or_embed.shape[1])
+            gpt_loss = self.gpt.training_step(batch=(gpt_x[:, :-1], z_q_ind[:, :-1], z_q_ind[:, 1:]), batch_idx=batch_idx)  # Train gpt on dvq tokens shifted for prediction
 
-        if self.trainer.use_dp or self.trainer.use_ddp2:
-            loss = loss.unsqueeze(0)
+            # We use multiple optimizers so need to manually backward each one separately
+            self.gpt_optimizer.zero_grad()
+            # self.manual_backward(gpt_loss['loss'], self.gpt_optimizer)
+
+            # Required due to https://github.com/PyTorchLightning/pytorch-lightning/issues/7698
+            # Basically we run into issues with gradient clipping + manual_backward()
+            self._running_manual_backward = True
+            self.trainer.train_loop.backward(gpt_loss['loss'], optimizer=self.gpt_optimizer, opt_idx=None)
+            self._running_manual_backward = False
+
+            self.gpt_optimizer.step()
+
+            loss = gpt_loss['loss']
+            if self.trainer.use_dp or self.trainer.use_ddp2:
+                loss = loss.unsqueeze(0)
+
+        else:
+            latent_loss, dvq_loss, recon_loss = self._train_step_dvq(batch, batch_idx)
+            loss = dvq_loss
+            self.log_dict({
+                "dvq_recon_loss": recon_loss,
+                "dvq_latent_loss": latent_loss, })
 
         self.log_dict({
             "total_reward": self.total_rewards[-1] if self.total_rewards else 0,
@@ -380,8 +467,6 @@ class LearnMax(pl.LightningModule):
             "train_loss": loss,
             "episodes": self.done_episodes,
             "episode_steps": self.total_episode_steps[-1] if self.total_episode_steps else 0,
-            "dvq_recon_loss": recon_loss,
-            "dvq_latent_loss": latent_loss,
         })
 
         # return loss
@@ -389,6 +474,18 @@ class LearnMax(pl.LightningModule):
         #     "loss": loss,
         #     "avg_reward": self.avg_rewards,
         # })
+
+    def _train_step_dvq(self, batch, batch_idx):
+        self.dvq.set_enable_kmeans(True)
+        dvq_loss, recon_loss, latent_loss, x_hat = self.dvq.training_step(batch, batch_idx)
+        # We use multiple optimizers so need to manually backward each one separately
+        self.dvq_optimizer.zero_grad()
+        self.manual_backward(dvq_loss)
+        self.dvq_optimizer.step()
+        loss = dvq_loss
+        if self.trainer.use_dp or self.trainer.use_ddp2:
+            loss = loss.unsqueeze(0)
+        return latent_loss, loss, recon_loss
 
     # def test_step(self, *args, **kwargs) -> Dict[str, torch.Tensor]:
     #     """Evaluate the agent for 10 episodes"""
@@ -410,11 +507,28 @@ class LearnMax(pl.LightningModule):
 
     def _dataloader(self) -> DataLoader:
         """Initialize the Replay Buffer dataset used for retrieving experiences"""
+        # Also, need to disable kmeans in an object variable and avoid backpropping elsewhere
+        if self.training_gpt:
+            for prop_name in dir(self.dvq):
+                prop = getattr(self.dvq, prop_name)
+                if isinstance(prop, nn.Module):
+                    prop.zero_grad()
+            batch_size = self.gpt_batch_size
+            self.dvq.set_enable_kmeans(False)
+            log.info(f'Not training dvq so setting warm start size to batch size. '
+                     f'Was {self.warm_start_size}, now  is {self.batch_size}')
+            self.warm_start_size = self.gpt_batch_size * self.gpt_block_size
+        else:
+            batch_size = self.batch_size  # Already set in __init__ but in case we toggle training gpt, set here too
         self.buffer = MultiStepBuffer(self.replay_size, self.n_steps)
+        log.info(f'Populating replay buffer with {self.warm_start_size} experiences...')
         self.populate(self.warm_start_size)
+        log.info(f'...finished populating replay buffer')
 
+        # train_batch calls the model to get the next action, so each worker has a copy of the model!
         self.dataset = ExperienceSourceDataset(self.train_batch)
-        return DataLoader(dataset=self.dataset, batch_size=self.batch_size, num_workers=self.num_workers,
+
+        return DataLoader(dataset=self.dataset, batch_size=batch_size, num_workers=self.num_workers,
                           drop_last=True, pin_memory=True)
 
     def train_dataloader(self) -> DataLoader:
@@ -449,6 +563,9 @@ class LearnMax(pl.LightningModule):
         # TODO: Add the VQVAE and GPT args here as well
         arg_parser.add_argument("--dvq_quantize_proj", type=int, default=None)
         arg_parser.add_argument("--single_token2", action='store_true', default=False)
+        arg_parser.add_argument('-n', '--num_workers', type=int, default=None, help="number of workers for dataloading")
+        arg_parser.add_argument('--viz_dvq', type=str, help="visualize dvq images", default=None)
+        arg_parser.add_argument('--dvq_checkpoint', type=str, help="Checkpoint to restore", default=None)
         return arg_parser
 
     @staticmethod
@@ -521,9 +638,11 @@ class LearnMax(pl.LightningModule):
         * take the transformer's input sequence of z,a embeddings and output deviations as input to beam search
           (note that deviation is the predicted output prob change and is the proxy we are using for uncertainty)
         * for saliency level zero, just concatenate state and action embeddings for input to the transformer,
-          get the action that corresponds to each output state by forwarding it through the dvq decoder. We need to
-          learn an action embedding for this.
-          in batch(es) and getting the closest action embedding to the decoded one
+          for higher levels, get the action that corresponds to each output state by forwarding it through the dvq decoder
+          for that saliency level in batch(es) and getting the closest action embedding to the decoded one.
+          saliency levels above level 0 will consist of their own dvq + gpt that clusters the action + state tokens
+          from below and predicts those as abstract action-states. This is to allow for planning and creating abstract
+          actions like, beat level 1 vs jump.
         * add deviations to _all_ encountered sorted deviations
             * try naive unoptimal way first though since we don't have that many branches)
             * If we need to optimize, use TORCH.SEARCHSORTED
@@ -532,9 +651,11 @@ class LearnMax(pl.LightningModule):
             * sequences just get appended to and are not sorted, so sequence index can be static.
         * get topk_interesting(action_deviations, k) output indexes - (nb. interesting is defined as within 50-75pct
           uncertainty) - however we may need to do 50-100pct to avoid state starvation
-        * limit the initial actions in the trajectory to ones with a predicted state that close to the one received from the sim
+          there will be some trajectories at high saliency levels that are the most interesting. we hope that those
+          trajectories remain most interesting for some amount of time so that we're not switching strats to often.
+        * limit the initial actions in the trajectory to ones with a predicted state that's close to the one received from the sim
         * feed the corresponding z,a embeddings at those indexes back into the transformer at the end of the
-          current sequence (nb. we are simulating the env in multiple future branches)
+          current sequence (we are simulating the env in multiple future branches)
         * get new states and deviations for the next level of the tree and add them to the sorted list according to above
         * when we build up a pool of transformer i/o that reaches some desired max size in GPU memory, get the most
           interesting trajectory and return the first action of that trajectory.
@@ -550,6 +671,8 @@ class LearnMax(pl.LightningModule):
           https://arxiv.org/abs/1805.11592 or pretrained agents perhaps
           (TODO: Ask Aditya Ramesh about this as he tried training jointly with DALL-E and didn't notice improvement,
            We don't need improvement, we just need this to deal with shifting input distributions.
+           # TODO: Short term saliency layer(s) for working memory. Could use high learning rate or multiple overlapping
+           #    layers.
         """
 
         # TODO:
@@ -576,11 +699,13 @@ def viz_dvq():
     # model = LearnMax.load_from_checkpoint('/home/c2/src/learnmax/learn_max/wandb/run-20210822_122545-1vpms2wc/files/learnmax-learn_max/1vpms2wc/checkpoints/epoch=0-step=999.ckpt')
     # model = LearnMax.load_from_checkpoint('/home/c2/src/learnmax/learn_max/wandb/run-20210823_122845-19bx2g56/files/learnmax-learn_max/19bx2g56/checkpoints/epoch=3-step=38899.ckpt')
     # model = LearnMax.load_from_checkpoint('/home/c2/src/learnmax/learn_max/wandb/run-20210824_140120-2w1glywq/files/learnmax-learn_max/2w1glywq/checkpoints/epoch=0-step=7399.ckpt')
-    ckpt = '/home/c2/src/learnmax/learn_max/wandb/run-20210906_120330-2y37nll3/files/learnmax-learn_max/2y37nll3/checkpoints/epoch=36-step=369999.ckpt'
+    # ckpt = '/home/c2/src/learnmax/learn_max/wandb/run-20210906_120330-2y37nll3/files/learnmax-learn_max/2y37nll3/checkpoints/epoch=36-step=369999.ckpt'
+    # ckpt = '/home/c2/src/learnmax/learn_max/wandb/run-20210907_154630-8v2mk188/files/learnmax-learn_max/8v2mk188/checkpoints/epoch=8-step=81999.ckpt'  # perfect on 20 examples
+    ckpt = '/home/c2/src/learnmax/learn_max/wandb/run-20210917_122229-3h1loaoh/files/learnmax-learn_max/3h1loaoh/checkpoints/epoch=3-step=30999.ckpt'  # 19/20
     print(f'visualizing {ckpt}')
     model = LearnMax.load_from_checkpoint(ckpt)
     model.cuda()
-    wandb.init(entity='crizcraig')
+    wandb.init(entity='crizcraig', mode='disabled')
 
     test_loader = model.test_dataloader()
     x = next(iter(test_loader))
@@ -597,81 +722,89 @@ def viz_dvq():
 
     plt.show()
 
+LOAD_LAYER_TYPES = (nn.ConvTranspose2d, ResBlock, nn.ReLU, nn.Conv2d)
+
+def set_net_weights(source, target):
+    for i, layer in enumerate(source):
+        if hasattr(layer, 'weight'):
+            target[i].weight = layer.weight
+        if hasattr(layer, 'bias'):
+            target[i].bias = layer.bias
+        if isinstance(layer, ResBlock):
+            set_net_weights(layer.conv, target[i].conv)
+        if not isinstance(layer, LOAD_LAYER_TYPES):
+            raise ValueError('Unexpected layer type, add support for new layers here')
+        if not isinstance(target[i], LOAD_LAYER_TYPES):
+            raise ValueError('Unexpected layer type, add support for new layers here')
+
+
 def cli_main():
+    torch.backends.cudnn.benchmark = True  # autotune kernels
+    torch.multiprocessing.set_start_method('spawn')
     parser = argparse.ArgumentParser()
 
     # model args
     parser = LearnMax.add_reinforcement_learning_args(parser)
     parser = LearnMax.add_model_specific_args(parser)
-    parser.add_argument('--viz_dvq', type=str, help="visualize dvq images", default=None)
     args = parser.parse_args()
-    
+    if args.num_workers is None:
+        # data loader workers - pycharm has issues debugging when > 0
+        # also weirdness when >0 in that wandb.init needs to be called for quantize to log???
+        #   - must be due to spawning multiple training processes?
+        args.num_workers = 0 if DEBUGGING else 0
+        print('cli num workers', args.num_workers)
+        print('DEBUGGING', DEBUGGING)
     if args.viz_dvq is not None:
         return viz_dvq()
     else:
         delattr(args, 'viz_dvq')
 
-    torch.backends.cudnn.benchmark = True  # autotune kernels
+    model = LearnMax(**args.__dict__)
+    if args.dvq_checkpoint:
+        load_pretrained_dvq(args, model)
+        args.enable_kmeans = False
 
     # common = {'batch_size': args.gpt_batch_size, 'pin_memory': bool(args.pin_memory), 'num_workers': args.num_workers}
-
-    model = LearnMax(**args.__dict__)
-
-
     # trainer args  # TODO: Check that our defaults above are preserved for overlapping things like pin-memory
     parser.add_argument('-x', '--num_epochs', type=int, default=2, help="number of epochs to train for")
-    parser.add_argument('-b', '--gpt_batch_size', type=int, default=64, help="batch size to train gpt with")
-    parser.add_argument('-l', '--gpt_block_size', type=int, default=128, help="block size for the model (length of window of context)")
+    parser.add_argument('-b', '--gpt_batch_size', type=int, default=16, help="batch size to train gpt with")
+    parser.add_argument('-l', '--gpt_block_size', type=int, default=80, help="block size for the model (length of window of context)")
     parser.add_argument('-g', '--num_gpus', type=int, default=1, help="number of gpus to train on")
-    parser.add_argument('-n', '--num_workers', type=int, default=0, help="number of workers for dataloading")
-    parser.add_argument('-p', '--pin_memory', type=int, default=0, help="pin memory on dataloaders?")
-
-
+    parser.add_argument('-p', '--pin_memory', type=bool, default=True, help="pin memory on dataloaders?")
     parser = pl.Trainer.add_argparse_args(parser)
     args = parser.parse_args()
-
-    wandb.init(entity='crizcraig', save_code=True, name=input('\n\nExperiment name?\n\n'))  # TODO: Try comet for code saving, it looks like it saves and does diffs on everything, not just this file
-
+    # TODO: Try comet for code saving, it looks like it saves and does diffs on everything, not just this file
+    if DEBUGGING:
+        wandb_name = None
+        wandb_mode = 'disabled'
+        fast_dev_run = True
+    else:
+        wandb_name = input('\n\nExperiment name?\n\n')
+        wandb_mode = 'online'
+        fast_dev_run = False
+    wandb.init(entity='crizcraig', save_code=True, name=wandb_name, mode=wandb_mode)
     # wandb.watch(model)  # causes OOM https://github.com/wandb/client/issues/2644
 
     wandb_logger = WandbLogger()
-
     log.info(json.dumps(vars(args), indent=0))
-
-
-
-
     """
     Algo
-
     Fill up replay buffer for a while, taking random actions to start. .populate()
-
     Train the dvq on the replay buffer randomly shuffled.
-
     Use dvq tokens to train transformer (gpt-architecture) 
     """
-    # -------------------- Standard dvq training
 
-    # annealing schedules for lots of constants
-    callbacks = [ModelCheckpoint(monitor='dvq_recon_loss', mode='min', every_n_train_steps=1000, save_top_k=3), DecayLR()]
-    if False and args.dvq_vq_flavor == 'gumbel':  # Not used yet
-       callbacks.extend([DecayTemperature(), RampBeta()])
+    seed_everything(SEED)  # env is seeded later tho
 
-    # Things to try
-    # More steps cos anneal goes to 1.2M! Not helping
-    # Fewer clusters, we're only using ~50 out of 4096: Resulted in blurry images
-    # Do k-means throughout training, not just once: works great! went from 10/20 to 19.5/20 correct images
-    # Output image, we can count images that are obviously wrong
-    # 10 points per cluster seemed to work better than 20, try 15, etc...: 15 works pretty well vs 20 and 10
-    trainer = pl.Trainer.from_argparse_args(args, callbacks=callbacks, max_steps=int(1.2e6), logger=wandb_logger, gpus=1)
+    if not args.dvq_checkpoint:
+        train_dvq(args, model, wandb_logger, fast_dev_run)
 
-    trainer.fit(model)
-
-    return # TODO: GPT stuff below
+    # return # TODO: GPT stuff below
 
     # -------------------- Standard mingpt training
     log.info("preparing the learning rate schedule")
-    iter_tokens = args.gpt_batch_size * args.gpt_block_size  # number of tokens backpropped in one iteration
+    # number of tokens backpropped in one iteration, need to reduce for zuma vs char as tokens are 10x larger
+    iter_tokens = args.gpt_batch_size * args.gpt_block_size
     epoch_tokens = math.ceil(args.batches_per_epoch * iter_tokens)
     lr_decay = WarmupCosineLearningRateDecay(learning_rate=6e-4,
                                              warmup_tokens=512 * 20,  # epoch_tokens // 2,
@@ -679,21 +812,71 @@ def cli_main():
                                              final_tokens=args.num_epochs * epoch_tokens)
     t0 = time.time()
     log.info("training...")
-    trainer = pl.Trainer(gpus=args.num_gpus, max_epochs=args.num_epochs, gradient_clip_val=1.0, callbacks=[lr_decay],
-                         precision=args.precision, default_root_dir=args.default_root_dir)
-    trainer.fit(model.gpt, train_dataloader, val_dataloader)  # Need to populated these
-    t1 = time.time()
-    log.info("%d epochs took %fs, or %fs/epoch" % (args.num_epochs, t1 - t0, (t1 - t0) / args.num_epochs))
+    checkpoint_callback = ModelCheckpoint(monitor='gpt_train_loss', mode='min', every_n_train_steps=1000, save_top_k=3,
+                                          verbose=True)
+    trainer = pl.Trainer(gpus=args.num_gpus, max_epochs=args.num_epochs, gradient_clip_val=1.0,
+                         callbacks=[lr_decay, checkpoint_callback],
+                         precision=args.precision, default_root_dir=args.default_root_dir, logger=wandb_logger,
+                         deterministic=True, fast_dev_run=fast_dev_run)  # Turn off deterministic speed up
 
-    # save checkpoints based on avg_reward
-    checkpoint_callback = ModelCheckpoint(save_top_k=1, monitor="max_interesting", mode="max", period=1, verbose=True)
+    # checkpoint_callback = ModelCheckpoint(save_top_k=1, monitor="max_interesting", mode="max", period=1, verbose=True)
 
-    seed_everything(SEED)  # env is seeded later
-    trainer = pl.Trainer.from_argparse_args(args, deterministic=True, checkpoint_callback=checkpoint_callback)
+    # trainer = pl.Trainer.from_argparse_args(args, callbacks=callbacks, max_steps=int(1.2e6), logger=wandb_logger,
+    #                                         gpus=1)  # Max steps can be like 5k I think.
 
     trainer.fit(model)
 
+    # train_dataset = CharDataset(open('train_shakespeare.txt', 'r').read(), args.block_size)  # one line of poem is roughly 50 characters
+    # val_dataset = CharDataset(open('val_shakespeare.txt', 'r').read(), args.block_size)
+    # test_dataset = CharDataset(open('test_shakespeare.txt', 'r').read(), args.block_size)
+    #
+    # common = {'batch_size': args.batch_size, 'pin_memory': bool(args.pin_memory), 'num_workers': args.num_workers}
+    # train_dataloader = DataLoader(train_dataset, shuffle=True, **common)
+    # val_dataloader = DataLoader(val_dataset, shuffle=False, **common)
+
+    t1 = time.time()
+    log.info("%d epochs took %fs, or %fs/epoch" % (args.num_epochs, t1 - t0, (t1 - t0) / args.num_epochs))
     # end standard mingpt training
+
+
+def load_pretrained_dvq(args, model):
+    _model = torch.load(args.dvq_checkpoint)
+    state_dict = {k:v for k,v in _model['state_dict'].items() if k.startswith('dvq')}
+    state_dict = {k[4:]:v for k,v in state_dict.items()}  # Remove `dvq.` as we're loading a submodule
+    model.dvq.load_state_dict(state_dict)
+    # _model = LearnMax.load_from_checkpoint(args.dvq_checkpoint)
+    # set_net_weights(_model.dvq.encoder.net, model.dvq.encoder.net)
+    # set_net_weights(_model.dvq.decoder.net, model.dvq.decoder.net)
+    # assert len(list(model.dvq.decoder.net.parameters())) == 14, 'Did you add a new layer, if so copy the weights'
+    # assert _model.dvq.quantizer.embed.embedding_dim == model.dvq.quantizer.embed.embedding_dim
+    # assert _model.dvq.quantizer.embed.num_embeddings == model.dvq.quantizer.embed.num_embeddings
+    # assert _model.dvq.quantizer.output_proj == model.dvq.quantizer.output_proj
+    # assert _model.dvq.quantizer.patch_width == model.dvq.quantizer.patch_width
+    # assert _model.dvq.is_single_token2 == model.dvq.is_single_token2
+    # model.dvq.quantizer.embed.weight = _model.dvq.quantizer.embed.weight
+    # model.dvq.quantizer.proj.weight = _model.dvq.quantizer.proj.weight
+    # model.dvq.quantizer.proj.bias = _model.dvq.quantizer.proj.bias
+    for attr in dir(model.dvq):
+        if hasattr(getattr(model.dvq, attr), 'weight') and attr not in ('embed', 'proj'):
+            raise ValueError('Unexpected params, add support for new layers here')
+
+
+def train_dvq(args, model, wandb_logger, fast_dev_run):
+    # -------------------- Standard dvq training
+    # annealing schedules for lots of constants
+    callbacks = [ModelCheckpoint(monitor='dvq_recon_loss', mode='min', every_n_train_steps=1000, save_top_k=3),
+                 DecayLR()]
+    if False and args.dvq_vq_flavor == 'gumbel':  # Not used yet
+        callbacks.extend([DecayTemperature(), RampBeta()])
+    # Things to try
+    # More steps cos anneal goes to 1.2M! Not helping
+    # Fewer clusters, we're only using ~50 out of 4096: Resulted in blurry images
+    # Do k-means throughout training, not just once: works great! went from 10/20 to 19.5/20 correct images
+    # Output image, we can count images that are obviously wrong
+    # 10 points per cluster seemed to work better than 20, try 15, etc...: 15 works pretty well vs 20 and 10
+    trainer = pl.Trainer.from_argparse_args(args, callbacks=callbacks, max_steps=int(1.2e6), logger=wandb_logger,
+                                            gpus=args.num_gpus, fast_dev_run=fast_dev_run)  # Max steps can be like 5k I think.
+    trainer.fit(model)
 
 
 class ProcessFrame84Color(ObservationWrapper):

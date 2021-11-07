@@ -25,11 +25,9 @@ class CausalSelfAttention(nn.Module):
     explicit implementation to show that there is nothing too scary here.
     """
 
-    def __init__(self, embedding_dim, block_size, n_head, attn_pdrop, resid_pdrop, out_embedding_dim=None):
+    def __init__(self, embedding_dim, block_size, n_head, attn_pdrop, resid_pdrop):
         super().__init__()
         assert embedding_dim % n_head == 0
-        if out_embedding_dim is None:
-            out_embedding_dim = embedding_dim
         self.n_head = n_head
         # key, query, value projections for all heads
         self.key = nn.Linear(embedding_dim, embedding_dim)
@@ -39,18 +37,18 @@ class CausalSelfAttention(nn.Module):
         self.attn_drop = nn.Dropout(attn_pdrop)
         self.resid_drop = nn.Dropout(resid_pdrop)
         # output projection
-        self.proj = nn.Linear(embedding_dim, out_embedding_dim)
+        self.proj = nn.Linear(embedding_dim, embedding_dim)
         # causal mask to ensure that attention is only applied to the left in the input sequence
         self.register_buffer("mask", torch.tril(torch.ones(block_size, block_size))
                                      .view(1, 1, block_size, block_size))
 
     def forward(self, x, layer_past=None):
-        B, T, C = x.size()
+        B, T, C = x.size()  # 64, 128, 256, Channels = token+pos embedding size
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        k = self.key(x).view(  B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = self.query(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = self.value(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        k = self.key(x).view(  B, T, self.n_head, C // self.n_head).transpose(1, 2) # (64, 8, 128, 32)
+        q = self.query(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B,  nh, T,  hs)
+        v = self.value(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B,  nh, T,  hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
@@ -71,17 +69,24 @@ class Block(nn.Module):
         super().__init__()
         self.ln1 = nn.LayerNorm(embedding_dim)
         self.ln2 = nn.LayerNorm(embedding_dim)
-        self.attn = CausalSelfAttention(embedding_dim, block_size, n_head, attn_pdrop, resid_pdrop, out_embedding_dim)
+        self.attn = CausalSelfAttention(embedding_dim, block_size, n_head, attn_pdrop, resid_pdrop)
         self.mlp = nn.Sequential(
             nn.Linear(embedding_dim, 4 * embedding_dim),
             nn.GELU(),
             nn.Linear(4 * embedding_dim, embedding_dim),
-            nn.Dropout(resid_pdrop),
+            nn.Dropout(resid_pdrop),  # TODO: Ask Eleuther why this expansion and contraction is done even in perceiver
         )
+        if out_embedding_dim != embedding_dim:
+            self.out_proj = nn.Linear(embedding_dim, out_embedding_dim)
+        else:
+            self.out_proj = None
 
     def forward(self, x):
         x = x + self.attn(self.ln1(x))
         x = x + self.mlp(self.ln2(x))
+        if self.out_proj is not None:
+            # We could do cross attention as in perceiver IO, but this seems simpler ¯\_(ツ)_/¯
+            x = self.out_proj(x)
         return x
 
 class GPT(nn.Module):
@@ -101,6 +106,7 @@ class GPT(nn.Module):
                  embd_pdrop: float = 0.1,  # \in [0,1]: amount of dropout on input embeddings
                  resid_pdrop: float = 0.1,  # \in [0,1]: amount of dropout in each residual connection
                  attn_pdrop: float = 0.1,  # \in [0,1]: amount of dropout on the attention matrix
+                 should_input_embed: bool = False,  # whether to use embeddings or indexes as input to first layer
                  ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -115,12 +121,13 @@ class GPT(nn.Module):
         self.pos_emb = nn.Parameter(torch.zeros(1, block_size, embedding_dim))
         self.drop = nn.Dropout(embd_pdrop)
         # deep transformer: just a sequence of transformer blocks
-        self.blocks, self.scaling = self.init_blocks(attn_pdrop, block_size, embedding_dim, n_head, n_layer, resid_pdrop)
+        self.blocks, _, out_dims = self.init_blocks(attn_pdrop, block_size, embedding_dim, n_head, n_layer, resid_pdrop)
+        out_embedding_dim = out_dims[-1]
 
         # decoder: at the end one more layernorm and decode the answers
-        self.ln_f = nn.LayerNorm(embedding_dim)
-        self.logit_p_head = nn.Linear(embedding_dim, vocab_size, bias=False) # no need for extra bias due to one in ln_f
-        self.deviation_head = nn.Linear(embedding_dim, vocab_size, bias=False)   # mean deviation
+        self.ln_f = nn.LayerNorm(out_embedding_dim)
+        self.logit_p_head = nn.Linear(out_embedding_dim, vocab_size, bias=False) # no need for extra bias due to one in ln_f
+        self.deviation_head = nn.Linear(out_embedding_dim, vocab_size, bias=False)   # mean deviation
 
         self.block_size = block_size
         self.apply(self._init_weights)
@@ -128,8 +135,9 @@ class GPT(nn.Module):
         self.iter = 0
         self.trajectory_counts: Dict[Tuple[int], int] = defaultdict(int)
         self.max_trajectory_count = 0
+        self.should_input_embed = should_input_embed
 
-        log.info("number of parameters: %e", sum(p.numel() for p in self.parameters()))
+        log.info("number of parameters: %e" % sum(p.numel() for p in self.parameters()))
 
     def init_blocks(self, attn_pdrop, block_size, embedding_dim, n_head, n_layer, resid_pdrop):
         """
@@ -139,17 +147,22 @@ class GPT(nn.Module):
         reduces the amount of memory used in all subsequent layers that use the reduced layer width.
         """
         blocks = []
-        approx_scale = [0.25] + [1] * (n_layer - 1)  # TODO: Allow passing this in
+        approx_scale = [0.1] + [1] * (n_layer - 1)  # TODO: Allow passing this in
         assert len(approx_scale) == n_layer
+        out_dims = []
         for l_i in range(n_layer):
-            if embedding_dim % n_head != 0:
-                # Make embedding dim divisible by number of heads
-                embedding_dim -= embedding_dim % n_head
-            out_embedding_dim = int(approx_scale[l_i] * embedding_dim)
-
+            embedding_dim = self.make_divisible_by_heads(embedding_dim, n_head)
+            out_embedding_dim = self.make_divisible_by_heads(int(approx_scale[l_i] * embedding_dim), n_head)
             blocks.append(Block(embedding_dim, block_size, n_head, attn_pdrop, resid_pdrop, out_embedding_dim))
             embedding_dim = out_embedding_dim
-        return nn.Sequential(*blocks), approx_scale
+            out_dims.append(out_embedding_dim)
+        return nn.Sequential(*blocks), approx_scale, out_dims
+
+    def make_divisible_by_heads(self, embedding_dim, n_head):
+        if embedding_dim % n_head != 0:
+            # Make embedding dim divisible by number of heads
+            embedding_dim -= embedding_dim % n_head
+        return embedding_dim
 
     def get_block_size(self):
         return self.block_size
@@ -227,12 +240,19 @@ class GPT(nn.Module):
             print('trajectories: ', len(self.trajectory_counts))
             print('max_trajectory_count: ', self.max_trajectory_count)
 
-    def forward(self, idx):
-        b, t = idx.size()
+    def forward(self, idx_or_embed):
+        if len(idx_or_embed.size()) == 3:  # TODO: Use self.should_input_embed here
+            b, t, embed = idx_or_embed.size()
+        else:
+            b, t = idx_or_embed.size()
+            embed = None
         assert t <= self.block_size, "Cannot forward, model block size is exhausted."
 
         # forward the GPT model
-        token_embeddings = self.tok_emb(idx) # each index maps to a (learnable) vector
+        if embed is None:
+            token_embeddings = self.tok_emb(idx_or_embed) # each index maps to a (learnable) vector
+        else:
+            token_embeddings = idx_or_embed  # Tokens are input directly from dvq, keeping semantic info instead of re-learning
         position_embeddings = self.pos_emb[:, :t, :] # each position maps to a (learnable) vector
         x = self.drop(token_embeddings + position_embeddings)
         x = self.blocks(x)
@@ -240,34 +260,43 @@ class GPT(nn.Module):
         logits = self.logit_p_head(x)
         expected_deviation = self.deviation_head(x)  # Uses mean deviation instead of standard deviation https://stats.stackexchange.com/q/81986/18187
 
-        wandb.log({'train/expected_deviation_median', torch.quantile(expected_deviation, 0.5)})
-        wandb.log({'train/expected_deviation_90pct', torch.quantile(expected_deviation, 0.9 )})
-        wandb.log({'train/expected_deviation_95pct', torch.quantile(expected_deviation, 0.95)})
-        wandb.log({'train/expected_deviation_99pct', torch.quantile(expected_deviation, 0.99)})
-        wandb.log({'train/expected_deviation_mean', expected_deviation.mean()})
-        wandb.log({'train/expected_deviation_max', expected_deviation.max()})
-        wandb.log({'train/expected_deviation_min', expected_deviation.min()})
-        wandb.log({'train/logits_std', logits.std()})
+        wandb.log({'train/expected_deviation_median': torch.quantile(expected_deviation, 0.5)})
+        wandb.log({'train/expected_deviation_90pct': torch.quantile(expected_deviation, 0.9 )})
+        wandb.log({'train/expected_deviation_95pct': torch.quantile(expected_deviation, 0.95)})
+        wandb.log({'train/expected_deviation_99pct': torch.quantile(expected_deviation, 0.99)})
+        wandb.log({'train/expected_deviation_mean': expected_deviation.mean()})
+        wandb.log({'train/expected_deviation_max': expected_deviation.max()})
+        wandb.log({'train/expected_deviation_min': expected_deviation.min()})
+        wandb.log({'train/logits_std': logits.std()})
 
         return logits, expected_deviation
 
     def step_(self, split, batch, batch_idx=None):
-        idx, targets = batch
-        logits, expected_deviation = self(idx)
+        embed, idx, target_idx = batch  # So this is like  x, x_idx, y = batch
+        x = embed if self.should_input_embed else idx
+        logits, expected_deviation = self(x)
 
         # Calculate mean deviation loss --------------------------------------
         # Turn targets into one hot B x block_size x vocab_size with 1 in vocab
-        one_hot = F.one_hot(targets, num_classes=self.vocab_size)
+        one_hot = F.one_hot(target_idx, num_classes=self.vocab_size).squeeze()
         probs = F.softmax(logits, dim=-1)
-        wandb.log({'train/probs_std', probs.std()})
+        wandb.log({'train/probs_std': probs.std()})
         p_diff = (one_hot - probs).abs()  # actual deviation
         d_diff = p_diff - expected_deviation
         d_loss = d_diff.square().sum() / d_diff.numel()
 
         # Calculate standard transformer categorical probability loss-----------
         # pytorch cross entropy has built-in softmax so pass logits
-        p_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        p_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_idx.reshape(-1))
         loss = d_loss + p_loss
         self.iter += 1
         return {'loss': loss}
 
+    def training_step(self, *args, **kwargs):
+        return self.step_('train', *args, **kwargs)
+
+    def validation_step(self, *args, **kwargs):
+        return self.step_('val', *args, **kwargs)
+
+    def test_step(self, *args, **kwargs):
+        return self.step_('test', *args, **kwargs)

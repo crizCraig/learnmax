@@ -9,4 +9,4 @@ DATE_STR = datetime.now().strftime('%Y_%m-%d_%H-%M.%S.%f')
 SAVE_DIR = f'{ROOT_DIR}/checkpoints'
 CHECKPOINT_NAME = f'{DATE_STR}.ckpt'
 SEED = 1_414_213
-DEBUGGING = getattr(sys, 'gettrace', None) is not None
+DEBUGGING = sys.gettrace() is not None

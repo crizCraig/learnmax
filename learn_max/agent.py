@@ -48,7 +48,8 @@ class LearnMaxAgent:
             states = [states]
 
         if not isinstance(states, torch.Tensor):
-            states = torch.tensor(states, device=device)
+            states = torch.tensor(states, device=device)  # causes issues when num_workers > 0
+            # print(f'states {device=}')
 
         # TODO: Ensure that we pass an action state to each Env and aren't passing actions to one env and states to
         #   another, etc...
@@ -66,6 +67,8 @@ class LearnMaxAgent:
         # - Another way is a brute force - trajectory counting approach. The longer such trajectories are, the bigger
         #   the more keys a count dictionary would contain and the lower their constituent counts would be. This can
         #   be used to check the above heuristics.
+        # - DVQ reconstruction loss - if the image hasn't been seen before, we will do a really bad job at reconstructing,
+        #   esp. if it's a new level in zuma for example
 
         # TODO: Consider moving this up to the lightning model
         self.s_buff.append(states)
@@ -76,15 +79,14 @@ class LearnMaxAgent:
             self.dvq_ready = True  # dvq outputs are now based on some training
         else:
             dvq_x = states
-
-        x_hat, z_q_emb, latent_loss, z_q_ind = self.model.dvq(dvq_x, wait_to_init=not self.dvq_ready)
+        x, x_hat, z_q_emb, z_q_flat, latent_loss, z_q_ind = self.model.dvq(dvq_x, wait_to_init=not self.dvq_ready)
 
         # Return a random action if we haven't filled buffer of z states.
         if True or not dvq_batch_ready:
             ret = self.get_random_action(states)
         else:
             # Search through tree of predicted z,a to find most interesting future
-            ret = self.model.beam_search(z_q_emb, self.a_buff)
+            ret = self.model.beam_search(z_q_flat, self.a_buff)
 
         # # get the logits and pass through softmax for probability distribution
         # probabilities = F.softmax(self.net(states)).squeeze(dim=-1)

@@ -54,8 +54,7 @@ else:
 model.cuda()
 x = x.cuda()
 
-
-x_hat, z_q, latent_loss, ind = model(x)
+x, x_hat, z_q_emb, z_q_flat, latent_loss, z_q_ind = model(x)
 
 
 xcols = torch.cat([x, x_hat], axis=2) # side by side x_pre and xhat

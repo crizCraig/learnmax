@@ -8,6 +8,7 @@ import math
 from argparse import ArgumentParser
 
 import torch
+import wandb
 from torch import nn, einsum
 import torch.nn.functional as F
 
@@ -33,7 +34,7 @@ class VQVAE(dvq_module):
 
     def __init__(self, n_hid=64, num_embeddings=512, embedding_dim=64, loss_flavor='l2',
                  input_channels=3, enc_dec_flavor='deepmind', vq_flavor='vqvae', quantize_proj=None,
-                 is_single_token2=False):
+                 is_single_token2=False, enable_kmeans=True):
         """
         @type n_hid: number of channels controlling the size of the model
         @type num_embeddings: vocabulary size; number of possible discrete states
@@ -42,10 +43,12 @@ class VQVAE(dvq_module):
         @type input_channels: Typically 3 for RGB
         @type enc_dec_flavor: Deepmind VQVAE or OpenAI Dall-E dVAE
         @type vq_flavor: `vqvae` or `gumbel`
+        @type enable_kmeans: whether to run kmeans alongside online clustering
         """
         super().__init__()
 
         self.is_single_token2 = is_single_token2
+        self.enable_kmeans = enable_kmeans
 
         # encoder/decoder module pair
         Encoder, Decoder = {
@@ -71,7 +74,7 @@ class VQVAE(dvq_module):
         }[vq_flavor]
         self.quantizer = QuantizerModule(self.encoder.output_channels, num_embeddings, embedding_dim,
                                          patch_width=self.encoder.out_width, output_proj=quantize_proj,
-                                         is_single_token2=self.is_single_token2)
+                                         is_single_token2=self.is_single_token2, enable_kmeans=self.enable_kmeans)
 
         # the data reconstruction loss in the ELBO
         ReconLoss = {
@@ -82,14 +85,19 @@ class VQVAE(dvq_module):
         self.recon_loss = ReconLoss
 
     def forward(self, x, wait_to_init=False):
+
         z = self.encoder(x)
-        z_q, latent_loss, ind = self.quantizer(z, wait_to_init)  # zq 128, 64, 8, 8 vs 128, 1024
+        
+        z_q_emb, z_q_flat, latent_loss, z_q_ind = self.quantizer.forward(z, wait_to_init)  # zq 128, 64, 8, 8 vs 128, 1024
         if 'TRY_NON_QUANTIZED' in os.environ:
             x_hat = self.decoder(z)
         else:
-            x_hat = self.decoder(z_q)  # zq is B, Embed dim, H, W
+            x_hat = self.decoder(z_q_emb)  # zq is B, Embed dim, H, W
+        return x, x_hat, z_q_emb, z_q_flat, latent_loss, z_q_ind  # Return x as we do a view on it
 
-        return x_hat, z_q, latent_loss, ind
+    def set_enable_kmeans(self, value):
+        self.enable_kmeans = value
+        self.quantizer.enable_kmeans = value
 
     def training_step(self, batch, batch_idx):
         if len(batch) == 5:
@@ -97,27 +105,40 @@ class VQVAE(dvq_module):
             x = torch.cat([s, s_next])
         else:
             x, y = batch # hate that i have to do this here in the model
-        x_hat, z_q, latent_loss, ind = self.forward(x)
+
+        x, x_hat, z_q_emb, z_q_flat, latent_loss, z_q_ind = self.forward(x)
         recon_loss = self.recon_loss.nll(x, x_hat)
         quant_loss_mult = float(os.getenv('QUANT_LOSS_MULT', 1))
         loss = recon_loss + quant_loss_mult * latent_loss
         return loss, recon_loss, latent_loss, x_hat
 
     def validation_step(self, batch, batch_idx):
-        x, y = batch # hate that i have to do this here in the model
-        x_hat, z_q, latent_loss, ind = self.forward(x)
+        if len(batch) == 5:
+            s, a, r, d, s_next = batch
+            # x = torch.cat([s, s_next])  # doubles batch size
+            x = s
+        else:
+            x, y = batch # hate that i have to do this here in the model
+
+        if len(x.shape) == 5:  # B, block_size, C, H, W
+            # Includes gpt block size in shape, flatten first two dimensions
+            x = x.view(x.shape[0] * x.shape[1], x.shape[2], x.shape[3], x.shape[4])
+        x, x_hat, z_q_emb, z_q_flat, latent_loss, z_q_ind = self.forward(x)
         recon_loss = self.recon_loss.nll(x, x_hat)
-        self.log('dvq_val_recon_loss', recon_loss, prog_bar=True)
-        self.log('dvq_latent_loss', latent_loss, prog_bar=True)
+        wandb.log({'dvq_val_recon_loss': recon_loss})
+        wandb.log({'dvq_val_latent_loss': latent_loss})
+
+        quant_loss_mult = float(os.getenv('QUANT_LOSS_MULT', 1))
+        loss = recon_loss + quant_loss_mult * latent_loss
 
         # debugging: cluster perplexity. when perplexity == num_embeddings then all clusters are used exactly equally
-        encodings = F.one_hot(ind, self.quantizer.n_embed).float().reshape(-1, self.quantizer.n_embed)
+        encodings = F.one_hot(z_q_ind, self.quantizer.n_embed).float().reshape(-1, self.quantizer.n_embed)
         avg_probs = encodings.mean(0)
-        print(avg_probs)
         perplexity = (-(avg_probs * torch.log(avg_probs + 1e-10)).sum()).exp()
         cluster_use = torch.sum(avg_probs > 0)
-        self.log('dvq_val_perplexity', perplexity, prog_bar=True)
-        self.log('dvq_val_cluster_use', cluster_use, prog_bar=True)
+        wandb.log({'dvq_val_perplexity': perplexity})
+        wandb.log({'dvq_val_cluster_use': cluster_use})
+        return loss, recon_loss, latent_loss, x_hat, z_q_ind, z_q_flat
 
     def configure_optimizers(self):
 

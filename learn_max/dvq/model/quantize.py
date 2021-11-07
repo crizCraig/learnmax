@@ -15,6 +15,8 @@ from loguru import logger as log
 from scipy.cluster.vq import kmeans2
 
 # -----------------------------------------------------------------------------
+from learn_max.utils import wandb_try_log
+
 
 class VQVAEQuantize(nn.Module):
     """
@@ -25,7 +27,8 @@ class VQVAEQuantize(nn.Module):
     https://github.com/deepmind/sonnet/blob/v2/sonnet/src/nets/vqvae.py
     https://github.com/deepmind/sonnet/blob/v2/examples/vqvae_example.ipynb
     """
-    def __init__(self, num_hiddens, n_embed, embedding_dim, patch_width=None, output_proj=None, is_single_token2=False):
+    def __init__(self, num_hiddens, n_embed, embedding_dim, patch_width=None, output_proj=None, is_single_token2=False,
+                 enable_kmeans=True):
         super().__init__()
 
         self.embedding_dim = embedding_dim
@@ -38,6 +41,7 @@ class VQVAEQuantize(nn.Module):
 
         self.is_single_token2 = is_single_token2
         self.forward_iter = 0
+        self.enable_kmeans = enable_kmeans
 
         if 'SINGLE_TOKEN' in os.environ:
             self.proj = nn.Linear(embedding_dim, embedding_dim)  # Perhaps could be removed
@@ -90,7 +94,7 @@ class VQVAEQuantize(nn.Module):
         # DeepMind def does not do this but I find I have to... ;/
         # Works just as well with one point per cluster in single token CIFAR which is somewhat sus.
         # HOWEVER, super important for Montezuma
-        if 'DISABLE_KMEANS' not in os.environ and self.training and self.data_initialized.item() == 0:
+        if self.enable_kmeans and self.training and self.data_initialized.item() == 0:
             # TODO: We need to do this on the batch after performing some random actions, or just try random init.
             #  If that doesn't work, we can try youtube videos, or use randomly drawn samples from a large replay
             #  buffer to retrain.
@@ -115,13 +119,13 @@ class VQVAEQuantize(nn.Module):
                 self.data_initialized.fill_(1)
             # TODO: this won't work in multi-GPU setups
 
-        if self.forward_iter % 4000 == 0:
+        if self.training and self.forward_iter % 4000 == 0:
             # This actually ends up happening every 2000 updates due to validation iters or something
             # TODO: Use the global train step through a lightning hook like the learning rate
             self.data_initialized.fill_(0)
 
         if self.initial_centroid_spread is not None:
-            wandb.log({'initial_centroid_spread': self.initial_centroid_spread})
+            wandb_try_log({'initial_centroid_spread': self.initial_centroid_spread})
 
         # Extract indexes from embedding and computes distance (similar to k-means here?)
         dist = (
@@ -132,17 +136,17 @@ class VQVAEQuantize(nn.Module):
         # dimensions are (num_tokens, num_embeddings)
         # TODO: First just see if we can set latent loss to zero and get good single token performance
 
-        _, ind = (-dist).max(1)
-        wandb.log({'unique_closest_clusters': torch.unique(ind).numel()})
+        _, z_q_ind = (-dist).max(1)
+        wandb_try_log({'unique_closest_clusters': torch.unique(z_q_ind).numel()})
         if self.forward_iter % 100 == 0:
-            wandb.log({'centroid_spread': self.get_centroid_spread()})
+            wandb_try_log({'centroid_spread': self.get_centroid_spread()})
         # Dist between centroids
         # Avg Dist betweeen points
         if 'SINGLE_TOKEN' not in os.environ and not self.is_single_token2:
             # tensor([[[371, 371, 371,  ..., 371, 371, 371],
             #          [371, 371, 371,  ..., 371, 371, 371],
             #          [371, 371, 371,  ..., 371, 371, 371]]], device='cuda:0')
-            ind = ind.view(B, H, W)  # (128, 8, 8)
+            z_q_ind = z_q_ind.view(B, H, W)  # (128, 8, 8)
         # Single token initial 128
         # tensor([411, 411, 411, 411, 411, 411, 411, 411, 411, 411, 411, 411, 411, 411,
         #         411, 411, 411, 411, 411, 411, 411, 411, 411, 411, 411, 411, 411, 411,
@@ -156,28 +160,29 @@ class VQVAEQuantize(nn.Module):
         #         411, 411], device='cuda:0')
 
         # vector quantization cost that trains the embedding vectors
-        z_q = self.embed_code(ind) # (B, H, W, C) (128, 8, 8, 64) OR ST2=> (B, E) (128, 4096)
-        point_spread = self.get_point_spread(z_e, z_q)
-        wandb.log({'point_spread': point_spread})
+        z_q_emb = self.embed_code(z_q_ind) # (B, H, W, C) (128, 8, 8, 64) OR ST2=> (B, E) (128, 4096)
+        point_spread = self.get_point_spread(z_e, z_q_emb)
+        wandb_try_log({'point_spread': point_spread})
         if self.initial_point_spread is None:
             self.initial_point_spread = point_spread
-            log.info(f'initial_point_spread {self.initial_point_spread}')
-        wandb.log({'initial_point_spread': self.initial_point_spread})
+            log.debug(f'initial_point_spread {self.initial_point_spread}')
+        wandb_try_log({'initial_point_spread': self.initial_point_spread})
 
         commitment_cost = 0.25
-        latent_loss = commitment_cost * (z_q.detach() - z_e).pow(2).mean() + (z_q - z_e.detach()).pow(2).mean()
+        latent_loss = commitment_cost * (z_q_emb.detach() - z_e).pow(2).mean() + (z_q_emb - z_e.detach()).pow(2).mean()
         latent_loss *= self.kld_scale
 
-        z_q = z_e + (z_q - z_e).detach() # noop in forward pass, straight-through gradient estimator in backward pass
+        z_q_emb = z_e + (z_q_emb - z_e).detach() # noop in forward pass, straight-through gradient estimator in backward pass
+        z_q_flat = z_q_emb
         if self.is_single_token2:
             # Had 128 * 64 = B * W **2, E
             # Now we have B, W ** 2 * C = 128,
-            z_q = z_q.reshape(B, H, W, self.output_proj)  # (B, E) = (B, H*W*C) => (B, H, W, C)
+            z_q_emb = z_q_emb.reshape(B, H, W, self.output_proj)  # (B, E) = (B, H*W*C) => (B, H, W, C)
         if 'SINGLE_TOKEN' not in os.environ:
-            z_q = z_q.permute(0, 3, 1, 2) # stack encodings into channels again: (B, C, H, W)
+            z_q_emb = z_q_emb.permute(0, 3, 1, 2) # stack encodings into channels again: (B, C, H, W)
 
         self.forward_iter += 1
-        return z_q, latent_loss, ind
+        return z_q_emb, z_q_flat, latent_loss, z_q_ind
 
     def get_point_spread(self, z_e, z_q):
         return ((z_q - z_e) ** 2).sum(axis=1).sqrt().mean()

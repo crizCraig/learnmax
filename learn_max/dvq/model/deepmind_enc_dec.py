@@ -79,7 +79,6 @@ class DeepMindEncoder(nn.Module):
                     ResBlock(2*n_hid, 2*n_hid//4),  # 128, 8x8
                 )
 
-
         self.out_width = out_width
         # self.output_stide = 4
 

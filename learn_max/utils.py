@@ -1,6 +1,7 @@
 import torch
 
 import numpy as np
+import wandb
 from numpy import array
 from torch import nn
 
@@ -111,6 +112,13 @@ def _init_weights(module):
     elif isinstance(module, nn.LayerNorm):
         module.bias.data.zero_()
         module.weight.data.fill_(1.0)
+
+
+def wandb_try_log(msg_dict):
+    try:
+        wandb.log(msg_dict)
+    except:
+        pass
 
 if __name__ == '__main__':
     test_topk_interesting()
