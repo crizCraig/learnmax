@@ -603,11 +603,12 @@ class LearnMax(pl.LightningModule):
     def add_model_specific_args(arg_parser: argparse.ArgumentParser, ) -> argparse.ArgumentParser:
         # TODO: Add the VQVAE and GPT args here as well
         arg_parser.add_argument("--dvq_quantize_proj", type=int, default=None)
+        arg_parser.add_argument("--num_gpus", type=int, default=1)
         arg_parser.add_argument("--single_token2", action='store_true', default=False)
         arg_parser.add_argument('-n', '--num_workers', type=int, default=None, help="number of workers for dataloading")
         arg_parser.add_argument('--viz_dvq', type=str, help="visualize dvq images", default=None)
         arg_parser.add_argument('--dvq_checkpoint', type=str, help="Checkpoint to restore", default=None)
-        arg_parser.add_argument('--gpt_batch_size', type=int, help="GPT batch size", default=4)
+        arg_parser.add_argument('--gpt_batch_size', type=int, help="GPT batch size", default=48)
         arg_parser.add_argument('--gpt_block_size', type=int, default=80,
                             help="block size for the model (length of window of context)")
         return arg_parser
