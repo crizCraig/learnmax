@@ -507,7 +507,51 @@ class LearnMax(pl.LightningModule):
 
             gpt_ret = self.gpt.training_step(batch=(gpt_x, z_q_ind_x, z_q_ind_y, a), batch_idx=batch_idx)
 
-            gpt_loss = self.gpt.training_step(batch=(gpt_x, z_q_ind_x, z_q_ind_y), batch_idx=batch_idx)  # Train gpt on dvq tokens shifted for prediction
+            if 'VISUALIZE_GPT' in os.environ:
+                # TODO: We have batch and window dimensions. Let's visualize the first batch window
+                batches_to_visualize = 1
+                for b_i in range(batches_to_visualize):
+                    num_imgs_per_row = 5
+                    top_n = 3
+                    imgs = s[b_i][:num_imgs_per_row]
+
+                    logits = gpt_ret['logits'].detach().cpu().numpy()[b_i][:num_imgs_per_row]
+
+                    # top n predicted next embedding indexes for each img
+                    top_n_idxs = torch.Tensor(np.argpartition(logits, -top_n)[:, -top_n:]).int()
+
+                    # get dvq embeddings from indexes
+                    embeddings = self.dvq.quantizer.embed_code(top_n_idxs.cuda())
+
+                    # decode predictions into images
+                    imgs_hat = self.dvq.decode_flat(embeddings)
+
+                    imgs_display = []
+                    for img_i, img in enumerate(imgs):
+                        img = img.permute(1, 2, 0).cpu().numpy()
+                        blank = np.ones_like(img)
+                        img_hat_row = []
+                        for ti in range(top_n):
+                            img_hat = (imgs_hat[img_i][ti].permute(1, 2, 0) + 0.5).clamp(0, 1)
+                            img_hat_row.append(img_hat.detach().cpu().numpy())
+                        left_img = np.concatenate([blank, img, blank])
+                        right_img = np.concatenate(img_hat_row)
+                        imgs_display.append(np.concatenate([left_img, right_img], axis=1))
+
+                    imgs_display = np.concatenate(imgs_display)
+                    fig1 = plt.figure(figsize=(num_imgs_per_row, 1))
+                    ax1 = fig1.add_subplot(111)
+                    ax1.imshow(imgs_display, interpolation='none')
+                    plt.show()
+                    # Visualize image with action and next image
+                    # Under that show the decoded image and the cluster index + distance
+
+
+                # TODO: Then for each subsequence in the window, visualize the predicted next states
+                # top_3_emb = None  # TODO get this from gpt_ret['logits']
+                # for emb in top_3_emb:
+                #     img_expected = self.dvq.decode(emb)
+                # pass
 
             # We use multiple optimizers so need to manually backward each one separately
             self.gpt_optimizer.zero_grad()

@@ -289,6 +289,10 @@ class GPT(nn.Module):
         # Turn targets into one hot B x block_size x vocab_size with 1 in vocab
         one_hot = F.one_hot(target_idx, num_classes=self.vocab_size).squeeze()
         probs = F.softmax(logits, dim=-1)
+
+        # Here we want to take the highest prob next states and visualize them.
+        # To visualize this, we need to decode the embedding into an image
+
         wandb.log({'train/probs_std': probs.std()})
         p_diff = (one_hot - probs).abs()  # actual deviation
         d_diff = p_diff - expected_deviation
@@ -299,7 +303,7 @@ class GPT(nn.Module):
         p_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_idx.reshape(-1))
         loss = d_loss + p_loss
         self.iter += 1
-        return {'loss': loss}
+        return {'loss': loss, 'logits': logits, 'expected_deviation': expected_deviation}
 
     def training_step(self, *args, **kwargs):
         return self.step_('train', *args, **kwargs)
