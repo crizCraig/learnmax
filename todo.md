@@ -1,4 +1,10 @@
 - try training the whole thing without having a good vqvae representation from a good pretrained agent or videos
     - this will mean that the meaning of the clusters will change over time. that should be okay as we are trying to maximize interestingness anyway. if we switch between training the transformer and dVAE 
 - train dVAE with pretrained agent
+- Pass the action in as an embedding
+  - Learn new state embedding so that the embedding can change to adapt with the added position embedding
+  - ~~Understand why recent ViT models don't use the position encoding~~ (they just use conv for position)
+  - Try summing it with the state just like the position embedding
+- ~~since loss is not decreasing, we should try to overfit on a single batch~~
+- visualize actual states and predicted states. right now we are not searching through a tree, so we should just be playing random actions and predicting the latent state results.
 - integrate transformer to take actions
