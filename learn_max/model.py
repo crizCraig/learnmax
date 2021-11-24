@@ -75,6 +75,7 @@ class LearnMax(pl.LightningModule):
             gpt_batch_size: int = 16,  # with such large embeddings (4410) needs to be small now to fit on rtx 2080
 
             # mingpt model optimization args
+            training_gpt: bool = None,  # whether to train gpt
             gpt_learning_rate: float = 3e-4,  # the base learning rate of the model
             gpt_weight_decay: float = 0.1,  # amount of regularizing L2 weight decay on MatMul ops
             gpt_betas: Tuple[float, float] = (0.9, 0.95),  # momentum terms (betas) for the Adam optimizer
@@ -142,7 +143,10 @@ class LearnMax(pl.LightningModule):
         self.dvq_enc_dec_flavor = dvq_enc_dec_flavor
         self.dvq_vq_flavor = dvq_vq_flavor
         self.dvq_checkpoint = dvq_checkpoint
-        self.training_gpt = True if self.dvq_checkpoint is not None else False
+        if training_gpt is None:
+            self.training_gpt = True if self.dvq_checkpoint is not None else False
+        else:
+            self.training_gpt = training_gpt
 
         self.gpt_embedding_dim = embedding_dim  # the "width" of the model (embedding_dim), number of channels in each Transformer
         self.gpt_block_size = gpt_block_size
