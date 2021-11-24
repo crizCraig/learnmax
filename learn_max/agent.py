@@ -66,7 +66,7 @@ class LearnMaxAgent:
             states = [states]
 
         if not isinstance(states, torch.Tensor):
-            states = torch.tensor(states, device=device)  # causes issues when num_workers > 0
+            states = torch.tensor(np.array(states), device=device)  # causes issues when num_workers > 0
             # print(f'states {device=}')
 
         # TODO: Ensure that we pass an action state to each Env and aren't passing actions to one env and states to
