@@ -81,9 +81,9 @@ class VQVAEQuantize(nn.Module):
 
                 # B,  8, 8, 64 CIFAR
                 # B, 21, 21, 8 Atari
-                # We want to get a batch of embeddings, so n 4096. We shouldn't project down so much, number 1.
+                # We want to get a batch of embeddings, so n 4096. We shouldn't project down so much.
                 # Fastest thing to do would be to resize, but CIFAR is 32x32 and we start out 84x84.
-                # So instead of proj going down from 64 to 8, we should go 64 to 10. Then the token size can be
+                # So instead of proj going down from 64 to 8, we go 64 to 10. Then the token size is
                 # 10 * 441 = 4410.
                 z_e = z_e.reshape(B, self.embedding_dim)  # B * H * W, E => B, H * W * E
 
@@ -175,11 +175,11 @@ class VQVAEQuantize(nn.Module):
         z_q_emb = z_e + (z_q_emb - z_e).detach() # noop in forward pass, straight-through gradient estimator in backward pass
         z_q_flat = z_q_emb
         if self.is_single_token2:
-            # Had 128 * 64 = B * W **2, E
-            # Now we have B, W ** 2 * C = 128,
-            z_q_emb = z_q_emb.reshape(B, H, W, self.output_proj)  # (B, E) = (B, H*W*C) => (B, H, W, C)
+            # (B, E) = (B, H*W*output_proj) => (B, H, W, output_proj)
+            # (128, 4410) = (128, 21*21*10) => (128, 21, 21, 10)
+            z_q_emb = z_q_emb.reshape(B, H, W, self.output_proj)
         if 'SINGLE_TOKEN' not in os.environ:
-            z_q_emb = z_q_emb.permute(0, 3, 1, 2) # stack encodings into channels again: (B, C, H, W)
+            z_q_emb = z_q_emb.permute(0, 3, 1, 2)  # stack encodings into channels again: (B, C, H, W)
 
         self.forward_iter += 1
         return z_q_emb, z_q_flat, latent_loss, z_q_ind

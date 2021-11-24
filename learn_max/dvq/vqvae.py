@@ -95,7 +95,7 @@ class VQVAE(dvq_module):
         if 'TRY_NON_QUANTIZED' in os.environ:
             x_hat = self.decoder(z)
         else:
-            x_hat = self.decoder(z_q_emb)  # zq is B, Embed dim, H, W
+            x_hat = self.decoder(z_q_emb)  # zq is B, Embed dim, H, W i.e. 1, 10, 21, 21
 
         recon_loss = self.recon_loss.nll(x, x_hat)
         quant_loss_mult = float(os.getenv('QUANT_LOSS_MULT', 1))
