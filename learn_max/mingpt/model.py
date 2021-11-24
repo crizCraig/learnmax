@@ -89,6 +89,7 @@ class Block(nn.Module):
             x = self.out_proj(x)
         return x
 
+
 class GPT(nn.Module):
     """  the full GPT language model, with a context size of block_size """
 
@@ -107,6 +108,7 @@ class GPT(nn.Module):
                  resid_pdrop: float = 0.1,  # \in [0,1]: amount of dropout in each residual connection
                  attn_pdrop: float = 0.1,  # \in [0,1]: amount of dropout on the attention matrix
                  should_input_embed: bool = False,  # whether to use embeddings or indexes as input to first layer
+                 num_actions: int = 0,  # number of actions to use for action embedding
                  ):
         super().__init__()
         self.vocab_size = vocab_size

@@ -167,7 +167,7 @@ def get_batch_vars(batch, use_next=False, return_agent_state=False, populate_gpt
         # z_q_ind = z_q_ind.view(batch_size, z_q_flat.shape[0] // batch_size, -1)
         z_q_ind_x = z_q_ind[:, :-1]
         z_q_ind_y = z_q_ind[:, 1:]
-        return gpt_x, z_q_ind_x, z_q_ind_y
+        return gpt_x, z_q_ind_x, z_q_ind_y, a[:, :-1], s
         # idx_or_embed = idx_or_embed.view(int(idx_or_embed.shape[0] / self.block_size) - 1, self.block_size,
         #                                  idx_or_embed.shape[1])
 

@@ -21,9 +21,9 @@ class GptWarmupCosineLearningRateDecay(pl.Callback):
         # state in this class, will count number of tokens processed so far
         self.tokens = 0
 
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx=None, dataloader_idx=None):
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx=None):
         # y needs to be target indexes which is currently not passed by train_batch, do so when training_gpt as we have them! Also, need to emulate -100 thing when stars align
-        gpt_x, z_q_ind_x, z_q_ind_y = get_batch_vars(batch, return_agent_state=True, populate_gpt=True)
+        gpt_x, z_q_ind_x, z_q_ind_y, a, s = get_batch_vars(batch, return_agent_state=True, populate_gpt=True)
         # _, y = batch
         self.tokens += (z_q_ind_y >= 0).sum()  # y == -100 is "ignore", so don't count these
         if self.tokens < self.warmup_tokens:
