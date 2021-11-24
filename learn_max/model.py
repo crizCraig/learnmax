@@ -220,13 +220,48 @@ class LearnMax(pl.LightningModule):
         self.obs_shape = self.env.observation_space.shape
         self.n_actions = self.env.action_space.n
 
-        # This action embedding will be concatenated with the dvq output. The first saliency level transformer
+        # This action embedding will be concatenated with the dvq output. The transformer
         #  will then enumerate all actions for all possible dvq tokens for n_actions * n_embd total possible
         #  outputs from the softmax. This allows selecting actions with the known next state.
-        #  Saliency levels above that will have abstract actions and therefore can't be enumerated.
-        #  Abstract actions will live in combined tokens along with abstract states. These tokens will be generated
-        #  by dvq's which take in z,a's below them.
-        self.action_emb = nn.Embedding(self.n_actions, embedding_dim)
+        # Saliency levels above that will have abstract actions, however, we will use the same
+        # dvq states with actions as keypoints. Saliency levels are combined into the same transformer by
+        # concating a context token to the input.
+        # The transformer will know what saliency level next z,a from this prefix. This saliency token will represent
+        # the salience level and the step within that level (so could perhaps be considered two tokens).
+
+        # OLD IDEA FROM WHICH THIS CAME - NOT SCALABLE DUE TO MANY TRANSFORMERS
+        # Abstract actions will live in combined (z,a) tokens along with abstract states. These tokens will be generated
+        # by dvq's which take in z,a's from below them.
+        #
+        # Low-level actions will therefore require simply taking the postfix from the txf predicted next token.
+
+        # Only one dvq is needed in order to transform concrete into abstract states.
+        # If a novel state is encountered, we must look at the salience sequence above us to determine if the state
+        # was unpredicted in that level as well. If so, we continue up a saliency level, until reaching the cieling
+        # saliency. https://drive.google.com/file/d/1HE1zsZnw41A7l1Hn5VEgyS0b59fgLYxu
+        # The image linked is above except that the reserved cieling token will not be reserved.
+        # The saliency decoder can be just an MLP with 2 output softmax's which
+        # maps a large set of dvq outputs to a given saliency level + saliency step.
+        # We don't start a new saliency level until the expected deviation of the transformer output decreases to a
+        # point where have a good grasp of the probabilities at the current saliency level.
+        # Basically we don't make a new level until unknown unknowns are reduced to known unknowns. I.e. we
+        # know if something is inherently noisy / evenly distributed vs unexplored at a given saliency level.
+        # Once the expected deviation of transformer output probabilities goes down on average at a given saliency
+        # level, but THEN we receive a highly surprising state (as determined via dvq reconstruction loss, low predicted
+        # probability by gpt, mahalonbis distance of the centroid from pen-ultimate dvq layer,
+        # or another uncertainty measure) only THEN do we create a _new_ salient state.
+        # This _should_ have the effect of compressing saliency levels over time as we become less surprised by
+        # our higher level plans and repeat them consistently. If this happens, we should notice the keypoint state
+        # for the saliency level above has been reached without novelty and skip that state in the input to the
+        # saliency level above for future training.
+        # So when we start training, everything will have the same saliency context until uncertainty goes down.
+        # Also, since the saliency decoder predicts an integer via the softmax, we need to map the integer to an embedding
+        # with learned embedding.
+
+
+        # TODO: In order to concatenate this with the state embedding, shrink the state embedding by the size of the
+        #   action embedding. Then make sure the softmax size is n_actions * n_state_embed
+        # self.action_emb = nn.Embedding(self.n_actions, action_embedding_dim)
 
         self.apply(_init_weights)  # Should only be action embeddings, other weights are in dvq and gpt
 
@@ -685,7 +720,7 @@ class LearnMax(pl.LightningModule):
 
         * take the transformer's input sequence of z,a embeddings and output deviations as input to beam search
           (note that deviation is the predicted output prob change and is the proxy we are using for uncertainty)
-        * for saliency level zero, just concatenate state and action embeddings for input to the transformer,
+        * for saliency level zero, just concatenate (or sum) state and action embeddings for input to the transformer,
           for higher levels, get the action that corresponds to each output state by forwarding it through the dvq decoder
           for that saliency level in batch(es) and getting the closest action embedding to the decoded one.
           saliency levels above level 0 will consist of their own dvq + gpt that clusters the action + state tokens
