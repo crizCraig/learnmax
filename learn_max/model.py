@@ -751,28 +751,35 @@ def viz_dvq():
     # model = LearnMax.load_from_checkpoint('/home/c2/src/learnmax/learn_max/wandb/run-20210824_140120-2w1glywq/files/learnmax-learn_max/2w1glywq/checkpoints/epoch=0-step=7399.ckpt')
     # ckpt = '/home/c2/src/learnmax/learn_max/wandb/run-20210906_120330-2y37nll3/files/learnmax-learn_max/2y37nll3/checkpoints/epoch=36-step=369999.ckpt'
     # ckpt = '/home/c2/src/learnmax/learn_max/wandb/run-20210907_154630-8v2mk188/files/learnmax-learn_max/8v2mk188/checkpoints/epoch=8-step=81999.ckpt'  # perfect on 20 examples
-    ckpt = '/home/c2/src/learnmax/learn_max/wandb/run-20210917_122229-3h1loaoh/files/learnmax-learn_max/3h1loaoh/checkpoints/epoch=3-step=30999.ckpt'  # 19/20
-    print(f'visualizing {ckpt}')
-    model = LearnMax.load_from_checkpoint(ckpt)
+    # ckpt = '/home/a/src/learnmax/epoch=3-step=30999.ckpt'  # 19/20
+    # print(f'visualizing {ckpt}')
+    # model = load_pretrained_dvq(ckpt)
     model.cuda()
     wandb.init(entity='crizcraig', mode='disabled')
 
     test_loader = model.test_dataloader()
-    x = next(iter(test_loader))
-    x = [t.cuda() for t in x]
-    loss, recon_loss, latent_loss, x_hat = model.dvq.training_step(x, 0)
+    xl = next(iter(test_loader))[0].cuda()
+    x = xl.cuda().reshape(-1, 3, 84, 84)
+    # TODO: List => Tensor
+    # x = [t.cuda() for t in xl]
+    # x_hat = [t['dvq_x_hat'].cuda() for t in x]
+    # loss, recon_loss, latent_loss, x_hat = model.dvq.training_step(x, 0)
+    # 80,3,84,84
+    x2, x_hat, z_q_emb, z_q_flat, latent_loss, recon_loss, dvq_loss, z_q_ind = model.dvq.forward(x)
     # states, actions, rewards, dones, new_states = next(iter(test_loader))
     # x = torch.cat([states, new_states])
-    xcols = torch.cat([x[0], x_hat[:32]], axis=2)  # side by side x_pre and xhat
-    xrows = torch.cat([xcols[i] for i in range(x[0].size(0))], axis=2)
-
-    plt.figure(figsize=(20, 5))
-    plt.imshow((xrows.data.cpu().permute(1, 2, 0) + 0.5).clamp(0, 1))
+    num_cols = 20
+    xcols = torch.cat([x[:num_cols], x_hat[:num_cols]], axis=2)  # side by side x_pre and xhat
+    xrows = torch.cat([xcols[i] for i in range(num_cols)], axis=2)
+    plt.figure(figsize=(num_cols, 5))
+    plt.imshow((xrows.data.cpu().permute(1, 2, 0)).clamp(0, 1))
     plt.axis('off')
+    plt.show()
 
     plt.show()
 
 LOAD_LAYER_TYPES = (nn.ConvTranspose2d, ResBlock, nn.ReLU, nn.Conv2d)
+
 
 def set_net_weights(source, target):
     for i, layer in enumerate(source):
@@ -786,6 +793,7 @@ def set_net_weights(source, target):
             raise ValueError('Unexpected layer type, add support for new layers here')
         if not isinstance(target[i], LOAD_LAYER_TYPES):
             raise ValueError('Unexpected layer type, add support for new layers here')
+
 
 def cli_main():
     torch.backends.cudnn.benchmark = True  # autotune kernels
@@ -803,15 +811,38 @@ def cli_main():
         args.num_workers = 0 if DEBUGGING else 0
         print('cli num workers', args.num_workers)
         print('DEBUGGING', DEBUGGING)
-    if args.viz_dvq is not None:
-        return viz_dvq()
-    else:
-        delattr(args, 'viz_dvq')
 
-    model = LearnMax(**args.__dict__)
+    if args.viz_dvq:
+        args.training_gpt = False
+        args.dvq_enable_kmeans = False
+        args.warm_start_size = 100
+
+    if DEBUGGING:
+        wandb_name = None
+        wandb_mode = 'disabled'
+        fast_dev_run = False
+        args.gpt_batch_size = 10
+        if os.environ.get('DEBUG_GPU', 'n') == 'n':
+            args.num_gpus = 0
+    else:
+        if args.viz_dvq:
+            wandb_name = None
+        else:
+            wandb_name = input('\n\nExperiment name?\n\n')
+        wandb_mode = 'online'
+        fast_dev_run = False
+
+    learn_max_args = copy(args.__dict__)
+    del learn_max_args['num_gpus']  # This is for trainer later
+    del learn_max_args['viz_dvq']  # For flow control below, not the model
+    model = LearnMax(**learn_max_args)
     if args.dvq_checkpoint:
         load_pretrained_dvq(args, model)
-        args.enable_kmeans = False
+
+    if args.viz_dvq is not None:
+        return viz_dvq(model)
+    else:
+        delattr(args, 'viz_dvq')
 
     # common = {'batch_size': args.gpt_batch_size, 'pin_memory': bool(args.pin_memory), 'num_workers': args.num_workers}
     # trainer args  # TODO: Check that our defaults above are preserved for overlapping things like pin-memory
@@ -820,17 +851,8 @@ def cli_main():
     parser.add_argument('-p', '--pin_memory', type=bool, default=True, help="pin memory on dataloaders?")
     parser = pl.Trainer.add_argparse_args(parser)
     args = parser.parse_args()
-    # TODO: Try comet for code saving, it looks like it saves and does diffs on everything, not just this file
-    if DEBUGGING:
-        wandb_name = None
-        wandb_mode = 'disabled'
-        fast_dev_run = True
-        if os.environ.get('DEBUG_GPU', 'n') == 'n':
-            args.num_gpus = 0
-    else:
-        wandb_name = input('\n\nExperiment name?\n\n')
-        wandb_mode = 'online'
-        fast_dev_run = False
+
+
     wandb.init(entity='crizcraig', save_code=True, name=wandb_name, mode=wandb_mode)
     # wandb.watch(model)  # causes OOM https://github.com/wandb/client/issues/2644
 
