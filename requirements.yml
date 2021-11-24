@@ -1,4 +1,4 @@
-name: lm
+name: lm3
 # conda env create -f requirements.yml
 # then conda activate lm
 # to remove, simply do conda env remove -n lm
@@ -16,7 +16,7 @@ dependencies:
 - scipy=1.1.0
 - tensorboard
 - pip:
-  - scikit-learn==0.20.0
+#  - scikit-learn==0.20.0
   - opencv-contrib-python
   - pytorch-lightning
   - scipy

@@ -1,7 +1,10 @@
-numpy
+# numpy # install with conda
+# scipy # install with conda
+pytorch-lightning
+opencv-contrib-python
 matplotlib
 loguru
-torch
+# torch # install with conda
 atari-py
 gym
 fire
