@@ -837,7 +837,7 @@ def cli_main():
 
     # common = {'batch_size': args.gpt_batch_size, 'pin_memory': bool(args.pin_memory), 'num_workers': args.num_workers}
     # trainer args  # TODO: Check that our defaults above are preserved for overlapping things like pin-memory
-    parser.add_argument('-x', '--num_epochs', type=int, default=2, help="number of epochs to train for")
+    parser.add_argument('-x', '--num_epochs', type=int, default=1000, help="number of epochs to train for")
     parser.add_argument('-g', '--num_gpus', type=int, default=1, help="number of gpus to train on")
     parser.add_argument('-p', '--pin_memory', type=bool, default=True, help="pin memory on dataloaders?")
     parser = pl.Trainer.add_argparse_args(parser)
@@ -873,7 +873,7 @@ def cli_main():
 
                                                 final_tokens=args.num_epochs * epoch_tokens)
     t0 = time.time()
-    log.info("training...")
+    log.info(f'training for {args.num_epochs} epochs...')
     checkpoint_callback = ModelCheckpoint(monitor='train_loss', mode='min', every_n_train_steps=1000, save_top_k=3,
                                           verbose=True)
     trainer = pl.Trainer(gpus=args.num_gpus,
