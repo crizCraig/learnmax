@@ -333,7 +333,23 @@ class LearnMax(pl.LightningModule):
 
         self.profile_cuda_usage_tensors()
 
+        actions, agent_states, dones, new_states, rewards, states = (None, None, None, None, None, None)
+
         while True:
+            if self.total_steps == 0 or 'OVERFIT' not in os.environ:
+                actions, agent_states, dones, new_states, rewards, states = self._take_action(episode_reward,
+                                                                                              episode_steps)
+
+            for idx, _ in enumerate(dones):
+                # Lightning wants tensors, numpy arrays, numbers, dicts or lists in batch
+                if isinstance(agent_states[idx], AgentState):
+                    agent_states_idx = [_.dict() for _ in agent_states]
+                else:
+                    raise NotImplemented('Why is this happening not like above?')
+                    agent_states_idx = [_.dict() for _ in agent_states[idx]]  # TODO: Remove this if GPT does not need
+                # print('states', states[idx][0][0])
+                yield states[idx], actions[idx], rewards[idx], dones[idx], new_states[idx], agent_states_idx
+
             self.total_steps += 1
             action, agent_state = self.agent(self.state, self.device)
 
@@ -847,10 +863,16 @@ def cli_main():
     log.info("training...")
     checkpoint_callback = ModelCheckpoint(monitor='train_loss', mode='min', every_n_train_steps=1000, save_top_k=3,
                                           verbose=True)
-    trainer = pl.Trainer(gpus=args.num_gpus, max_epochs=args.num_epochs, gradient_clip_val=1.0,
+    trainer = pl.Trainer(gpus=args.num_gpus,
+                         max_epochs=args.num_epochs,
+                         # gradient_clip_val=1.0, # lightning does not support with manual optimization which we need due to two optimizers
                          callbacks=[lr_decay, checkpoint_callback],
-                         precision=args.precision, default_root_dir=args.default_root_dir, logger=wandb_logger,
-                         deterministic=True, fast_dev_run=fast_dev_run)  # Turn off deterministic speed up
+                         precision=args.precision,
+                         default_root_dir=args.default_root_dir,
+                         logger=wandb_logger,
+                         deterministic=True,  # Turn off deterministic to speed up
+                         # overfit_batches=1,
+                         fast_dev_run=fast_dev_run)
 
     # checkpoint_callback = ModelCheckpoint(save_top_k=1, monitor="max_interesting", mode="max", period=1, verbose=True)
 
