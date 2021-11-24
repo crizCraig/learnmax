@@ -59,6 +59,7 @@ class LearnMax(pl.LightningModule):
             dvq_vq_flavor: str = 'vqvae',  # `vqvae` or `gumbel`
             dvq_quantize_proj: int = None,
             dvq_checkpoint: str = None,  # pretrained dvq checkpoint
+            dvq_enable_kmeans: bool = True,  # whether to train the clusters iteratively with kmeans
 
             # mingpt model definition args
             # size of the vocabulary (number of possible tokens) -
@@ -86,7 +87,7 @@ class LearnMax(pl.LightningModule):
             # semantically meaningful so we use those as input.
             gpt_input_embed: bool = True,
 
-            # RL type stuff
+            # RL/sensorimotor type stuff
             avg_reward_len: int = 100,  # how many episodes to take into account when calculating the avg reward
             epoch_len: int = 1000,  # how many batches before pseudo epoch
             gamma: float = 1,  # discount factor - only used for evaluation metrics right now
@@ -238,7 +239,7 @@ class LearnMax(pl.LightningModule):
             self.dvq = VQVAE(n_hid=dvq_n_hid, num_embeddings=num_embeddings, embedding_dim=self.dvq_embedding_dim,
                 loss_flavor=dvq_loss_flavor, input_channels=dvq_input_channels,
                 enc_dec_flavor=dvq_enc_dec_flavor, vq_flavor=dvq_vq_flavor, quantize_proj=dvq_quantize_proj,
-                is_single_token2=self.is_single_token2)
+                is_single_token2=self.is_single_token2, enable_kmeans=dvq_enable_kmeans)
         else:
             # TODO: Need to test that distance between clusters is further than avg distance between points in a cluster
             self.dvq = VQVAE(n_hid=dvq_n_hid, num_embeddings=num_embeddings, embedding_dim=self.dvq_embedding_dim,
@@ -249,7 +250,8 @@ class LearnMax(pl.LightningModule):
         self.gpt = GPT(vocab_size=num_embeddings, block_size=gpt_block_size, n_layer=gpt_n_layer,
                        embedding_dim=self.gpt_embedding_dim, n_head=gpt_n_head, learning_rate=gpt_learning_rate,
                        weight_decay=gpt_weight_decay, betas=gpt_betas, embd_pdrop=gpt_embd_pdrop,
-                       resid_pdrop=gpt_resid_pdrop, attn_pdrop=gpt_attn_pdrop, should_input_embed=gpt_input_embed)
+                       resid_pdrop=gpt_resid_pdrop, attn_pdrop=gpt_attn_pdrop, should_input_embed=gpt_input_embed,
+                       num_actions=self.n_actions)
 
         self.agent = LearnMaxAgent(model=self, num_actions=self.env.action_space.n)
 
@@ -421,13 +423,13 @@ class LearnMax(pl.LightningModule):
             np.array(ret_states),
             np.array(ret_actions),
             np.array(ret_rewards, dtype=np.float32),
-            np.array(ret_dones, dtype=np.bool),
+            np.array(ret_dones, dtype=bool),
             np.array(ret_next_states),
             ret_agent_states,
         )
         return ret
 
-    def training_step(self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx, optimizer_idx) -> torch.Tensor:
+    def training_step(self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx) -> torch.Tensor:
         """
         Calculates loss based on the minibatch received
 
