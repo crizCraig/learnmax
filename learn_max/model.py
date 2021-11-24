@@ -511,19 +511,17 @@ class LearnMax(pl.LightningModule):
 
             # We use multiple optimizers so need to manually backward each one separately
             self.gpt_optimizer.zero_grad()
-            # self.manual_backward(gpt_loss['loss'], self.gpt_optimizer)
+            self.manual_backward(gpt_ret['loss'])  # , self.gpt_optimizer)
 
             # Required due to https://github.com/PyTorchLightning/pytorch-lightning/issues/7698
-            # Basically we run into issues with gradient clipping + manual_backward()
-            self._running_manual_backward = True
-            self.trainer.train_loop.backward(gpt_loss['loss'], optimizer=self.gpt_optimizer, opt_idx=None)
-            self._running_manual_backward = False
-
+            torch.nn.utils.clip_grad_norm_(self.gpt.parameters(), 1.0)
             self.gpt_optimizer.step()
 
-            loss = gpt_loss['loss']
-            if self.trainer.use_dp or self.trainer.use_ddp2:
-                loss = loss.unsqueeze(0)
+            loss = gpt_ret['loss']
+            # TODO: For distributed training?
+            #  Although use_dp is not available now, would need self.trainer._accelerator_connector.strategy
+            # if self.trainer.use_dp or self.trainer.use_ddp2:
+            #     loss = loss.unsqueeze(0)
         else:
             latent_loss, dvq_loss, recon_loss = self._train_step_dvq(batch, batch_idx)
             loss = dvq_loss
@@ -774,8 +772,19 @@ class LearnMax(pl.LightningModule):
         #    0.6  0.8  0.8  0.7
         pass
 
+    # Perform gradient clipping on gradients associated with gpt (optimizer_idx=1)
+    # def configure_gradient_clipping(self, optimizer, optimizer_idx, gradient_clip_val, gradient_clip_algorithm):
+    #     if optimizer_idx == 1:
+    #         # Lightning will handle the gradient clipping
+    #         self.clip_gradients(
+    #             optimizer,
+    #             gradient_clip_val=gradient_clip_val,
+    #             gradient_clip_algorithm=gradient_clip_algorithm
+    #         )
+    #     # else:
+            # implement your own custom logic to clip gradients for generator (optimizer_idx=0)
 
-def viz_dvq():
+def viz_dvq(model):
     # model = LearnMax.load_from_checkpoint('/home/c2/src/learnmax/learn_max/wandb/run-20210819_112836-2sk8562w/files/learnmax-learn_max/2sk8562w/checkpoints/epoch=0-step=1179.ckpt')
     # model = LearnMax.load_from_checkpoint('/home/c2/src/learnmax/learn_max/wandb/run-20210821_213732-ujs1wtib/files/learnmax-learn_max/ujs1wtib/checkpoints/epoch=0-step=1299.ckpt')
     # model = LearnMax.load_from_checkpoint('/home/c2/src/learnmax/learn_max/wandb/run-20210822_114404-1hl1r5gh/files/learnmax-learn_max/1hl1r5gh/checkpoints/epoch=0-step=79.ckpt')
