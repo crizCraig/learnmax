@@ -3,9 +3,8 @@ import json
 import math
 import os
 import time
-from collections import namedtuple
 from copy import copy
-from typing import Tuple, List, OrderedDict, Dict, Optional
+from typing import Tuple, List, Optional
 
 import cv2
 import gym
