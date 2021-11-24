@@ -351,50 +351,6 @@ class LearnMax(pl.LightningModule):
                 yield states[idx], actions[idx], rewards[idx], dones[idx], new_states[idx], agent_states_idx
 
             self.total_steps += 1
-            action, agent_state = self.agent(self.state, self.device)
-
-            next_state, r, is_done, _ = self.env.step(action[0])
-
-            new_state = (next_state, agent_state)
-
-            # TODO: Subtract 0.5 from image so that we - map [0,1] range to [-0.5, 0.5]
-
-            # TODO: Allow learning within the episode
-
-            episode_reward += r
-            episode_steps += 1
-
-            exp = Experience(state=self.state, action=action[0], reward=r, done=is_done, new_state=new_state)
-
-            self.buffer.append(exp)
-            # print(f'bufflen {len(self.buffer)}')
-            self.state = new_state
-
-            if is_done:
-                self.done_episodes += 1
-                self.total_rewards.append(episode_reward)
-                self.total_episode_steps.append(episode_steps)
-                self.avg_rewards = float(np.mean(self.total_rewards[-self.avg_reward_len:]))
-                self.state = self.reset()
-                episode_steps = 0
-                episode_reward = 0
-
-            if self.training_gpt:
-                # Sample sequentially from replay buffer
-                # If training GPT, we need to return the dvq state indexes as well to be used in on_train_batch_end
-                #   in lr_decay _, y = batch
-                states, actions, rewards, dones, new_states, agent_states = self.sample_latest_sequential()
-            else:
-                # Sample randomly from replay buffer
-                states, actions, rewards, dones, new_states = self.buffer.sample(self.batch_size)  # TODO: Change to dvq_batch_size?
-                # TODO: Test extracting agent_states
-                states, _ = states
-                new_states, agent_states = new_states
-
-            for idx, _ in enumerate(dones):
-                # Lightning wants tensors, numpy arrays, numbers, dicts or lists in batch
-                agent_states_idx = [_.dict() for _ in agent_states[idx]]
-                yield states[idx], actions[idx], rewards[idx], dones[idx], new_states[idx], agent_states_idx
 
             # if self.total_steps % 1000 == 0:
             #     from guppy import hpy
@@ -404,6 +360,41 @@ class LearnMax(pl.LightningModule):
             # Simulates epochs
             if self.total_steps % self.batches_per_epoch == 0:
                 break
+
+    def _take_action(self, episode_reward, episode_steps):
+        # print('taking action')
+        action, agent_state = self.agent(self.state, self.device)
+        next_state, r, is_done, _ = self.env.step(action[0])
+        new_state = (next_state, agent_state)
+        # TODO: Subtract 0.5 from image so that we - map [0,1] range to [-0.5, 0.5]
+        # TODO: Allow learning within the episode
+        episode_reward += r
+        episode_steps += 1
+        exp = Experience(state=self.state, action=action[0], reward=r, done=is_done, new_state=new_state)
+        self.buffer.append(exp)
+        # print(f'bufflen {len(self.buffer)}')
+        self.state = new_state
+        if is_done:
+            self.done_episodes += 1
+            self.total_rewards.append(episode_reward)
+            self.total_episode_steps.append(episode_steps)
+            self.avg_rewards = float(np.mean(self.total_rewards[-self.avg_reward_len:]))
+            self.state = self.reset()
+            episode_steps = 0
+            episode_reward = 0
+        if self.training_gpt:
+            # Sample sequentially from replay buffer
+            # If training GPT, we need to return the dvq state indexes as well to be used in on_train_batch_end
+            #   in lr_decay _, y = batch
+            states, actions, rewards, dones, new_states, agent_states = self.sample_latest_sequential()
+        else:
+            # Sample randomly from replay buffer
+            states, actions, rewards, dones, new_states = self.buffer.sample(
+                self.batch_size)  # TODO: Change to dvq_batch_size?
+            states = np.array([x for x in states[:, 0]])
+            new_states, agent_states = new_states[:, 0], new_states[:, 1]
+            new_states = np.array([x for x in new_states])
+        return actions, agent_states, dones, new_states, rewards, states
 
     def profile_cuda_usage_tensors(self):
         import torch
