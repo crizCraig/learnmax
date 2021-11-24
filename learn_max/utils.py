@@ -120,23 +120,28 @@ def wandb_try_log(msg_dict):
     except:
         pass
 
+
 def get_batch_vars(batch, use_next=False, return_agent_state=False, populate_gpt=False):
     agent_state = None
     if len(batch) == 5:
+        # No agent state
         s, a, r, d, s_next = batch
         if use_next:
-            x = torch.cat([s, s_next])  # doubles batch size which we don't want with GPT as there's OOM
+            dvq_x = torch.cat((s, s_next))  # doubles batch size which we don't want with GPT as there's OOM
         else:
-            x = s
+            dvq_x = s
     elif len(batch) == 6:
+        # Has agent state
         s, a, r, d, s_next, agent_state = batch
-        x = s
+        dvq_x = s
     else:
-        x, y = batch # hate that i have to do this here in the model
-    dvq_batch = x
-    if return_agent_state:
-        dvq_batch = x, agent_state
+        # Text (i.e. not atari)
+        a = None  # This is for text so no action TODO: remove
+        dvq_x, y = batch  # hate that i have to do this here in the model
     if not populate_gpt:
+        dvq_batch = dvq_x
+        if return_agent_state:
+            dvq_batch = dvq_x, agent_state
         return dvq_batch
     else:
         dvq_loss = torch.mean(torch.Tensor([a['dvq_loss'].mean() for a in agent_state]))
