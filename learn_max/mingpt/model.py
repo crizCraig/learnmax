@@ -117,8 +117,11 @@ class GPT(nn.Module):
         self.betas = betas
 
         # input embedding stem: drop(content + position)
-        self.tok_emb = nn.Embedding(vocab_size, embedding_dim)
+        action_embedding_dim = 100
+        self.tok_emb = nn.Embedding(vocab_size, embedding_dim - action_embedding_dim)
         self.pos_emb = nn.Parameter(torch.zeros(1, block_size, embedding_dim))
+        self.act_emb = nn.Embedding(num_actions, action_embedding_dim)
+
         self.drop = nn.Dropout(embd_pdrop)
         # deep transformer: just a sequence of transformer blocks
         self.blocks, _, out_dims = self.init_blocks(attn_pdrop, block_size, embedding_dim, n_head, n_layer, resid_pdrop)
@@ -240,7 +243,7 @@ class GPT(nn.Module):
             print('trajectories: ', len(self.trajectory_counts))
             print('max_trajectory_count: ', self.max_trajectory_count)
 
-    def forward(self, idx_or_embed):
+    def forward(self, idx_or_embed, actions):
         if self.should_input_embed:
             b, t, embed = idx_or_embed.size()
         else:
@@ -250,10 +253,12 @@ class GPT(nn.Module):
 
         # forward the GPT model
         if embed is None:
-            token_embeddings = self.tok_emb(idx_or_embed) # each index maps to a (learnable) vector
+            token_embeddings = self.tok_emb(idx_or_embed)  # each index maps to a (learnable) vector
         else:
             token_embeddings = idx_or_embed  # Tokens are input directly from dvq, keeping semantic info instead of re-learning
-        position_embeddings = self.pos_emb[:, :t, :] # each position maps to a (learnable) vector
+        position_embeddings = self.pos_emb[:, :t, :]  # each position maps to a (learnable) vector
+        action_embeddings = self.act_emb(actions)
+        token_embeddings = torch.cat((token_embeddings, action_embeddings), dim=2)
         x = self.drop(token_embeddings + position_embeddings)
         x = self.blocks(x)
         x = self.ln_f(x)
@@ -272,9 +277,11 @@ class GPT(nn.Module):
         return logits, expected_deviation
 
     def step_(self, split, batch, batch_idx=None):
-        embed, idx, target_idx = batch  # i.e.  x, x_idx, y = batch
+        embed, idx, target_idx, a = batch  # i.e.  x, x_idx, y = batch
+
+
         x = embed if self.should_input_embed else idx
-        logits, expected_deviation = self(x)
+        logits, expected_deviation = self.forward(x, a)
 
         # Calculate mean deviation loss --------------------------------------
         # Turn targets into one hot B x block_size x vocab_size with 1 in vocab

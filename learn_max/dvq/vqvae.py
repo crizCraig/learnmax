@@ -7,6 +7,7 @@ import os
 import math
 from argparse import ArgumentParser
 
+import numpy as np
 import torch
 import wandb
 from torch import nn, einsum
