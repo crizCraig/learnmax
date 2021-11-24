@@ -85,8 +85,10 @@ class LearnMax(pl.LightningModule):
 
             # Whether to use embeddings or indexes as input to first layer. With characters, we learn an embedding
             # from the ascii index, but with dvq inputs, the embeddings are high dimensional and
-            # semantically meaningful so we use those as input.
-            gpt_input_embed: bool = True,
+            # semantically meaningful so we optionally use those as input.
+            # Learning the embedding may still be useful though as it can be jointly trained with the position
+            # (and perhaps action embedding) which are summed as input to the transformer.
+            gpt_input_embed: bool = False,
 
             # RL/sensorimotor type stuff
             avg_reward_len: int = 100,  # how many episodes to take into account when calculating the avg reward
@@ -148,7 +150,8 @@ class LearnMax(pl.LightningModule):
         else:
             self.training_gpt = training_gpt
 
-        self.gpt_embedding_dim = embedding_dim  # the "width" of the model (embedding_dim), number of channels in each Transformer
+        # the "width" of the model (embedding_dim), number of channels in each Transformer
+        self.gpt_embedding_dim = embedding_dim
         self.gpt_block_size = gpt_block_size
         self.gpt_batch_size = gpt_batch_size
         self.gpt_n_layer = gpt_n_layer
