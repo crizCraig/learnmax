@@ -465,8 +465,12 @@ class LearnMax(pl.LightningModule):
         #   on the other network. We'll just have to see what works.
 
         if self.training_gpt:
-            self.dvq.set_enable_kmeans(False)
-            gpt_x, z_q_ind_x, z_q_ind_y = get_batch_vars(batch, return_agent_state=True, populate_gpt=True)
+            self.dvq.set_do_kmeans(False)
+            gpt_x, z_q_ind_x, z_q_ind_y, a, s = get_batch_vars(batch, return_agent_state=True, populate_gpt=True)
+            # print('gptx', gpt_x[0][0])
+            # Train gpt on dvq tokens shifted for prediction
+
+            gpt_ret = self.gpt.training_step(batch=(gpt_x, z_q_ind_x, z_q_ind_y, a), batch_idx=batch_idx)
 
             gpt_loss = self.gpt.training_step(batch=(gpt_x, z_q_ind_x, z_q_ind_y), batch_idx=batch_idx)  # Train gpt on dvq tokens shifted for prediction
 
@@ -507,7 +511,7 @@ class LearnMax(pl.LightningModule):
         # })
 
     def _train_step_dvq(self, batch, batch_idx):
-        self.dvq.set_enable_kmeans(True)
+        self.dvq.set_do_kmeans(True)
 
         _, agent_state = get_batch_vars(batch, return_agent_state=True)
 
@@ -554,7 +558,7 @@ class LearnMax(pl.LightningModule):
                 if isinstance(prop, nn.Module):
                     prop.zero_grad()
             batch_size = self.gpt_batch_size
-            self.dvq.set_enable_kmeans(False)
+            self.dvq.set_do_kmeans(False)
             log.info(f'Not training dvq so setting warm start size to batch size. '
                      f'Was {self.warm_start_size}, now  is {self.batch_size}')
             self.warm_start_size = self.gpt_batch_size * self.gpt_block_size
