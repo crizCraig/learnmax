@@ -103,7 +103,21 @@ class VQVAE(dvq_module):
 
         return x, x_hat, z_q_emb, z_q_flat, latent_loss, recon_loss, dvq_loss, z_q_ind  # Return x as we do a view on it
 
-    def set_enable_kmeans(self, value):
+    def decode(self, z_q_emb):
+        return self.decoder(z_q_emb)
+
+    def decode_flat(self, z_q_emb):
+        in_dims = z_q_emb.size()
+        P = self.quantizer.output_proj
+        W = int(np.sqrt(in_dims[-1]/P))
+        z_q_emb = z_q_emb.reshape(-1, P, W, W)
+        decoded = self.decode(z_q_emb)
+
+        # Match input dims
+        decoded = decoded.reshape(in_dims[0], in_dims[1], *decoded.size()[-3:])
+        return decoded
+
+    def set_do_kmeans(self, value):
         self.enable_kmeans = value
         self.quantizer.enable_kmeans = value
 
