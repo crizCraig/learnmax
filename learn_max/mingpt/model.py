@@ -49,21 +49,22 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.size()  # 64, 128, 256, Channels = token+pos embedding size
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        k = self.key(x).view(  B, T, self.n_head, C // self.n_head).transpose(1, 2) # (64, 8, 128, 32)
-        q = self.query(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B,  nh, T,  hs)
-        v = self.value(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B,  nh, T,  hs)
+        k = self.key(x).view(  B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (64, 8, 128, 32)
+        q = self.query(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B,  nh, T,  hs)
+        v = self.value(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B,  nh, T,  hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
         att = att.masked_fill(self.mask[:,:,:T,:T] == 0, float('-inf'))
         att = F.softmax(att, dim=-1)
         att = self.attn_drop(att)
-        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+        y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)  # re-assemble all head outputs side by side
 
         # output projection
         y = self.resid_drop(self.proj(y))
         return y
+
 
 class Block(nn.Module):
     """ an unassuming Transformer block """
@@ -88,7 +89,7 @@ class Block(nn.Module):
         x = x + self.attn(self.ln1(x))
         x = x + self.mlp(self.ln2(x))
         if self.out_proj is not None:
-            # We could do cross attention as in perceiver IO, but this seems simpler ¯\_(ツ)_/¯
+            # We could do cross attention as in perceiver IO, but this seems simpler
             x = self.out_proj(x)
         return x
 
@@ -101,7 +102,7 @@ class GPT(nn.Module):
                  vocab_size: int,  # size of the vocabulary (number of possible tokens)
                  block_size: int,  # length of the model's context window in time
                  n_layer: int,  # depth of the model; number of Transformer blocks in sequence
-                 embedding_dim: int,  # the "width" of the model, number of channels in each Transformer
+                 input_embedding_dim: int,  # the "width" of the input to the model
                  n_head: int,  # number of heads in each multi-head attention inside each Transformer block
                  # model optimization args
                  learning_rate: float = 3e-4,  # the base learning rate of the model
@@ -111,6 +112,7 @@ class GPT(nn.Module):
                  resid_pdrop: float = 0.1,  # \in [0,1]: amount of dropout in each residual connection
                  attn_pdrop: float = 0.1,  # \in [0,1]: amount of dropout on the attention matrix
                  should_input_embed: bool = False,  # whether to use embeddings or indexes as input to first layer
+                 should_input_and_learn_embed: bool = False,  # whether to cat input embed with learned token embed
                  num_actions: int = 0,  # number of actions to use for action embedding
                  ):
         super().__init__()
@@ -122,8 +124,13 @@ class GPT(nn.Module):
         self.betas = betas
 
         # input embedding stem: drop(content + position)
+        #   content = prev_salient + next_salient + dvq_token + learned_token + action_token
+        #   6272 total - dvq_token:4410,learned_token:2048,action_token:128
+        learned_embedding_dim = 4000
         action_embedding_dim = 100
-        self.tok_emb = nn.Embedding(vocab_size, embedding_dim - action_embedding_dim)
+        embedding_dim = input_embedding_dim + learned_embedding_dim + action_embedding_dim
+        assert embedding_dim % n_head == 0, 'Embedding not evenly divisible by number of heads'
+        self.learned_state_embed = nn.Embedding(vocab_size, learned_embedding_dim)
         self.pos_emb = nn.Parameter(torch.zeros(1, block_size, embedding_dim))
         self.act_emb = nn.Embedding(num_actions, action_embedding_dim)
 
@@ -144,6 +151,7 @@ class GPT(nn.Module):
         self.trajectory_counts: Dict[Tuple[int], int] = defaultdict(int)
         self.max_trajectory_count = 0
         self.should_input_embed = should_input_embed
+        self.should_input_and_learn_embed = should_input_and_learn_embed
 
         log.info("number of parameters: %e" % sum(p.numel() for p in self.parameters()))
 
@@ -248,23 +256,23 @@ class GPT(nn.Module):
             print('trajectories: ', len(self.trajectory_counts))
             print('max_trajectory_count: ', self.max_trajectory_count)
 
-    def forward(self, idx_or_embed, actions):
-        if self.should_input_embed:
-            b, t, embed = idx_or_embed.size()
-        else:
-            b, t = idx_or_embed.size()
-            embed = None
+    def forward(self, embed, idx, actions):
+        # if self.should_input_embed:
+        #     b, t, embed = idx_or_embed.size()
+        # else:
+        #     b, t = idx_or_embed.size()
+        #     embed = None
+        b, t, e = embed.size()
         assert t <= self.block_size, "Cannot forward, model block size is exhausted."
 
         # forward the GPT model
-        if embed is None:
-            token_embeddings = self.tok_emb(idx_or_embed)  # each index maps to a (learnable) vector
-        else:
-            token_embeddings = idx_or_embed  # Tokens are input directly from dvq, keeping semantic info instead of re-learning
+        learned_embed = self.learned_state_embed(idx)  # each index maps to a (learnable) vector
         position_embeddings = self.pos_emb[:, :t, :]  # each position maps to a (learnable) vector
-        action_embeddings = self.act_emb(actions)
-        token_embeddings = torch.cat((token_embeddings, action_embeddings), dim=2)
-        x = self.drop(token_embeddings + position_embeddings)
+        action_embeddings = self.act_emb(actions)  # each action maps to a (learnable) vector
+        # embed *= 0
+        token_embed = torch.cat((embed, learned_embed, action_embeddings), dim=2)  # cat orig state to keep sensory data
+
+        x = self.drop(token_embed + position_embeddings)
         x = self.blocks(x)
         x = self.ln_f(x)
         logits = self.logit_p_head(x)
@@ -283,8 +291,7 @@ class GPT(nn.Module):
 
     def step_(self, split, batch, batch_idx=None):
         embed, idx, target_idx, a = batch  # i.e.  x, x_idx, y = batch
-        x = embed if self.should_input_embed else idx
-        logits, expected_deviation = self.forward(x, a)
+        logits, expected_deviation = self.forward(embed, idx, a)
 
         # Calculate mean deviation loss for uncertainty ----------------------
         # Turn targets into one hot B x block_size x vocab_size with 1 in vocab

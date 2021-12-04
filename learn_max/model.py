@@ -88,7 +88,9 @@ class LearnMax(pl.LightningModule):
             # semantically meaningful so we optionally use those as input.
             # Learning the embedding may still be useful though as it can be jointly trained with the position
             # (and perhaps action embedding) which are summed as input to the transformer.
-            gpt_input_embed: bool = False,
+            # update: Just passing the dvq embedding does not work, possibly due to summing with the position.
+            # Need to try concatenating the dvq embedding with a learned embedding.
+            gpt_input_embed: bool = True,
 
             # RL/sensorimotor type stuff
             avg_reward_len: int = 100,  # how many episodes to take into account when calculating the avg reward
@@ -151,7 +153,7 @@ class LearnMax(pl.LightningModule):
             self.training_gpt = training_gpt
 
         # the "width" of the model (embedding_dim), number of channels in each Transformer
-        self.gpt_embedding_dim = embedding_dim
+        self.gpt_input_embedding_dim = embedding_dim
         self.gpt_block_size = gpt_block_size  # Size of the temporal window
         self.gpt_batch_size = gpt_batch_size
         self.gpt_n_layer = gpt_n_layer
@@ -290,7 +292,7 @@ class LearnMax(pl.LightningModule):
                 is_single_token2=self.is_single_token2)
 
         self.gpt = GPT(vocab_size=num_embeddings, block_size=gpt_block_size, n_layer=gpt_n_layer,
-                       embedding_dim=self.gpt_embedding_dim, n_head=gpt_n_head, learning_rate=gpt_learning_rate,
+                       input_embedding_dim=self.gpt_input_embedding_dim, n_head=gpt_n_head, learning_rate=gpt_learning_rate,
                        weight_decay=gpt_weight_decay, betas=gpt_betas, embd_pdrop=gpt_embd_pdrop,
                        resid_pdrop=gpt_resid_pdrop, attn_pdrop=gpt_attn_pdrop, should_input_embed=gpt_input_embed,
                        num_actions=self.n_actions)
@@ -510,14 +512,8 @@ class LearnMax(pl.LightningModule):
 
             gpt_ret = self.gpt.training_step(batch=(gpt_x, z_q_ind_x, z_q_ind_y, a), batch_idx=batch_idx)
 
-            if 'VISUALIZE_GPT' in os.environ and batch_idx % 1000 == 0:
+            if batch_idx % 1000 == 0:
                 self.viz_gpt(gpt_ret, state=s, batch_idx=batch_idx)
-
-                # TODO: Then for each subsequence in the window, visualize the predicted next states
-                # top_3_emb = None  # TODO get this from gpt_ret['logits']
-                # for emb in top_3_emb:
-                #     img_expected = self.dvq.decode(emb)
-                # pass
 
             # We use multiple optimizers so need to manually backward each one separately
             self.gpt_optimizer.zero_grad()
@@ -609,7 +605,6 @@ class LearnMax(pl.LightningModule):
         plt.show()
 
     def viz_gpt(self, gpt_ret, state, batch_idx):
-        # TODO: We have batch and window dimensions. Let's visualize the first batch window
         batches_to_visualize = 1
         for b_i in range(batches_to_visualize):
             num_imgs_to_viz = 10
@@ -653,7 +648,11 @@ class LearnMax(pl.LightningModule):
             imgs_display = np.concatenate(imgs_display)
             im = Image.fromarray(np.uint8(imgs_display * 255))
             # im.show()
-            im.save(f'{ROOT_DIR}/images/viz_gpt_{get_date_str()}_r_{RUN_ID}_e_{self.current_epoch}_b_{batch_idx}.png')
+            filename = f'{ROOT_DIR}/images/viz_gpt_{get_date_str()}_r_{RUN_ID}_e_{self.current_epoch}_b_{batch_idx}.png'
+            log.info(f'Saving gpt viz to {filename}')
+            im.save(filename)
+            # TODO: Log to wandb
+            wandb.log({'train/gpt-viz': [wandb.Image(im)]})
 
             # fig1 = plt.figure(figsize=(num_imgs_per_row, 1))
             # ax1 = fig1.add_subplot(111)
@@ -767,8 +766,8 @@ class LearnMax(pl.LightningModule):
         arg_parser.add_argument('--viz_dvq', type=str, help="visualize dvq images", default=None)
         arg_parser.add_argument('--viz_all_dvq_clusters', type=str, help="visualize all dvq clusters", default=None)
         arg_parser.add_argument('--dvq_checkpoint', type=str, help="Checkpoint to restore", default=None)
-        arg_parser.add_argument('--gpt_batch_size', type=int, help="GPT batch size", default=48)
-        arg_parser.add_argument('--gpt_block_size', type=int, default=80,
+        arg_parser.add_argument('--gpt_batch_size', type=int, help="GPT batch size", default=8)
+        arg_parser.add_argument('--gpt_block_size', type=int, default=40,
                             help="block size for the model (length of window of context)")
         return arg_parser
 
