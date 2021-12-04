@@ -93,9 +93,9 @@ class VQVAE(dvq_module):
         
         z_q_emb, z_q_flat, latent_loss, z_q_ind = self.quantizer.forward(z, wait_to_init)  # zq 128, 64, 8, 8 vs 128, 1024
         if 'TRY_NON_QUANTIZED' in os.environ:
-            x_hat = self.decoder(z)
+            x_hat = self.decoder.forward(z)
         else:
-            x_hat = self.decoder(z_q_emb)  # zq is B, Embed dim, H, W i.e. 1, 10, 21, 21
+            x_hat = self.decoder.forward(z_q_emb)  # zq is B, Embed dim, H, W i.e. 1, 10, 21, 21
 
         recon_loss = self.recon_loss.nll(x, x_hat)
         quant_loss_mult = float(os.getenv('QUANT_LOSS_MULT', 1))
@@ -106,15 +106,23 @@ class VQVAE(dvq_module):
     def decode(self, z_q_emb):
         return self.decoder(z_q_emb)
 
-    def decode_flat(self, z_q_emb):
+    def decode_flat(self, z_q_emb, output_proj):
         in_dims = z_q_emb.size()
-        P = self.quantizer.output_proj
-        W = int(np.sqrt(in_dims[-1]/P))
-        z_q_emb = z_q_emb.reshape(-1, P, W, W)
+        # (1, 21, 21, 10)
+
+        width = int(np.sqrt(in_dims[-1] // output_proj))
+        z_q_emb = z_q_emb.reshape((np.prod(in_dims[:-1]), width, width, output_proj))
+
+        s = len(z_q_emb.size())
+        z_q_emb = z_q_emb.permute(*list(range(s-3)), s-1, s-3, s-2)
+        # P = self.quantizer.output_proj
+        # W = int(np.sqrt(in_dims[-1]/P))
+        # z_q_emb = z_q_emb.reshape(-1, P, W, W)
         decoded = self.decode(z_q_emb)
 
-        # Match input dims
-        decoded = decoded.reshape(in_dims[0], in_dims[1], *decoded.size()[-3:])
+        # Match high order input dims before image dims
+        out_dims = in_dims[:-1] + decoded.size()[-3:]
+        decoded = decoded.reshape(*out_dims)
         return decoded
 
     def set_do_kmeans(self, value):
@@ -171,9 +179,8 @@ class VQVAE(dvq_module):
         inter_params = decay & no_decay
         union_params = decay | no_decay
         assert len(inter_params) == 0, "parameters %s made it into both decay/no_decay sets!" % (str(inter_params), )
-        assert (len(param_dict.keys() - union_params) == 0,
-                "parameters %s were not separated into either decay/no_decay set!" % (
-                str(param_dict.keys() - union_params),))
+        assert len(param_dict.keys() - union_params) == 0, "parameters %s were not separated into either decay/no_decay set!" % (
+                str(param_dict.keys() - union_params),)
 
         # create the pytorch optimizer object
         optim_groups = [

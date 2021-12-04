@@ -14,8 +14,11 @@ from typing import Dict, Tuple
 import torch
 import torch.nn as nn
 import wandb
+from einops import rearrange
 from loguru import logger as log
 from torch.nn import functional as F
+
+from learn_max.utils import accuracy
 
 
 class CausalSelfAttention(nn.Module):
@@ -280,18 +283,23 @@ class GPT(nn.Module):
 
     def step_(self, split, batch, batch_idx=None):
         embed, idx, target_idx, a = batch  # i.e.  x, x_idx, y = batch
-
-
         x = embed if self.should_input_embed else idx
         logits, expected_deviation = self.forward(x, a)
 
-        # Calculate mean deviation loss --------------------------------------
+        # Calculate mean deviation loss for uncertainty ----------------------
         # Turn targets into one hot B x block_size x vocab_size with 1 in vocab
         one_hot = F.one_hot(target_idx, num_classes=self.vocab_size).squeeze()
         probs = F.softmax(logits, dim=-1)
 
-        # Here we want to take the highest prob next states and visualize them.
-        # To visualize this, we need to decode the embedding into an image
+        # rearrange(a, 'd0 d1 d2 d3 d4 d5 -> d0 d1 (d2 d3 d4) d5')
+        # Combine batch and window dimensions with rearrange
+        top_acc_lvls = (self.vocab_size // 10, self.vocab_size // 100, 3, 1)
+        acc = accuracy(logits=rearrange(logits, 'd0 d1 d2 -> (d0 d1) d2'),
+                       target=rearrange(target_idx, 'd0 d1 -> (d0 d1)'),
+                       topk=top_acc_lvls)
+
+        for lvl_i, lvl in enumerate(top_acc_lvls):
+            wandb.log({f'train/acc/top{lvl}': acc[lvl_i]})
 
         wandb.log({'train/probs_std': probs.std()})
         p_diff = (one_hot - probs).abs()  # actual deviation
@@ -303,7 +311,8 @@ class GPT(nn.Module):
         p_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_idx.reshape(-1))
         loss = d_loss + p_loss
         self.iter += 1
-        return {'loss': loss, 'logits': logits, 'expected_deviation': expected_deviation}
+        return {'loss': loss, 'logits': logits, 'expected_deviation': expected_deviation,
+                'target_idx': target_idx}
 
     def training_step(self, *args, **kwargs):
         return self.step_('train', *args, **kwargs)

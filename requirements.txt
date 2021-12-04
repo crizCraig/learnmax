@@ -10,3 +10,4 @@ gym
 fire
 lightning-bolts
 wandb
+einops

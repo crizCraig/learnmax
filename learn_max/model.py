@@ -14,6 +14,7 @@ import torch
 import torch.backends.cudnn
 import wandb
 import matplotlib.pyplot as plt
+from PIL import Image
 from gym import Env, ObservationWrapper
 from loguru import logger as log
 from pl_bolts.datamodules import ExperienceSourceDataset
@@ -32,8 +33,8 @@ from torch.utils.data import DataLoader
 from learn_max import dvq
 from learn_max.agent import LearnMaxAgent, AgentState
 from learn_max.dvq.model.deepmind_enc_dec import ResBlock
-from learn_max.utils import topk_interesting, _init_weights, get_batch_vars
-from learn_max.constants import SAVE_DIR, SEED, DEBUGGING
+from learn_max.utils import topk_interesting, _init_weights, get_batch_vars, get_date_str
+from learn_max.constants import SAVE_DIR, SEED, DEBUGGING, DATE_STR, ROOT_DIR, RUN_ID
 from learn_max.dvq.vqvae import VQVAE, DecayLR, DecayTemperature, RampBeta
 from learn_max.mingpt.lr_decay import GptWarmupCosineLearningRateDecay
 from learn_max.mingpt.model import GPT
@@ -151,7 +152,7 @@ class LearnMax(pl.LightningModule):
 
         # the "width" of the model (embedding_dim), number of channels in each Transformer
         self.gpt_embedding_dim = embedding_dim
-        self.gpt_block_size = gpt_block_size
+        self.gpt_block_size = gpt_block_size  # Size of the temporal window
         self.gpt_batch_size = gpt_batch_size
         self.gpt_n_layer = gpt_n_layer
         self.gpt_n_head = gpt_n_head
@@ -374,16 +375,17 @@ class LearnMax(pl.LightningModule):
 
         while True:
             if self.total_steps == 0 or 'OVERFIT' not in os.environ:
-                actions, agent_states, dones, new_states, rewards, states = self._take_action(episode_reward,
-                                                                                              episode_steps)
+                actions, agent_states, dones, new_states, rewards, states = self._take_action_and_sample(episode_reward,
+                                                                                                         episode_steps)
 
             for idx, _ in enumerate(dones):
                 # Lightning wants tensors, numpy arrays, numbers, dicts or lists in batch
                 if isinstance(agent_states[idx], AgentState):
+                    # agents_states only has a batch dimension, not window size
                     agent_states_idx = [_.dict() for _ in agent_states]
                 else:
-                    raise NotImplemented('Why is this happening not like above?')
-                    agent_states_idx = [_.dict() for _ in agent_states[idx]]  # TODO: Remove this if GPT does not need
+                    # agents_states has batch and window size dimensions
+                    agent_states_idx = [_.dict() for _ in agent_states[idx]]
                 # print('states', states[idx][0][0])
                 yield states[idx], actions[idx], rewards[idx], dones[idx], new_states[idx], agent_states_idx
 
@@ -398,7 +400,7 @@ class LearnMax(pl.LightningModule):
             if self.total_steps % self.batches_per_epoch == 0:
                 break
 
-    def _take_action(self, episode_reward, episode_steps):
+    def _take_action_and_sample(self, episode_reward, episode_steps):
         # print('taking action')
         action, agent_state = self.agent(self.state, self.device)
         next_state, r, is_done, _ = self.env.step(action[0])
@@ -456,9 +458,10 @@ class LearnMax(pl.LightningModule):
         ret_rewards = []
         ret_dones = []
         ret_next_states = []
-        for _ in start_indices:
+        block_idx = np.array(list(range(self.gpt_block_size)))
+        for s in start_indices:
             # TODO: pad with -100 when last index? We just avoid by making sure we sample early enough in the buffer
-            indices = np.array(list(range(len(self.buffer) - 1)[-self.gpt_block_size:]))
+            indices = s + block_idx
             states, actions, rewards, dones, next_states = zip(*[self.buffer.buffer[idx] for idx in indices])
             ret_states.append([s[0] for s in states])
             ret_actions.append(actions)
@@ -507,45 +510,8 @@ class LearnMax(pl.LightningModule):
 
             gpt_ret = self.gpt.training_step(batch=(gpt_x, z_q_ind_x, z_q_ind_y, a), batch_idx=batch_idx)
 
-            if 'VISUALIZE_GPT' in os.environ:
-                # TODO: We have batch and window dimensions. Let's visualize the first batch window
-                batches_to_visualize = 1
-                for b_i in range(batches_to_visualize):
-                    num_imgs_per_row = 5
-                    top_n = 3
-                    imgs = s[b_i][:num_imgs_per_row]
-
-                    logits = gpt_ret['logits'].detach().cpu().numpy()[b_i][:num_imgs_per_row]
-
-                    # top n predicted next embedding indexes for each img
-                    top_n_idxs = torch.Tensor(np.argpartition(logits, -top_n)[:, -top_n:]).int()
-
-                    # get dvq embeddings from indexes
-                    embeddings = self.dvq.quantizer.embed_code(top_n_idxs.cuda())
-
-                    # decode predictions into images
-                    imgs_hat = self.dvq.decode_flat(embeddings)
-
-                    imgs_display = []
-                    for img_i, img in enumerate(imgs):
-                        img = img.permute(1, 2, 0).cpu().numpy()
-                        blank = np.ones_like(img)
-                        img_hat_row = []
-                        for ti in range(top_n):
-                            img_hat = (imgs_hat[img_i][ti].permute(1, 2, 0) + 0.5).clamp(0, 1)
-                            img_hat_row.append(img_hat.detach().cpu().numpy())
-                        left_img = np.concatenate([blank, img, blank])
-                        right_img = np.concatenate(img_hat_row)
-                        imgs_display.append(np.concatenate([left_img, right_img], axis=1))
-
-                    imgs_display = np.concatenate(imgs_display)
-                    fig1 = plt.figure(figsize=(num_imgs_per_row, 1))
-                    ax1 = fig1.add_subplot(111)
-                    ax1.imshow(imgs_display, interpolation='none')
-                    plt.show()
-                    # Visualize image with action and next image
-                    # Under that show the decoded image and the cluster index + distance
-
+            if 'VISUALIZE_GPT' in os.environ and batch_idx % 1000 == 0:
+                self.viz_gpt(gpt_ret, state=s, batch_idx=batch_idx)
 
                 # TODO: Then for each subsequence in the window, visualize the predicted next states
                 # top_3_emb = None  # TODO get this from gpt_ret['logits']
@@ -586,6 +552,119 @@ class LearnMax(pl.LightningModule):
         #     "loss": loss,
         #     "avg_reward": self.avg_rewards,
         # })
+
+    def viz_all_dvq_clusters(self):
+        self.cuda()
+        wandb.init(entity='crizcraig', mode='disabled')
+        n = self.dvq_num_embeddings
+        width = int(n ** 0.5)
+        col_i = 0
+        row = []
+        rows = []
+        for i in range(n):
+            _i = 3070 if 'FAKE_Z_Q_EMB' in os.environ else i
+            emb = self.dvq.quantizer.embed_code(torch.tensor([_i]).cuda())  # TODO: Speed up with batching
+            img_t = self.dvq.decode_flat(emb, output_proj=self.dvq.quantizer.output_proj)
+            img_t = img_t.squeeze().permute(1, 2, 0).clamp(0, 1)
+            row.append(img_t.detach().cpu().numpy())
+            col_i += 1
+            if col_i > width:
+                col_i = 0
+                rows.append(np.concatenate(row, axis=1))
+                row = []
+        last_row = np.concatenate(row, axis=1)
+        last_row_remain = rows[-1].shape[1] - last_row.shape[1]
+        last_row_padded = np.concatenate((last_row, np.zeros((rows[-1].shape[0], last_row_remain, 3))), axis=1)
+        rows.append(last_row_padded)
+        x_hat = np.array(rows).reshape((84 * width, -1, 3))
+        im = Image.fromarray(np.uint8(x_hat * 255))
+        im.show()
+        im.save(f'{ROOT_DIR}/images/all_dvq_clusters_{DATE_STR}.png')
+
+    def viz_dvq(self):
+        self.cuda()
+        wandb.init(entity='crizcraig', mode='disabled')
+
+        test_loader = self.test_dataloader()
+        xl = next(iter(test_loader))[0].cuda()
+        x = xl.cuda().reshape(-1, 3, 84, 84)
+        # TODO: List => Tensor
+        # x = [t.cuda() for t in xl]
+        # x_hat = [t['dvq_x_hat'].cuda() for t in x]
+        # loss, recon_loss, latent_loss, x_hat = model.dvq.training_step(x, 0)
+        # 80,3,84,84
+        x2, x_hat, z_q_emb, z_q_flat, latent_loss, recon_loss, dvq_loss, z_q_ind = self.dvq.forward(x)
+        # states, actions, rewards, dones, new_states = next(iter(test_loader))
+        # x = torch.cat([states, new_states])
+        num_cols = 20
+        xcols = torch.cat([x[:num_cols], x_hat[:num_cols]], axis=2)  # side by side x_pre and xhat
+        xrows = torch.cat([xcols[i] for i in range(num_cols)], axis=2)
+
+        # TODO: Just save image with PIL here
+        plt.figure(figsize=(num_cols, 5))
+        plt.imshow((xrows.data.cpu().permute(1, 2, 0)).clamp(0, 1))
+        plt.axis('off')
+        plt.show()
+
+        plt.show()
+
+    def viz_gpt(self, gpt_ret, state, batch_idx):
+        # TODO: We have batch and window dimensions. Let's visualize the first batch window
+        batches_to_visualize = 1
+        for b_i in range(batches_to_visualize):
+            num_imgs_to_viz = 10
+            top_n = 3
+            imgs = state[b_i][:num_imgs_to_viz]  # Check start of sequence
+
+            logits = gpt_ret['logits'].detach().cpu().numpy()[b_i][:num_imgs_to_viz]
+
+            target_idx = gpt_ret['target_idx'][b_i][:num_imgs_to_viz]
+            emb = self.dvq.quantizer.embed_code(target_idx)
+            imgs_target = self.emb2img(emb)
+
+            # top n predicted next embedding indexes for each img
+            top_n_idxs = np.argpartition(logits, -top_n)[:, -top_n:]  # top n idxs unsorted
+            top_n_idxs_idxs_sorted = np.argsort(np.take_along_axis(-logits, top_n_idxs, axis=1))  # -logits => sort desc
+            top_n_idxs = np.take_along_axis(top_n_idxs, top_n_idxs_idxs_sorted, axis=1)  # top n idxs sorted desc
+            top_n_idxs = torch.Tensor(top_n_idxs).int()
+
+            # get dvq embeddings from indexes
+            emb_hat = self.dvq.quantizer.embed_code(top_n_idxs.cuda())
+
+            # decode predictions into images
+            imgs_hat = self.emb2img(emb_hat)
+            sn = len(imgs_hat.size())
+            imgs_hat = imgs_hat.permute(*list(range(sn-3)), sn-2, sn-1, sn-3).clamp(0, 1)
+            imgs_display = []
+            for img_i, img in enumerate(imgs):
+                img = img.permute(1, 2, 0).cpu().numpy()
+                img_target = imgs_target[img_i].permute(1, 2, 0).clamp(0, 1).detach().cpu().numpy()
+                blank = 0 * np.zeros_like(img)
+                img_hat_row = []
+                for ti in range(top_n):
+                    img_hat = imgs_hat[img_i][ti].clamp(0, 1)
+                    img_hat_row.append(img_hat.detach().cpu().numpy())
+                left_img = np.concatenate([blank, img, blank])
+                mid_img = np.concatenate(img_hat_row)
+                right_img = np.concatenate([blank, img_target, blank])
+                imgs_display.append(np.concatenate([left_img, mid_img, right_img], axis=1))
+                imgs_display.append(0.5 * np.ones((5, *imgs_display[-1].shape[1:])))  # border
+
+            imgs_display = np.concatenate(imgs_display)
+            im = Image.fromarray(np.uint8(imgs_display * 255))
+            # im.show()
+            im.save(f'{ROOT_DIR}/images/viz_gpt_{get_date_str()}_r_{RUN_ID}_e_{self.current_epoch}_b_{batch_idx}.png')
+
+            # fig1 = plt.figure(figsize=(num_imgs_per_row, 1))
+            # ax1 = fig1.add_subplot(111)
+            # ax1.imshow(imgs_display, interpolation='none')
+            # plt.show()
+            # TODO: Visualize image with action, cluster index + distance, probability, uncertainty
+            #   Make sure you're extracting the logits correctly for the image
+            #   Look at disappear and teleport images bad clustering cases.
+
+    def emb2img(self, emb):
+        return self.dvq.decode_flat(emb, output_proj=self.dvq.quantizer.output_proj)
 
     def _train_step_dvq(self, batch, batch_idx):
         self.dvq.set_do_kmeans(True)
@@ -681,12 +760,12 @@ class LearnMax(pl.LightningModule):
 
     @staticmethod
     def add_model_specific_args(arg_parser: argparse.ArgumentParser, ) -> argparse.ArgumentParser:
-        # TODO: Add the VQVAE and GPT args here as well
         arg_parser.add_argument("--dvq_quantize_proj", type=int, default=None)
         arg_parser.add_argument("--num_gpus", type=int, default=1)
         arg_parser.add_argument("--single_token2", action='store_true', default=False)
-        arg_parser.add_argument('-n', '--num_workers', type=int, default=None, help="number of workers for dataloading")
+        arg_parser.add_argument('--num_workers', type=int, default=None, help="number of workers for dataloading")
         arg_parser.add_argument('--viz_dvq', type=str, help="visualize dvq images", default=None)
+        arg_parser.add_argument('--viz_all_dvq_clusters', type=str, help="visualize all dvq clusters", default=None)
         arg_parser.add_argument('--dvq_checkpoint', type=str, help="Checkpoint to restore", default=None)
         arg_parser.add_argument('--gpt_batch_size', type=int, help="GPT batch size", default=48)
         arg_parser.add_argument('--gpt_block_size', type=int, default=80,
@@ -732,6 +811,8 @@ class LearnMax(pl.LightningModule):
 
     def beam_search(self, z_q_emb, a_buff, beam_batch_size=64):
         """
+        TODO: Explore MCTS as well or some hybrid
+
         Beam width should be batch size unless transformers combine batch + sequence trunk with the torch.tril mask
 
         We want total path interestingness (deviation) in the 50-70th percentile of all path costs.
@@ -828,42 +909,6 @@ class LearnMax(pl.LightningModule):
     #     # else:
             # implement your own custom logic to clip gradients for generator (optimizer_idx=0)
 
-def viz_dvq(model):
-    # model = LearnMax.load_from_checkpoint('/home/c2/src/learnmax/learn_max/wandb/run-20210819_112836-2sk8562w/files/learnmax-learn_max/2sk8562w/checkpoints/epoch=0-step=1179.ckpt')
-    # model = LearnMax.load_from_checkpoint('/home/c2/src/learnmax/learn_max/wandb/run-20210821_213732-ujs1wtib/files/learnmax-learn_max/ujs1wtib/checkpoints/epoch=0-step=1299.ckpt')
-    # model = LearnMax.load_from_checkpoint('/home/c2/src/learnmax/learn_max/wandb/run-20210822_114404-1hl1r5gh/files/learnmax-learn_max/1hl1r5gh/checkpoints/epoch=0-step=79.ckpt')
-    # model = LearnMax.load_from_checkpoint('/home/c2/src/learnmax/learn_max/wandb/run-20210822_122545-1vpms2wc/files/learnmax-learn_max/1vpms2wc/checkpoints/epoch=0-step=999.ckpt')
-    # model = LearnMax.load_from_checkpoint('/home/c2/src/learnmax/learn_max/wandb/run-20210823_122845-19bx2g56/files/learnmax-learn_max/19bx2g56/checkpoints/epoch=3-step=38899.ckpt')
-    # model = LearnMax.load_from_checkpoint('/home/c2/src/learnmax/learn_max/wandb/run-20210824_140120-2w1glywq/files/learnmax-learn_max/2w1glywq/checkpoints/epoch=0-step=7399.ckpt')
-    # ckpt = '/home/c2/src/learnmax/learn_max/wandb/run-20210906_120330-2y37nll3/files/learnmax-learn_max/2y37nll3/checkpoints/epoch=36-step=369999.ckpt'
-    # ckpt = '/home/c2/src/learnmax/learn_max/wandb/run-20210907_154630-8v2mk188/files/learnmax-learn_max/8v2mk188/checkpoints/epoch=8-step=81999.ckpt'  # perfect on 20 examples
-    # ckpt = '/home/a/src/learnmax/epoch=3-step=30999.ckpt'  # 19/20
-    # print(f'visualizing {ckpt}')
-    # model = load_pretrained_dvq(ckpt)
-    model.cuda()
-    wandb.init(entity='crizcraig', mode='disabled')
-
-    test_loader = model.test_dataloader()
-    xl = next(iter(test_loader))[0].cuda()
-    x = xl.cuda().reshape(-1, 3, 84, 84)
-    # TODO: List => Tensor
-    # x = [t.cuda() for t in xl]
-    # x_hat = [t['dvq_x_hat'].cuda() for t in x]
-    # loss, recon_loss, latent_loss, x_hat = model.dvq.training_step(x, 0)
-    # 80,3,84,84
-    x2, x_hat, z_q_emb, z_q_flat, latent_loss, recon_loss, dvq_loss, z_q_ind = model.dvq.forward(x)
-    # states, actions, rewards, dones, new_states = next(iter(test_loader))
-    # x = torch.cat([states, new_states])
-    num_cols = 20
-    xcols = torch.cat([x[:num_cols], x_hat[:num_cols]], axis=2)  # side by side x_pre and xhat
-    xrows = torch.cat([xcols[i] for i in range(num_cols)], axis=2)
-    plt.figure(figsize=(num_cols, 5))
-    plt.imshow((xrows.data.cpu().permute(1, 2, 0)).clamp(0, 1))
-    plt.axis('off')
-    plt.show()
-
-    plt.show()
-
 LOAD_LAYER_TYPES = (nn.ConvTranspose2d, ResBlock, nn.ReLU, nn.Conv2d)
 
 
@@ -889,7 +934,8 @@ def cli_main():
     # model args
     parser = LearnMax.add_reinforcement_learning_args(parser)
     parser = LearnMax.add_model_specific_args(parser)
-    args = parser.parse_args()
+    args, unknown = parser.parse_known_args()
+    viz_dvq = args.viz_dvq or args.viz_all_dvq_clusters
     if args.num_workers is None:
         # data loader workers - pycharm has issues debugging when > 0
         # also weirdness when >0 in that wandb.init needs to be called for quantize to log???
@@ -898,7 +944,7 @@ def cli_main():
         print('cli num workers', args.num_workers)
         print('DEBUGGING', DEBUGGING)
 
-    if args.viz_dvq:
+    if viz_dvq:
         args.training_gpt = False
         args.dvq_enable_kmeans = False
         args.warm_start_size = 100
@@ -907,11 +953,9 @@ def cli_main():
         wandb_name = None
         wandb_mode = 'disabled'
         fast_dev_run = False
-        args.gpt_batch_size = 10
-        if os.environ.get('DEBUG_GPU', 'n') == 'n':
-            args.num_gpus = 0
+        log.warning(f'Setting batch size to {args.gpt_batch_size}!')
     else:
-        if args.viz_dvq:
+        if viz_dvq:
             wandb_name = None
         else:
             wandb_name = input('\n\nExperiment name?\n\n')
@@ -920,24 +964,26 @@ def cli_main():
 
     learn_max_args = copy(args.__dict__)
     del learn_max_args['num_gpus']  # This is for trainer later
-    del learn_max_args['viz_dvq']  # For flow control below, not the model
+    del learn_max_args['viz_dvq']  # Not for model
+    del learn_max_args['viz_all_dvq_clusters']  # Not for model
     model = LearnMax(**learn_max_args)
     if args.dvq_checkpoint:
         load_pretrained_dvq(args, model)
 
     if args.viz_dvq is not None:
-        return viz_dvq(model)
+        return model.viz_dvq()
+    elif args.viz_all_dvq_clusters:
+        return model.viz_all_dvq_clusters()
     else:
         delattr(args, 'viz_dvq')
+        delattr(args, 'viz_all_dvq_clusters')
 
     # common = {'batch_size': args.gpt_batch_size, 'pin_memory': bool(args.pin_memory), 'num_workers': args.num_workers}
     # trainer args  # TODO: Check that our defaults above are preserved for overlapping things like pin-memory
     parser.add_argument('-x', '--num_epochs', type=int, default=1000, help="number of epochs to train for")
-    parser.add_argument('-g', '--num_gpus', type=int, default=1, help="number of gpus to train on")
     parser.add_argument('-p', '--pin_memory', type=bool, default=True, help="pin memory on dataloaders?")
     parser = pl.Trainer.add_argparse_args(parser)
     args = parser.parse_args()
-
 
     wandb.init(entity='crizcraig', save_code=True, name=wandb_name, mode=wandb_mode)
     # wandb.watch(model)  # causes OOM https://github.com/wandb/client/issues/2644

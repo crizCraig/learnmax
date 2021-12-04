@@ -1,9 +1,14 @@
+from datetime import datetime
+from typing import List
+
 import torch
 
 import numpy as np
 import wandb
 from numpy import array
 from torch import nn
+
+from learn_max.constants import DATE_FMT
 
 
 def topk_interesting(deviations, k):
@@ -175,6 +180,68 @@ def get_batch_vars(batch, use_next=False, return_agent_state=False, populate_gpt
         return gpt_x, z_q_ind_x, z_q_ind_y, a[:, :-1], s
         # idx_or_embed = idx_or_embed.view(int(idx_or_embed.shape[0] / self.block_size) - 1, self.block_size,
         #                                  idx_or_embed.shape[1])
+
+
+def get_date_str():
+    return datetime.now().strftime(DATE_FMT)
+
+
+def accuracy(logits: torch.Tensor, target: torch.Tensor, topk=(1,)) -> List[torch.FloatTensor]:
+    """
+    From: https://gist.github.com/weiaicunzai/2a5ae6eac6712c70bde0630f3e76b77b#gistcomment-3662283
+    Computes the accuracy over the k top predictions for the specified values of k
+    In top-5 accuracy you give yourself credit for having the right answer
+    if the right answer appears in your top five guesses.
+
+    ref:
+    - https://pytorch.org/docs/stable/generated/torch.topk.html
+    - https://discuss.pytorch.org/t/imagenet-example-accuracy-calculation/7840
+    - https://gist.github.com/weiaicunzai/2a5ae6eac6712c70bde0630f3e76b77b
+    - https://discuss.pytorch.org/t/top-k-error-calculation/48815/2
+    - https://stackoverflow.com/questions/59474987/how-to-get-top-k-accuracy-in-semantic-segmentation-using-pytorch
+
+    :param logits: output is the prediction of the model e.g. scores, logits, raw y_pred before normalization or getting classes
+    :param target: target is the truth
+    :param topk: tuple of topk's to compute e.g. (1, 2, 5) computes top 1, top 2 and top 5.
+    e.g. in top 2 it means you get a +1 if your models's top 2 predictions are in the right label.
+    So if your model predicts cat, dog (0, 1) and the true label was bird (3) you get zero
+    but if it were either cat or dog you'd accumulate +1 for that example.
+    :return: list of topk accuracy [top1st, top2nd, ...] depending on your topk input
+    """
+    with torch.no_grad():
+        # ---- get the topk most likely labels according to your model
+        max_k = max(topk)  # max number labels we will consider in the right choices for out model
+        batch_size = target.size(0)
+
+        # get top max_k indices that correspond to the most likely probability scores
+        # (note _ means we don't care about the actual top max_k scores just their corresponding indices/labels)
+        _, y_pred = logits.topk(k=max_k, dim=1)  # _, [B, n_classes] -> [B, max_k]
+        y_pred = y_pred.t()  # [B, max_k] -> [max_k, B] Expects input to be <= 2-D tensor and transposes dimensions 0 and 1.
+
+        # - get the credit for each example if the models predictions is in max_k values (main crux of code)
+        # for any example, the model will get credit if it's prediction matches the ground truth
+        # for each example we compare if the model's best prediction matches the truth. If yes we get an entry of 1.
+        # if the k'th top answer of the model matches the truth we get 1.
+        # Note: this for any example in batch we can only ever get 1 match (so we never overestimate accuracy <1)
+        target = target.contiguous()
+        target_reshaped = target.view(1, -1).expand_as(y_pred)  # [B] -> [B, 1] -> [max_k, B]
+        # compare every topk's model prediction with the ground truth & give credit if any matches the ground truth
+        correct = (y_pred == target_reshaped)  # [max_k, B] where for each example we know which topk prediction matched truth
+        # original: correct = pred.eq(target.view(1, -1).expand_as(pred))
+
+        # -- get topk accuracy
+        list_topk_accs = []  # idx is topk1, topk2, ... etc
+        for k in topk:
+            # get tensor of which topk answer was right
+            ind_which_topk_matched_truth = correct[:k]  # [max_k, B] -> [k, B]
+            # flatten it to help compute if we got it correct for each example in batch
+            flattened_indicator_which_topk_matched_truth = ind_which_topk_matched_truth.reshape(-1).float()  # [k, B] -> [kB]
+            # get if we got it right for any of our top k prediction for each example in batch
+            tot_correct_topk = flattened_indicator_which_topk_matched_truth.float().sum(dim=0, keepdim=True)  # [kB] -> [1]
+            # compute topk accuracy - the accuracy of the mode's ability to get it right within it's top k guesses/preds
+            topk_acc = tot_correct_topk / batch_size  # topk accuracy for entire batch
+            list_topk_accs.append(topk_acc)
+        return list_topk_accs  # list of topk accuracies for entire batch [topk1, topk2, ... etc]
 
 
 if __name__ == '__main__':
