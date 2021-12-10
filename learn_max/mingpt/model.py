@@ -124,15 +124,15 @@ class GPT(nn.Module):
         self.betas = betas
 
         # input embedding stem: drop(content + position)
-        #   content = prev_salient + next_salient + dvq_token + learned_token + action_token
-        #   6272 total - dvq_token:4410,learned_token:2048,action_token:128
-        learned_embedding_dim = 4000
+        #  Eventually:
+        #     content = prev_salient + next_salient + dvq_token + learned_token + action_token
         action_embedding_dim = 100
-        embedding_dim = input_embedding_dim + learned_embedding_dim + action_embedding_dim
+        embedding_dim = input_embedding_dim  # + action_embedding_dim
+        # self.dvq_proj = nn.Linear(input_embedding_dim, embedding_dim)
         assert embedding_dim % n_head == 0, 'Embedding not evenly divisible by number of heads'
-        self.learned_state_embed = nn.Embedding(vocab_size, learned_embedding_dim)
+        self.tok_emb = nn.Embedding(vocab_size, input_embedding_dim)
         self.pos_emb = nn.Parameter(torch.zeros(1, block_size, embedding_dim))
-        self.act_emb = nn.Embedding(num_actions, action_embedding_dim)
+        # self.act_emb = nn.Embedding(num_actions, input_embedding_dim)
 
         self.drop = nn.Dropout(embd_pdrop)
         # deep transformer: just a sequence of transformer blocks
@@ -142,7 +142,14 @@ class GPT(nn.Module):
         # decoder: at the end one more layernorm and decode the answers
         self.ln_f = nn.LayerNorm(out_embedding_dim)
         self.logit_p_head = nn.Linear(out_embedding_dim, vocab_size, bias=False) # no need for extra bias due to one in ln_f
+
+        # TODO: Remove or change to deviation over longer timescale - we want to know how the entropy of the
+        #   probs changes over time so that, in the case of an aleotoric process like a slot machine, we see that
+        #   while there may be patterns in recent data, the system over long stretches is random. The deviation head
+        #   just predicts instantaneous changes to probability and so does not do this.
         self.deviation_head = nn.Linear(out_embedding_dim, vocab_size, bias=False)   # mean deviation
+
+        self.target_idx = torch.arange(vocab_size)
 
         self.block_size = block_size
         self.apply(self._init_weights)
@@ -152,6 +159,7 @@ class GPT(nn.Module):
         self.max_trajectory_count = 0
         self.should_input_embed = should_input_embed
         self.should_input_and_learn_embed = should_input_and_learn_embed
+        self.num_actions = num_actions
 
         log.info("number of parameters: %e" % sum(p.numel() for p in self.parameters()))
 
@@ -266,31 +274,36 @@ class GPT(nn.Module):
         assert t <= self.block_size, "Cannot forward, model block size is exhausted."
 
         # forward the GPT model
-        learned_embed = self.learned_state_embed(idx)  # each index maps to a (learnable) vector
+        token_embed = self.tok_emb(idx)  # each index maps to a (learnable) vector
         position_embeddings = self.pos_emb[:, :t, :]  # each position maps to a (learnable) vector
-        action_embeddings = self.act_emb(actions)  # each action maps to a (learnable) vector
-        # embed *= 0
-        token_embed = torch.cat((embed, learned_embed, action_embeddings), dim=2)  # cat orig state to keep sensory data
+        # action_embeddings = self.act_emb(actions)  # each action maps to a (learnable) vector
+        # token_embed = torch.cat((token_embed, action_embeddings), dim=2)
 
-        x = self.drop(token_embed + position_embeddings)
+        # allow learning a transformation into the summed representation below so that we can learn how to best
+        # distribute the dvq embedding to the attention heads
+        # embed = self.dvq_proj(embed)  # this projection kills performance for some reason
+
+        # x = self.drop(token_embed + position_embeddings + action_embeddings + dvq_proj)
+        x = self.drop(token_embed + position_embeddings + embed)
         x = self.blocks(x)
         x = self.ln_f(x)
         logits = self.logit_p_head(x)
         expected_deviation = self.deviation_head(x)  # Uses mean deviation instead of standard deviation https://stats.stackexchange.com/q/81986/18187
 
-        wandb.log({'train/expected_deviation_median': torch.quantile(expected_deviation, 0.5)})
-        wandb.log({'train/expected_deviation_90pct': torch.quantile(expected_deviation, 0.9 )})
-        wandb.log({'train/expected_deviation_95pct': torch.quantile(expected_deviation, 0.95)})
-        wandb.log({'train/expected_deviation_99pct': torch.quantile(expected_deviation, 0.99)})
-        wandb.log({'train/expected_deviation_mean': expected_deviation.mean()})
-        wandb.log({'train/expected_deviation_max': expected_deviation.max()})
-        wandb.log({'train/expected_deviation_min': expected_deviation.min()})
+        # wandb.log({'train/expected_deviation_median': torch.quantile(expected_deviation, 0.5)})
+        # wandb.log({'train/expected_deviation_90pct': torch.quantile(expected_deviation, 0.9 )})
+        # wandb.log({'train/expected_deviation_95pct': torch.quantile(expected_deviation, 0.95)})
+        # wandb.log({'train/expected_deviation_99pct': torch.quantile(expected_deviation, 0.99)})
+        # wandb.log({'train/expected_deviation_mean': expected_deviation.mean()})
+        # wandb.log({'train/expected_deviation_max': expected_deviation.max()})
+        # wandb.log({'train/expected_deviation_min': expected_deviation.min()})
         wandb.log({'train/logits_std': logits.std()})
 
         return logits, expected_deviation
 
     def step_(self, split, batch, batch_idx=None):
-        embed, idx, target_idx, a = batch  # i.e.  x, x_idx, y = batch
+        embed, idx, next_idx, a = batch
+        target_idx = self.as_i_to_s_i(next_idx, a)
         logits, expected_deviation = self.forward(embed, idx, a)
 
         # Calculate mean deviation loss for uncertainty ----------------------
@@ -298,15 +311,7 @@ class GPT(nn.Module):
         one_hot = F.one_hot(target_idx, num_classes=self.vocab_size).squeeze()
         probs = F.softmax(logits, dim=-1)
 
-        # rearrange(a, 'd0 d1 d2 d3 d4 d5 -> d0 d1 (d2 d3 d4) d5')
-        # Combine batch and window dimensions with rearrange
-        top_acc_lvls = (self.vocab_size // 10, self.vocab_size // 100, 3, 1)
-        acc = accuracy(logits=rearrange(logits, 'd0 d1 d2 -> (d0 d1) d2'),
-                       target=rearrange(target_idx, 'd0 d1 -> (d0 d1)'),
-                       topk=top_acc_lvls)
-
-        for lvl_i, lvl in enumerate(top_acc_lvls):
-            wandb.log({f'train/acc/top{lvl}': acc[lvl_i]})
+        self.calc_accuracy(logits, target_idx)
 
         wandb.log({'train/probs_std': probs.std()})
         p_diff = (one_hot - probs).abs()  # actual deviation
@@ -320,6 +325,55 @@ class GPT(nn.Module):
         self.iter += 1
         return {'loss': loss, 'logits': logits, 'expected_deviation': expected_deviation,
                 'target_idx': target_idx}
+
+    def as_i_to_s_i(self, state_idx, actions):
+        """
+        Expand state indexes into action-state indexes
+        ----------------------------------------------
+        So we have a sequence of target state ints like
+
+            2 1 0
+
+        and we have 3 actions, we'd want to map each state to 3 possible action-states, a_s
+
+            s     a_s
+            0 => 0 1 2
+            1 => 3 4 5
+            2 => 6 7 8
+               ...
+
+        so the possible action-states for a given state, s, are:
+            a_s_all = [s * n + i for i in range(n)]
+            e.g. a_s_all[0] = [0,1,2]
+
+        Then the action-state index is defined as
+            as_all + a
+        ...where a is the action index
+
+        Now say we took actions, 0 1 2, then the target idx would be 6,4,2:
+            s,a       as   a    t
+            2,0 => [6 7 8][0] = 6
+            1,1 => [3 4 5][1] = 4
+            0,2 => [0 1 2][2] = 2
+        """
+        target_idx = self.target_idx.to(state_idx.device)[state_idx * self.num_actions + actions]
+        return target_idx
+
+    def s_i_to_as_i(self, action_state_idx):
+        """
+        State index to action-state index
+        inverse of get_action_state_idx_from_state_idx
+        """
+        return action_state_idx // self.num_actions
+
+    def calc_accuracy(self, logits, target_idx):
+        # rearrange combines batch and window dimensions
+        top_acc_lvls = (self.vocab_size // 10, self.vocab_size // 100, 3, 1)
+        acc = accuracy(logits=rearrange(logits, 'd0 d1 d2 -> (d0 d1) d2'),
+                       target=rearrange(target_idx, 'd0 d1 -> (d0 d1)'),
+                       topk=top_acc_lvls)
+        for lvl_i, lvl in enumerate(top_acc_lvls):
+            wandb.log({f'train/acc/top{lvl}': acc[lvl_i]})
 
     def training_step(self, *args, **kwargs):
         return self.step_('train', *args, **kwargs)

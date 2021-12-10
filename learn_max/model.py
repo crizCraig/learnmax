@@ -221,7 +221,7 @@ class LearnMax(pl.LightningModule):
             self.test_env = make_env(env_id)
 
         self.obs_shape = self.env.observation_space.shape
-        self.n_actions = self.env.action_space.n
+        self.num_actions = self.env.action_space.n
 
         # This action embedding will be concatenated with the dvq output. The transformer
         #  will then enumerate all actions for all possible dvq tokens for n_actions * n_embd total possible
@@ -281,21 +281,22 @@ class LearnMax(pl.LightningModule):
 
         if self.is_single_token2:
             self.dvq = VQVAE(n_hid=dvq_n_hid, num_embeddings=num_embeddings, embedding_dim=self.dvq_embedding_dim,
-                loss_flavor=dvq_loss_flavor, input_channels=dvq_input_channels,
-                enc_dec_flavor=dvq_enc_dec_flavor, vq_flavor=dvq_vq_flavor, quantize_proj=dvq_quantize_proj,
-                is_single_token2=self.is_single_token2, enable_kmeans=dvq_enable_kmeans)
+                             loss_flavor=dvq_loss_flavor, input_channels=dvq_input_channels,
+                             enc_dec_flavor=dvq_enc_dec_flavor, vq_flavor=dvq_vq_flavor,
+                             quantize_proj=dvq_quantize_proj,
+                             is_single_token2=self.is_single_token2, enable_kmeans=dvq_enable_kmeans)
         else:
             # TODO: Need to test that distance between clusters is further than avg distance between points in a cluster
             self.dvq = VQVAE(n_hid=dvq_n_hid, num_embeddings=num_embeddings, embedding_dim=self.dvq_embedding_dim,
-                loss_flavor=dvq_loss_flavor, input_channels=dvq_input_channels,
-                enc_dec_flavor=dvq_enc_dec_flavor, vq_flavor=dvq_vq_flavor, quantize_proj=None,
-                is_single_token2=self.is_single_token2)
+                             loss_flavor=dvq_loss_flavor, input_channels=dvq_input_channels,
+                             enc_dec_flavor=dvq_enc_dec_flavor, vq_flavor=dvq_vq_flavor, quantize_proj=None,
+                             is_single_token2=self.is_single_token2)
 
-        self.gpt = GPT(vocab_size=num_embeddings, block_size=gpt_block_size, n_layer=gpt_n_layer,
-                       input_embedding_dim=self.gpt_input_embedding_dim, n_head=gpt_n_head, learning_rate=gpt_learning_rate,
-                       weight_decay=gpt_weight_decay, betas=gpt_betas, embd_pdrop=gpt_embd_pdrop,
-                       resid_pdrop=gpt_resid_pdrop, attn_pdrop=gpt_attn_pdrop, should_input_embed=gpt_input_embed,
-                       num_actions=self.n_actions)
+        self.gpt = GPT(vocab_size=num_embeddings * self.num_actions, block_size=gpt_block_size, n_layer=gpt_n_layer,
+                       input_embedding_dim=self.gpt_input_embedding_dim, n_head=gpt_n_head,
+                       learning_rate=gpt_learning_rate, weight_decay=gpt_weight_decay, betas=gpt_betas,
+                       embd_pdrop=gpt_embd_pdrop, resid_pdrop=gpt_resid_pdrop, attn_pdrop=gpt_attn_pdrop,
+                       should_input_embed=gpt_input_embed, num_actions=self.num_actions)
 
         self.agent = LearnMaxAgent(model=self, num_actions=self.env.action_space.n)
 
@@ -379,7 +380,10 @@ class LearnMax(pl.LightningModule):
             if self.total_steps == 0 or 'OVERFIT' not in os.environ:
                 actions, agent_states, dones, new_states, rewards, states = self._take_action_and_sample(episode_reward,
                                                                                                          episode_steps)
-
+            if dones is None:
+                log.error('dones is None, what is going on - trying to continue')
+                time.sleep(5)
+                continue
             for idx, _ in enumerate(dones):
                 # Lightning wants tensors, numpy arrays, numbers, dicts or lists in batch
                 if isinstance(agent_states[idx], AgentState):
@@ -613,9 +617,11 @@ class LearnMax(pl.LightningModule):
 
             logits = gpt_ret['logits'].detach().cpu().numpy()[b_i][:num_imgs_to_viz]
 
-            target_idx = gpt_ret['target_idx'][b_i][:num_imgs_to_viz]
+            # dvq states are action agnostic, so get base state by dividing by num_actions
+            target_idx = self.gpt.s_i_to_as_i(gpt_ret['target_idx'][b_i][:num_imgs_to_viz])
+
             emb = self.dvq.quantizer.embed_code(target_idx)
-            imgs_target = self.emb2img(emb)
+            imgs_target = self.dvq.decode_flat(emb, output_proj=self.dvq.quantizer.output_proj)
 
             # top n predicted next embedding indexes for each img
             top_n_idxs = np.argpartition(logits, -top_n)[:, -top_n:]  # top n idxs unsorted
@@ -624,10 +630,12 @@ class LearnMax(pl.LightningModule):
             top_n_idxs = torch.Tensor(top_n_idxs).int()
 
             # get dvq embeddings from indexes
-            emb_hat = self.dvq.quantizer.embed_code(top_n_idxs.cuda())
+            target_idx_state = self.gpt.s_i_to_as_i(top_n_idxs.to(target_idx.device))
+
+            emb_hat = self.dvq.quantizer.embed_code(target_idx_state)
 
             # decode predictions into images
-            imgs_hat = self.emb2img(emb_hat)
+            imgs_hat = self.dvq.decode_flat(emb_hat, output_proj=self.dvq.quantizer.output_proj)
             sn = len(imgs_hat.size())
             imgs_hat = imgs_hat.permute(*list(range(sn-3)), sn-2, sn-1, sn-3).clamp(0, 1)
             imgs_display = []
@@ -651,7 +659,6 @@ class LearnMax(pl.LightningModule):
             filename = f'{ROOT_DIR}/images/viz_gpt_{get_date_str()}_r_{RUN_ID}_e_{self.current_epoch}_b_{batch_idx}.png'
             log.info(f'Saving gpt viz to {filename}')
             im.save(filename)
-            # TODO: Log to wandb
             wandb.log({'train/gpt-viz': [wandb.Image(im)]})
 
             # fig1 = plt.figure(figsize=(num_imgs_per_row, 1))
@@ -661,9 +668,6 @@ class LearnMax(pl.LightningModule):
             # TODO: Visualize image with action, cluster index + distance, probability, uncertainty
             #   Make sure you're extracting the logits correctly for the image
             #   Look at disappear and teleport images bad clustering cases.
-
-    def emb2img(self, emb):
-        return self.dvq.decode_flat(emb, output_proj=self.dvq.quantizer.output_proj)
 
     def _train_step_dvq(self, batch, batch_idx):
         self.dvq.set_do_kmeans(True)
