@@ -132,7 +132,7 @@ class GPT(nn.Module):
         assert embedding_dim % n_head == 0, 'Embedding not evenly divisible by number of heads'
         self.tok_emb = nn.Embedding(vocab_size, input_embedding_dim)
         self.pos_emb = nn.Parameter(torch.zeros(1, block_size, embedding_dim))
-        # self.act_emb = nn.Embedding(num_actions, input_embedding_dim)
+        self.act_emb = nn.Embedding(num_actions, input_embedding_dim)
 
         self.drop = nn.Dropout(embd_pdrop)
         # deep transformer: just a sequence of transformer blocks
@@ -275,8 +275,8 @@ class GPT(nn.Module):
 
         # forward the GPT model
         token_embed = self.tok_emb(idx)  # each index maps to a (learnable) vector
-        position_embeddings = self.pos_emb[:, :t, :]  # each position maps to a (learnable) vector
-        # action_embeddings = self.act_emb(actions)  # each action maps to a (learnable) vector
+        position_embed = self.pos_emb[:, :t, :]  # each position maps to a (learnable) vector
+        action_embed = self.act_emb(actions)  # each action maps to a (learnable) vector
         # token_embed = torch.cat((token_embed, action_embeddings), dim=2)
 
         # allow learning a transformation into the summed representation below so that we can learn how to best
@@ -284,7 +284,7 @@ class GPT(nn.Module):
         # embed = self.dvq_proj(embed)  # this projection kills performance for some reason
 
         # x = self.drop(token_embed + position_embeddings + action_embeddings + dvq_proj)
-        x = self.drop(token_embed + position_embeddings + embed)
+        x = self.drop(token_embed + position_embed + action_embed + embed)
         x = self.blocks(x)
         x = self.ln_f(x)
         logits = self.logit_p_head(x)
@@ -302,8 +302,8 @@ class GPT(nn.Module):
         return logits, expected_deviation
 
     def step_(self, split, batch, batch_idx=None):
-        embed, idx, next_idx, a = batch
-        target_idx = self.as_i_to_s_i(next_idx, a)
+        embed, idx, next_idx, a, a_next = batch
+        target_idx = self.s_i_to_as_i(next_idx, a)
         logits, expected_deviation = self.forward(embed, idx, a)
 
         # Calculate mean deviation loss for uncertainty ----------------------
@@ -311,14 +311,14 @@ class GPT(nn.Module):
         one_hot = F.one_hot(target_idx, num_classes=self.vocab_size).squeeze()
         probs = F.softmax(logits, dim=-1)
 
-        self.calc_accuracy(logits, target_idx)
+        self.accuracy(logits, target_idx)
 
         wandb.log({'train/probs_std': probs.std()})
         p_diff = (one_hot - probs).abs()  # actual deviation
         d_diff = p_diff - expected_deviation
         d_loss = d_diff.square().sum() / d_diff.numel()
 
-        # Calculate standard transformer categorical probability loss-----------
+        # Calculate standard transformer categorical probability loss -----------
         # pytorch cross entropy has built-in softmax so pass logits
         p_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_idx.reshape(-1))
         loss = d_loss + p_loss
@@ -326,7 +326,7 @@ class GPT(nn.Module):
         return {'loss': loss, 'logits': logits, 'expected_deviation': expected_deviation,
                 'target_idx': target_idx}
 
-    def as_i_to_s_i(self, state_idx, actions):
+    def s_i_to_as_i(self, state_idx, actions):
         """
         Expand state indexes into action-state indexes
         ----------------------------------------------
@@ -359,16 +359,20 @@ class GPT(nn.Module):
         target_idx = self.target_idx.to(state_idx.device)[state_idx * self.num_actions + actions]
         return target_idx
 
-    def s_i_to_as_i(self, action_state_idx):
+    def as_i_to_s_i(self, action_state_idx):
         """
         State index to action-state index
         inverse of get_action_state_idx_from_state_idx
         """
         return action_state_idx // self.num_actions
 
-    def calc_accuracy(self, logits, target_idx):
-        # rearrange combines batch and window dimensions
-        top_acc_lvls = (self.vocab_size // 10, self.vocab_size // 100, 3, 1)
+    def accuracy(self, logits, target_idx):
+
+        # TODO: State based accuracy (current action-state)
+
+        top_acc_lvls = (self.vocab_size // 10, self.vocab_size // 100, 3, 1, self.num_actions)
+
+        # rearrange combines batch and window dimensions into batch dimension
         acc = accuracy(logits=rearrange(logits, 'd0 d1 d2 -> (d0 d1) d2'),
                        target=rearrange(target_idx, 'd0 d1 -> (d0 d1)'),
                        topk=top_acc_lvls)

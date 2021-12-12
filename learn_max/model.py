@@ -378,10 +378,11 @@ class LearnMax(pl.LightningModule):
 
         while True:
             if self.total_steps == 0 or 'OVERFIT' not in os.environ:
+                # TODO: Do more than one action per batch
                 actions, agent_states, dones, new_states, rewards, states = self._take_action_and_sample(episode_reward,
                                                                                                          episode_steps)
             if dones is None:
-                log.error('dones is None, what is going on - trying to continue')
+                log.error('dones is None, what is going on??? - trying to continue')
                 time.sleep(5)
                 continue
             for idx, _ in enumerate(dones):
@@ -510,11 +511,11 @@ class LearnMax(pl.LightningModule):
 
         if self.training_gpt:
             self.dvq.set_do_kmeans(False)
-            gpt_x, z_q_ind_x, z_q_ind_y, a, s = get_batch_vars(batch, return_agent_state=True, populate_gpt=True)
+            gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y, s = get_batch_vars(batch, return_agent_state=True, populate_gpt=True)
             # print('gptx', gpt_x[0][0])
             # Train gpt on dvq tokens shifted for prediction
 
-            gpt_ret = self.gpt.training_step(batch=(gpt_x, z_q_ind_x, z_q_ind_y, a), batch_idx=batch_idx)
+            gpt_ret = self.gpt.training_step(batch=(gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y), batch_idx=batch_idx)
 
             if batch_idx % 1000 == 0:
                 self.viz_gpt(gpt_ret, state=s, batch_idx=batch_idx)
@@ -618,19 +619,19 @@ class LearnMax(pl.LightningModule):
             logits = gpt_ret['logits'].detach().cpu().numpy()[b_i][:num_imgs_to_viz]
 
             # dvq states are action agnostic, so get base state by dividing by num_actions
-            target_idx = self.gpt.s_i_to_as_i(gpt_ret['target_idx'][b_i][:num_imgs_to_viz])
+            target_idx = self.gpt.as_i_to_s_i(gpt_ret['target_idx'][b_i][:num_imgs_to_viz])
 
             emb = self.dvq.quantizer.embed_code(target_idx)
             imgs_target = self.dvq.decode_flat(emb, output_proj=self.dvq.quantizer.output_proj)
 
-            # top n predicted next embedding indexes for each img
+            # top n predicted next embedding indexes for each img - TODO: Use torch.topk here which is already sorted
             top_n_idxs = np.argpartition(logits, -top_n)[:, -top_n:]  # top n idxs unsorted
             top_n_idxs_idxs_sorted = np.argsort(np.take_along_axis(-logits, top_n_idxs, axis=1))  # -logits => sort desc
             top_n_idxs = np.take_along_axis(top_n_idxs, top_n_idxs_idxs_sorted, axis=1)  # top n idxs sorted desc
             top_n_idxs = torch.Tensor(top_n_idxs).int()
 
             # get dvq embeddings from indexes
-            target_idx_state = self.gpt.s_i_to_as_i(top_n_idxs.to(target_idx.device))
+            target_idx_state = self.gpt.as_i_to_s_i(top_n_idxs.to(target_idx.device))
 
             emb_hat = self.dvq.quantizer.embed_code(target_idx_state)
 
@@ -816,6 +817,11 @@ class LearnMax(pl.LightningModule):
         """
         TODO: Explore MCTS as well or some hybrid
 
+        Need to keep track of action taken at start of search path, total uncertainty, and path nodes.
+
+        Avoiding discount factor for now as this already happens due to limited prediction horizon. Also unclear if
+            discount factor is fundamentally good: https://stats.stackexchange.com/questions/221402/
+
         Beam width should be batch size unless transformers combine batch + sequence trunk with the torch.tril mask
 
         We want total path interestingness (deviation) in the 50-70th percentile of all path costs.
@@ -844,34 +850,29 @@ class LearnMax(pl.LightningModule):
 
         totals = [0.1, 1.1, 0.8, 0.6]
 
-        * take the transformer's input sequence of z,a embeddings and output deviations as input to beam search
-          (note that deviation is the predicted output prob change and is the proxy we are using for uncertainty)
-        * for saliency level zero, just concatenate (or sum) state and action embeddings for input to the transformer,
-          for higher levels, get the action that corresponds to each output state by forwarding it through the dvq decoder
-          for that saliency level in batch(es) and getting the closest action embedding to the decoded one.
-          saliency levels above level 0 will consist of their own dvq + gpt that clusters the action + state tokens
-          from below and predicts those as abstract action-states. This is to allow for planning and creating abstract
-          actions like, beat level 1 vs jump.
-        * add deviations to _all_ encountered sorted deviations
+        * take the transformer's input sequence of z embeddings and softmax entropy as input to tree search
+          (note that entropy is the proxy we are using for uncertainty)
+        * we are predicting action-states, so given state s0, predict num_actions * num_z
+            states which represent taking some action and landing in some state
+        * TODO: We need to think about backtracking to most promising forks since we aren't exhaustively exploring
+            MCTS, A*, and beam search should have ideas here
+        * add path uncertainties to _all_ encountered sorted path uncertainties
             * try naive unoptimal way first though since we don't have that many branches)
             * If we need to optimize, use TORCH.SEARCHSORTED
-                * insert new action_deviations with torch.cat - but also keep track of the associated sequence index in another
-                  (unsorted) dimension of the the action_deviations pool
+                * insert new uncertainties with torch.cat - but also keep track of the associated sequence index in another
+                  (unsorted) dimension of the the uncertainties pool
             * sequences just get appended to and are not sorted, so sequence index can be static.
-        * get topk_interesting(action_deviations, k) output indexes - (nb. interesting is defined as within 50-75pct
+        * get topk_interesting(action-states, k) output indexes - (nb. interesting is defined as within 50-75pct
           uncertainty) - however we may need to do 50-100pct to avoid state starvation
           there will be some trajectories at high saliency levels that are the most interesting. we hope that those
           trajectories remain most interesting for some amount of time so that we're not switching strats to often.
-        * limit the initial actions in the trajectory to ones with a predicted state that's close to the one received from the sim
-        * feed the corresponding z,a embeddings at those indexes back into the transformer at the end of the
+        * feed the corresponding a,z embeddings at those indexes back into the transformer at the end of the
           current sequence (we are simulating the env in multiple future branches)
-        * get new states and deviations for the next level of the tree and add them to the sorted list according to above
+        * get new states and uncertainties for the next level of the search and add them to the sorted list according to above
         * when we build up a pool of transformer i/o that reaches some desired max size in GPU memory, get the most
           interesting trajectory and return the first action of that trajectory.
-        * for the zeroth saliency level, just get the action part of the embedding, for higher levels, run the embedding through
-          the dvq for that level to get the representation for the level below, and so on until level zero.
         * we can now throw away the search tree
-        * add the previous state and action to the training batch for the transformer
+        * add the new experience to the training batch for the transformer as normal
         * repeat the above search for the next action
         * in tandem, store new observations from the environment in a batch to train the dvq online. this will mean
           that the embedding centroids will change and that the transformer will be associating moving centroids
@@ -882,6 +883,50 @@ class LearnMax(pl.LightningModule):
            We don't need improvement, we just need this to deal with shifting input distributions.
            # TODO: Short term saliency layer(s) for working memory. Could use high learning rate or multiple overlapping
            #    layers.
+
+
+        Saliency levels
+
+        Let’s say you have only the first saliency level and you get a sequence of predictable states followed by a less
+        predicted state (say jumping onto the ladder whereas usually you fall off or stay on the start platform).
+
+        (We can use the softmax prob or reconstruction error as a proxy for how predictable the state was.)
+
+        Now the single state novelty is higher and the uncertainty is low enough (on average across a recent sliding window)
+        that we can create a novel state in the saliency level above.
+        Initially the saliency context is just the first step. Now it will be the state where you are on the platform.
+
+        This context token would allow forming a different plan (even if it’s longer than the transformer’s prediction
+        window) depending on what the higher level dictates at that point.
+
+        Now let's say panama joe jumps onto the platform
+
+
+        ----------------------
+        Design
+
+        There should be a context tokens: (previous salient), goal (next salient) state, and saliency level embedding
+        added to each input token to the transformer.
+
+        The salient states are just dvq outputs, i.e. z states at each saliency level, which allows the same transformer to be
+        used for each saliency level. The difference is that, the context token will dictate skipping lower level states
+        directly to the next salient state at that level.
+
+        We need to stop adding levels when we run out of memory.
+
+        I think we'll have to pass zeroes in for the next salient when we are starting out (or just don't add it).
+        We only know the goal state when we've searched for the most interesting path and we know the next salient
+        state on the way at the current level.
+
+        Compression:
+            If the next salient state is reached and it's no longer surprising, i.e. it's by far the most probable state
+            and it has small reconstruction error, then we can train the level above to just skip this state as the
+            current level can readily predict it. But we don't want this new transition to cause surprise that
+            leads to a salient state above it. Checking to see if the predicted state (the old transition) was
+            encountered at the lower level seems to complicated, so we can just avoid compression for now.
+            **We do however need to keep track of when the goal state is reached and advance the saliency levels
+              above when this happens**
+
         """
 
         # TODO:
@@ -1052,7 +1097,10 @@ def cli_main():
 
 
 def load_pretrained_dvq(args, model):
-    _model = torch.load(args.dvq_checkpoint)
+    map_location = None
+    if 'CPU_ONLY' in os.environ:
+        map_location = torch.device('cpu')
+    _model = torch.load(args.dvq_checkpoint, map_location=map_location)
     state_dict = {k:v for k,v in _model['state_dict'].items() if k.startswith('dvq')}
     state_dict = {k[4:]:v for k,v in state_dict.items()}  # Remove `dvq.` as we're loading a submodule
     model.dvq.load_state_dict(state_dict)

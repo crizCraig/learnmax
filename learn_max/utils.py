@@ -170,14 +170,27 @@ def get_batch_vars(batch, use_next=False, return_agent_state=False, populate_gpt
         batch_size = batch[0].shape[0]
 
         # 80, 16, 1, 4410 => 16, 80, 4410
-        gpt_x = z_q_flat.squeeze().permute(1, 0, 2)[:, :-1, :]
-        # gpt_x = z_q_flat.view(batch_size, z_q_flat.shape[0] // batch_size, -1)[:, :-1, :]
-
-        z_q_ind = z_q_ind.squeeze().permute(1, 0)
+        # Here we omit the first state with `1:` in order to pass action-states where the action leads to the state
+        # vs what we have now which are state-actions, where the action is taken in the state.
+        # We additionally index with `:-1` to keep the last state for the last target.
+        #  in s:  s0 s1 s2 s3 s4
+        #  in a:  a0 a1 a2 a3 a4
+        #
+        #  out ax, sx, ay, sy
+        #  -------------------
+        #  ax: a0 a1 a2
+        #  sx: s1 s2 s3
+        #
+        #  ay: a1 a2 a3
+        #  sy: s2 s3 s4
+        gpt_x = z_q_flat.squeeze().permute(1, 0, 2)[:, 1:-1, :]
+        z_q_ind = z_q_ind.squeeze().permute(1, 0)[:, 1:]  # shift window by one to get action-states
         # z_q_ind = z_q_ind.view(batch_size, z_q_flat.shape[0] // batch_size, -1)
         z_q_ind_x = z_q_ind[:, :-1]
         z_q_ind_y = z_q_ind[:, 1:]  # GPT just predicts next state so we shift z_q_ind by one
-        return gpt_x, z_q_ind_x, z_q_ind_y, a[:, :-1], s
+        a_x = a[:, :-2]
+        a_y = a[:, 1:-1]
+        return gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y, s
         # idx_or_embed = idx_or_embed.view(int(idx_or_embed.shape[0] / self.block_size) - 1, self.block_size,
         #                                  idx_or_embed.shape[1])
 
