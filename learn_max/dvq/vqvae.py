@@ -87,11 +87,11 @@ class VQVAE(dvq_module):
         }[loss_flavor]
         self.recon_loss = ReconLoss
 
-    def forward(self, x, wait_to_init=False):
+    def forward(self, x):
 
         z = self.encoder(x)
         
-        z_q_emb, z_q_flat, latent_loss, z_q_ind = self.quantizer.forward(z, wait_to_init)  # zq 128, 64, 8, 8 vs 128, 1024
+        z_q_emb, z_q_flat, latent_loss, z_q_ind = self.quantizer.forward(z)  # zq 128, 64, 8, 8 vs 128, 1024
         if 'TRY_NON_QUANTIZED' in os.environ:
             x_hat = self.decoder.forward(z)
         else:

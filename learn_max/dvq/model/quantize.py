@@ -66,7 +66,7 @@ class VQVAEQuantize(nn.Module):
         # TODO: If we train the transformer and auto-encoder jointly, consider doing weight initialization in
         #  the same way for both. Right now pytorch does the dvq, with the quantizer initialized with k-means.
 
-    def forward(self, z, wait_to_init):
+    def forward(self, z):
         if 'SINGLE_TOKEN' in os.environ:
             B, E = z.size()  # B, Embed dim
             z_e = self.proj(z)

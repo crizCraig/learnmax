@@ -7,12 +7,14 @@ import numpy as np
 import torch
 from torch import nn
 
+
 @dataclass
 class AgentState:
+    state: torch.Tensor = None  # sensor state returned by env
     dvq_x: torch.Tensor = None
     dvq_x_hat: torch.Tensor = None
     dvq_z_q_emb: torch.Tensor = None
-    dvq_z_q_flat: torch.Tensor = None # same as dvq_z_q_emb just flattened for use as single token
+    dvq_z_q_flat: torch.Tensor = None  # same as dvq_z_q_emb just flattened for use as single token
     dvq_z_q_ind: torch.Tensor = None
     dvq_latent_loss: torch.Tensor = None
     dvq_recon_loss: torch.Tensor = None
@@ -38,39 +40,26 @@ class LearnMaxAgent:
         self.num_search_steps = num_search_steps
         self.s_buff = deque(maxlen=model.gpt_block_size)  # History of states
         self.a_buff = deque(maxlen=model.gpt_block_size)  # History of actions
-
         # Start with noop:
         #  https://github.com/mgbellemare/Arcade-Learning-Environment/blob/master/docs/manual/manual.pdf
         self.a_buff.append([0] * num_environments)
 
         self.num_environments = num_environments
 
-        # Training stuff
-        self.dvq_ready = False
-
     @torch.no_grad()
-    def __call__(self, states: torch.Tensor, device: str) -> Tuple[List[int], AgentState]:
+    def get_action(self, agent_state: torch.Tensor, device: str) -> Tuple[List[int], AgentState]:
         """
         Takes in the current state and returns the action based on the agents policy
 
         Args:
-            states: current state of the environment
+            agent_state: current state of the environment and internal states (i.e. dvq states)
             device: the device used for the current batch
 
         Returns:
-            action defined by policy and AgentState (agent's internal state)
+            action defined by policy
         """
-        states, agent_states = states  # Internal and external states
-
-        if not isinstance(states, list):
-            states = [states]
-
-        if not isinstance(states, torch.Tensor):
-            states = torch.tensor(np.array(states), device=device)  # causes issues when num_workers > 0
+        state = agent_state.dvq_x
             # print(f'states {device=}')
-
-        # TODO: Ensure that we pass an action state to each Env and aren't passing actions to one env and states to
-        #   another, etc...
 
         # Ways to measure uncertainty / interestingness
         # - We have a deviation head on the transformer that tries to just learn this from prob changes over time.
@@ -89,31 +78,24 @@ class LearnMaxAgent:
         # - DVQ reconstruction loss - if the image hasn't been seen before, we will do a really bad job at reconstructing,
         #   esp. if it's a new level in zuma for example
 
-        dvq_x = states
-
         if not self.model.training_gpt:
             # TODO: We have already forwarded these through the model, so there's no reason to re-forward. We just
             #   need to compute the average loss and run the manual backward.
-            self.s_buff.append(states)
+            # TODO: Move self.dvq_ready setting to LearnMax model
+            self.s_buff.append(state)
             dvq_batch_ready = self.model.training and len(self.s_buff) == self.s_buff.maxlen
             if dvq_batch_ready:
                 dvq_x = torch.cat(tuple(self.s_buff))  # Stack states in 0th (batch) dimension
                 self.s_buff.clear()
                 self.dvq_ready = True  # dvq outputs are now based on some training
 
-        x, x_hat, z_q_emb, z_q_flat, latent_loss, recon_loss, dvq_loss, z_q_ind = self.model.dvq(
-            dvq_x, wait_to_init=not self.dvq_ready)
-
-        agent_state = AgentState(dvq_x=x, dvq_x_hat=x_hat, dvq_z_q_emb=z_q_emb, dvq_z_q_flat=z_q_flat,
-                                 dvq_latent_loss=latent_loss, dvq_recon_loss=recon_loss, dvq_loss=dvq_loss,
-                                 dvq_z_q_ind=z_q_ind)
-
         # Return a random action if we haven't filled buffer of z states.
-        if True or not dvq_batch_ready:
-            ret = self.get_random_action(states)
+        if not self.model.buffer:  # TODO: Use self.dvq_ready for to do dvq training again
+            ret = self.get_random_action(len(state))
         else:
             # Search through tree of predicted z,a to find most interesting future
-            ret = self.model.beam_search(z_q_flat, self.a_buff)
+            # TODO: Use the model.buffer to get the latest up to window size
+            ret = self.model.tree_search(self.model.buffer)
 
         # # get the logits and pass through softmax for probability distribution
         # probabilities = F.softmax(self.net(states)).squeeze(dim=-1)
@@ -125,13 +107,13 @@ class LearnMaxAgent:
         # return actions
         self.a_buff.append(ret)
 
-        return ret, agent_state
+        return ret
 
-    def get_random_action(self, state: torch.Tensor) -> List[int]:
+    def get_random_action(self, num: int) -> List[int]:
         """returns a random action"""
         actions = []
 
-        for i in range(len(state)):
+        for i in range(num):
             action = np.random.randint(0, self.num_actions)
             actions.append(action)
 

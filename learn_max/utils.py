@@ -127,6 +127,7 @@ def wandb_try_log(msg_dict):
 
 
 def get_batch_vars(batch, use_next=False, return_agent_state=False, populate_gpt=False):
+    # TODO: Just put everything in agent_state, next_agent_state dicts
     agent_state = None
     if len(batch) == 5:
         # No agent state

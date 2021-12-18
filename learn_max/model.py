@@ -147,6 +147,7 @@ class LearnMax(pl.LightningModule):
         self.dvq_enc_dec_flavor = dvq_enc_dec_flavor
         self.dvq_vq_flavor = dvq_vq_flavor
         self.dvq_checkpoint = dvq_checkpoint
+        self.dvq_ready = False  #  Whether the dvq has enough data to train a batch
         if training_gpt is None:
             self.training_gpt = True if self.dvq_checkpoint is not None else False
         else:
@@ -191,6 +192,8 @@ class LearnMax(pl.LightningModule):
 
         # We use multiple optimizers so need to manually backward each one separately
         self.automatic_optimization = False
+
+        self.agent_state = None  # Most recent internal and external state
 
         def make_env(_env_id):
             _env = gym.make(_env_id)
@@ -277,8 +280,6 @@ class LearnMax(pl.LightningModule):
         self.batch_states = []
         self.batch_actions = []
 
-        self.state = self.reset()
-
         if self.is_single_token2:
             self.dvq = VQVAE(n_hid=dvq_n_hid, num_embeddings=num_embeddings, embedding_dim=self.dvq_embedding_dim,
                              loss_flavor=dvq_loss_flavor, input_channels=dvq_input_channels,
@@ -299,53 +300,64 @@ class LearnMax(pl.LightningModule):
                        should_input_embed=gpt_input_embed, num_actions=self.num_actions)
 
         self.agent = LearnMaxAgent(model=self, num_actions=self.env.action_space.n)
+        self.reset()
 
     def reset(self):
-        return self.env.reset(), AgentState()
+        self.agent_state = self.get_agent_state(self.env.reset())
+        return self.agent_state
 
-    def run_n_episodes(self, env, n_epsiodes: int = 1, epsilon: float = 1.0) -> List[int]:
-        """
-        Carries out N episodes of the environment with the current agent
+    def get_agent_state(self, state):
+        if not isinstance(state, list):
+            state = [state]
+        if not isinstance(state, torch.Tensor):
+            state = torch.tensor(np.array(state), device=self.device)  # causes issues when num_workers > 0
+        x, x_hat, z_q_emb, z_q_flat, latent_loss, recon_loss, dvq_loss, z_q_ind = self.dvq.forward(state)
+        agent_state = AgentState(state=state, dvq_x=x, dvq_x_hat=x_hat, dvq_z_q_emb=z_q_emb, dvq_z_q_flat=z_q_flat,
+                                 dvq_latent_loss=latent_loss, dvq_recon_loss=recon_loss, dvq_loss=dvq_loss,
+                                 dvq_z_q_ind=z_q_ind)
+        return agent_state
 
-        Args:
-            env: environment to use, either train environment or test environment
-            n_epsiodes: number of episodes to run
-            epsilon: epsilon value for DQN agent
-        """
-        total_rewards = []
-
-        for _ in range(n_epsiodes):
-            episode_state = env.reset()
-            done = False
-            episode_reward = 0
-
-            while not done:
-                self.agent.epsilon = epsilon
-                action, agent_state = self.agent(episode_state, self.device)
-                next_state, reward, done, _ = env.step(action[0])
-                episode_state = next_state
-                episode_reward += reward
-
-            total_rewards.append(episode_reward)
-
-        return total_rewards
+    # def run_n_episodes(self, env, n_epsiodes: int = 1, epsilon: float = 1.0) -> List[int]:
+    #     """
+    #     Carries out N episodes of the environment with the current agent
+    #
+    #     Args:
+    #         env: environment to use, either train environment or test environment
+    #         n_epsiodes: number of episodes to run
+    #         epsilon: epsilon value for DQN agent
+    #     """
+    #     total_rewards = []
+    #
+    #     for _ in range(n_epsiodes):
+    #         episode_state = env.reset()
+    #         done = False
+    #         episode_reward = 0
+    #
+    #         while not done:
+    #             self.agent.epsilon = epsilon
+    #             action, agent_state = self.agent(episode_state, self.device)
+    #             next_state, reward, done, _ = env.step(action[0])
+    #             episode_state = next_state
+    #             episode_reward += reward
+    #
+    #         total_rewards.append(episode_reward)
+    #
+    #     return total_rewards
 
     def populate(self, warm_start: int) -> None:
         """Populates the buffer with initial experience"""
         if warm_start > 0:
-            self.state = self.reset()
-
+            agent_state = self.reset()
             for _ in range(warm_start):
-                self.agent.epsilon = 1.0
-                action, agent_state = self.agent(self.state, self.device)
-                next_state, reward, done, _ = self.env.step(action[0])
-                new_state = (next_state, agent_state)
-                exp = Experience(state=self.state, action=action[0], reward=reward, done=done, new_state=new_state)
+                action = self.agent.get_action(agent_state, self.device)
+                next_state, reward, done, info = self.env.step(action[0])
+                next_agent_state = self.get_agent_state(next_state)
+                exp = Experience(state=self.agent_state, action=action[0], reward=reward, done=done,
+                                 new_state=next_agent_state)
                 self.buffer.append(exp)
-                self.state = new_state
-
+                self.agent_state = next_agent_state
                 if done:
-                    self.state = self.reset()
+                    self.reset()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -378,9 +390,13 @@ class LearnMax(pl.LightningModule):
 
         while True:
             if self.total_steps == 0 or 'OVERFIT' not in os.environ:
-                # TODO: Do more than one action per batch
-                actions, agent_states, dones, new_states, rewards, states = self._take_action_and_sample(episode_reward,
-                                                                                                         episode_steps)
+                # TODO: Do more than one action per batch, but not so much that we can't learn from recent experience
+                #   i.e. allow learning within the episode
+                # TODO: Move this tuple into a @dataclass
+                (states, actions, rewards, dones, new_states, agent_states, next_agent_states, episode_steps,
+                    episode_reward) = self._take_action_and_sample(episode_reward, episode_steps)
+
+                # actions, agent_states, dones, new_states, rewards, states, episode_steps, episode_reward = \
             if dones is None:
                 log.error('dones is None, what is going on??? - trying to continue')
                 time.sleep(5)
@@ -389,12 +405,12 @@ class LearnMax(pl.LightningModule):
                 # Lightning wants tensors, numpy arrays, numbers, dicts or lists in batch
                 if isinstance(agent_states[idx], AgentState):
                     # agents_states only has a batch dimension, not window size
-                    agent_states_idx = [_.dict() for _ in agent_states]
+                    agent_states = [_.dict() for _ in agent_states]
                 else:
                     # agents_states has batch and window size dimensions
-                    agent_states_idx = [_.dict() for _ in agent_states[idx]]
+                    agent_states = [_.dict() for _ in agent_states[idx]]
                 # print('states', states[idx][0][0])
-                yield states[idx], actions[idx], rewards[idx], dones[idx], new_states[idx], agent_states_idx
+                yield states[idx], actions[idx], rewards[idx], dones[idx], new_states[idx], agent_states
 
             self.total_steps += 1
 
@@ -408,39 +424,43 @@ class LearnMax(pl.LightningModule):
                 break
 
     def _take_action_and_sample(self, episode_reward, episode_steps):
-        # print('taking action')
-        action, agent_state = self.agent(self.state, self.device)
-        next_state, r, is_done, _ = self.env.step(action[0])
-        new_state = (next_state, agent_state)
-        # TODO: Subtract 0.5 from image so that we - map [0,1] range to [-0.5, 0.5]
-        # TODO: Allow learning within the episode
-        episode_reward += r
-        episode_steps += 1
-        exp = Experience(state=self.state, action=action[0], reward=r, done=is_done, new_state=new_state)
-        self.buffer.append(exp)
-        # print(f'bufflen {len(self.buffer)}')
-        self.state = new_state
+        episode_reward, episode_steps, is_done = self._take_action(episode_reward, episode_steps)
         if is_done:
             self.done_episodes += 1
             self.total_rewards.append(episode_reward)
             self.total_episode_steps.append(episode_steps)
             self.avg_rewards = float(np.mean(self.total_rewards[-self.avg_reward_len:]))
-            self.state = self.reset()
+            self.reset()
             episode_steps = 0
             episode_reward = 0
         if self.training_gpt:
             # Sample sequentially from replay buffer
             # If training GPT, we need to return the dvq state indexes as well to be used in on_train_batch_end
             #   in lr_decay _, y = batch
-            states, actions, rewards, dones, new_states, agent_states = self.sample_latest_sequential()
+            states, actions, rewards, dones, new_states, agent_states, next_agent_states = \
+                self.sample_latest_sequential()
+            # agent_states, actions, rewards, dones, new_agent_states = self.sample_latest_sequential()
         else:
             # Sample randomly from replay buffer
-            states, actions, rewards, dones, new_states = self.buffer.sample(
+            agent_states, actions, rewards, dones, new_agent_states = self.buffer.sample(
                 self.batch_size)  # TODO: Change to dvq_batch_size?
+            raise NotImplementedError('Get DVQ training to work with new agent_state protocol, old code below')
             states = np.array([x for x in states[:, 0]])
             new_states, agent_states = new_states[:, 0], new_states[:, 1]
             new_states = np.array([x for x in new_states])
-        return actions, agent_states, dones, new_states, rewards, states
+        return (states, actions, rewards, dones, new_states, agent_states, next_agent_states, episode_steps,
+                episode_reward)
+
+    def _take_action(self, episode_reward, episode_steps):
+        action = self.agent.get_action(self.agent_state, self.device)
+        next_state, r, is_done, _ = self.env.step(action[0])
+        next_agent_state = self.get_agent_state(next_state)
+        episode_reward += r
+        episode_steps += 1
+        exp = Experience(state=self.agent_state, action=action[0], reward=r, done=is_done, new_state=next_agent_state)
+        self.buffer.append(exp)
+        self.agent_state = next_agent_state
+        return episode_reward, episode_steps, is_done
 
     def profile_cuda_usage_tensors(self):
         import torch
@@ -465,18 +485,23 @@ class LearnMax(pl.LightningModule):
         ret_rewards = []
         ret_dones = []
         ret_next_states = []
+        ret_next_agent_states = []
         block_idx = np.array(list(range(self.gpt_block_size)))
         for s in start_indices:
             # TODO: pad with -100 when last index? We just avoid by making sure we sample early enough in the buffer
             indices = s + block_idx
-            states, actions, rewards, dones, next_states = zip(*[self.buffer.buffer[idx] for idx in indices])
+            agent_states, actions, rewards, dones, next_agent_states = zip(*[self.buffer.buffer[idx] for idx in indices])
+            states = agent_states['state']
             ret_states.append([s[0] for s in states])
+            ret_agent_states.append(agent_states)
             ret_actions.append(actions)
             ret_rewards.append(rewards)
             ret_dones.append(dones)
-            ret_next_states.append([s[0] for s in next_states])
-            ret_agent_states.append([s[1] for s in next_states])
+            next_states = next_agent_states['state']
+            ret_next_states.append(next_states)
+            ret_next_agent_states.append(next_agent_states)
         # TODO: Speed this up with numba?
+        # TODO: Just put everything in the agent_states, next_agent_states dict's
         ret = (
             np.array(ret_states),
             np.array(ret_actions),
@@ -484,10 +509,11 @@ class LearnMax(pl.LightningModule):
             np.array(ret_dones, dtype=bool),
             np.array(ret_next_states),
             ret_agent_states,
+            ret_next_agent_states,
         )
         return ret
 
-    def training_step(self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx) -> torch.Tensor:
+    def training_step(self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx):
         """
         Calculates loss based on the minibatch received
 
@@ -813,10 +839,8 @@ class LearnMax(pl.LightningModule):
 
         return arg_parser
 
-    def beam_search(self, z_q_emb, a_buff, beam_batch_size=64):
+    def tree_search(self, beam_batch_size=64):
         """
-        TODO: Explore MCTS as well or some hybrid
-
         Need to keep track of action taken at start of search path, total uncertainty, and path nodes.
 
         Avoiding discount factor for now as this already happens due to limited prediction horizon. Also unclear if
@@ -931,11 +955,28 @@ class LearnMax(pl.LightningModule):
 
         # TODO:
         #   - Get action embeddings
-        #   - Concatenate with z from dvq
+        #   - Forward most recent experience through GPT
+        #   - If search finds termination, trim from tree. But what if all branches terminate???
 
-        action_emb = self.action_emb(torch.tensor(a_buff)).squeeze()  # B, emb_dim = 128, 512
+        # Maybe unsqueeze z_q_embed to 1,1,4410
+        # z_q_embed # 1,4410
+        # z_q_ind  # 1
+        # a_buff  # 1
 
-        deviations = self.gpt()
+        # z_q_flat, z_q_ind, self.a_buff
+        z_q_flat = []
+        z_q_ind = []
+        a = []
+        n = min(len(self.buffer), self.gpt_block_size)
+        buffer = self.buffer.buffer
+        for i in reversed(range(n)):
+            exp = buffer[i]
+            z_q_flat.append(exp.state.dvq_z_q_flat)
+            z_q_ind.append(exp.state.dvq_z_q_ind)
+            a.append(exp.action)
+
+        # action_emb = self.action_emb(torch.tensor(a_buff)).squeeze()  # B, emb_dim = 128, 512
+        # deviations = self.gpt()
 
         beam_i = topk_interesting(deviations, k=beam_batch_size)
         # get actions associated with beam_i using decoder IN A BATCH
