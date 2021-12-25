@@ -13,6 +13,7 @@ from learn_max.constants import DATE_FMT
 
 def topk_interesting(entropy, k):
     """
+    Pick random action in 50-100 percentile
     i     entropy
     0:      0.1
     1:      0.2
@@ -56,24 +57,20 @@ def test_topk_interesting():
 
 def get_action_states(logits, actions):
     """
+    Get most likely state as a result of taking a given action
+
+    Params
+    ------
     logits: B, W, A, |S|
     actions: B, W, num_interesting_actions
 
-    returns: B, 2, num_interesting_states - where we take the max probability state for each action in the last
+    Returns
+    -------
+    Tensor of shape B, 2, num_interesting_states - where we take the max probability state for each action in the last
      window of each batch and 2 = actions,states
 
     Batches represent different paths taken throughout the planning tree, so the first time
     this is called, there's only one batch representing the trunk of the tree.
-
-    We only have 18 actions, so just get entropy across all 18.
-
-    IF we are searching greedily, then we get the top k highest entropy actions.
-
-    HOWEVER, we could also add some monte-carlo rollouts in order to find states with delayed learning.
-
-    For first level of the tree, only worry about one match (i.e. most recent action in env)
-      For subsequent levels, the batch will represent different possible futures
-      For ALL levels, on the last action in the window matters
     """
 
     ret = []

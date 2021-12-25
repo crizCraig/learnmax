@@ -954,86 +954,112 @@ class LearnMax(pl.LightningModule):
             **We do however need to keep track of when the goal state is reached and advance the saliency levels
               above when this happens**
 
+        So we're going to have batches which represent search paths, and each iteration we'll be adding
+        more search paths branching from the previous.
+
+        We have three inputs z_q_flat, z_q_ind, and a
+
+        Let's consider them as p
+
+        So in one sense we need to push new elements onto the end of p like a deque. But in another sense we
+        will be adding more branches and thus increasing p's size.
+
+        This can be achieved by just stacking more trajectories on top of p after pushing new elements onto the deque.
+
+        We need to keep track of which branches to add on to. Let's say p looks like this
+
+        ABC
+        ABD
+        ABE
+
+        And C results in two new states, D and E, then we should have
+
+        ABCD
+        ABCE
+
+        in addition to whatever comes from ABD and ABE.
+
+        So we should only append to the branch that spawned the state.
+
+
+
+        IF we are searching greedily, then we just pursue the top k highest entropy actions. Saliency levels
+        will mitigate the shortsightedness of this approach.
+
+        HOWEVER, we could also add some monte-carlo rollouts in order to find states with delayed learning.
+
+        For first level of the tree, only worry about one match (i.e. most recent action in env)
+        For subsequent levels, the batch will represent different possible futures
+        For ALL levels, only the last action in the window matters
+
         """
 
         # TODO:
         #   - If search finds termination, trim from tree. But what if all branches terminate???
 
-        z_q_flat_branches = []
+        z_q_embed_branches = []
         z_q_ind_branches = []
         action_branches = []
         n = min(len(self.buffer), self.gpt_block_size)
         buffer = self.buffer.buffer
         for i in reversed(range(n)):
             exp = buffer[i]
-            z_q_flat_branches.append(exp.state.dvq_z_q_flat)
+            z_q_embed_branches.append(exp.state.dvq_z_q_flat)
             z_q_ind_branches.append(exp.state.dvq_z_q_ind)
             action_branches.append(exp.action)
 
         # Unsqueeze so we have batch, window, embed dims, where batch=1, e.g. 1, 80, 4410
-        z_q_flat_branches = torch.cat(z_q_flat_branches).unsqueeze(0)
+        z_q_embed_branches = torch.cat(z_q_embed_branches).unsqueeze(0)
         z_q_ind_branches = torch.cat(z_q_ind_branches).unsqueeze(0)
         action_branches = torch.tensor(action_branches).unsqueeze(0).to(self.device)
 
-        """
-        So we're going to have batches which represent search paths, and each iteration we'll be adding
-        more search paths branching from the previous.
-        
-        We have three inputs z_q_flat, z_q_ind, and a
-        
-        Let's consider them as p
-        
-        So in one sense we need to push new elements onto the end of p like a deque. But in another sense we
-        will be adding more branches and thus increasing p's size.
-        
-        This can be achieved by just stacking more trajectories on top of p after pushing new elements onto the deque.
-        
-        We need to keep track of which branches to add on to. Let's say p looks like this
-        
-        ABC
-        ABD
-        ABE
-        
-        And C results in two new states, D and E, then we should have
-        
-        ABCD
-        ABCE
-        
-        in addition to whatever comes from ABD and ABE. 
-        
-        So we should only append to the branch that spawned the state.
-        """
-
-        logits, expected_deviation = self.gpt.forward(embed=z_q_flat_branches,
-                                                      idx=z_q_ind_branches,
-                                                      actions=action_branches)
-
-        B, W, _ = z_q_flat_branches.size()  # batch size, window size
-        assert B == 1, 'We should only start with one trunk'
+        assert z_q_embed_branches.size()[0] == 1, 'We should only start with one trunk'
 
         search_area = 150
-        while len(z_q_flat_branches) < search_area:
+        while len(z_q_embed_branches) < search_area:
+            # Move forward one step in the search tree
+            logits, expected_deviation = self.gpt.forward(embed=z_q_embed_branches,
+                                                          idx=z_q_ind_branches,
+                                                          actions=action_branches)
+
+            B, W, _ = z_q_embed_branches.size()  # batch size, window size
+
             # arrange so we can get entropy across each action
             logits = logits.reshape(B, W, -1, self.num_actions).transpose(-1, -2)
-
             probs = F.softmax(logits, dim=-1)
             entropy = -torch.sum(probs * torch.log(probs), dim=-1)
-            # action_emb = self.action_emb(torch.tensor(a_buff)).squeeze()  # B, emb_dim = 128, 512
-            # deviations = self.gpt()
-
-            # TODO:
-            #   1. Pick a random action within the desired entropy range - 50-100%
-
             actions = topk_interesting(entropy, k=beam_batch_size)
             action_states = get_action_states(logits, actions)
 
-            for bi, branch in enumerate(action_states):
-                # batches are branches here
-                # TODO: Get this to broadcast z_q_ind_branches to duplicate and append branch[1]
-                z_q_ind_branches[bi].cat(branch[1])
+            new_z_q_ind_branches = []
+            new_z_q_embed_branches = []
+            new_action_branches = []
+            for bi, tail in enumerate(action_states):  # batches are branches
+                # Get tail with cat-able shape
+                z_q_ind_tail = tail[1, :].unsqueeze(1)
+                z_q_embed_tail = self.dvq.quantizer.embed_code(z_q_ind_tail)
+                action_tail = tail[0, :].unsqueeze(1)
 
+                # Broadcast branches to duplicate head
+                z_q_ind_head = z_q_ind_branches[bi] * torch.ones((z_q_ind_tail.size()[0], 1))
+                z_q_embed_head = (self.dvq.quantizer.embed_code(z_q_ind_branches[bi]) *
+                                  torch.ones((z_q_ind_tail.size()[0], 1))).unsqueeze(-2)
+                action_head = action_branches[bi] * torch.ones((action_tail.size()[0], 1))
 
-        # Now append the action states to the buffer and forward through GPT again
+                # Add head+tail to new branches
+                new_z_q_ind_branches.append(torch.cat((z_q_ind_head, z_q_ind_tail), dim=-1))
+                new_z_q_embed_branches.append(torch.cat((z_q_embed_head, z_q_embed_tail), dim=-2))
+                new_action_branches.append(torch.cat((action_head, action_tail), dim=-1))
+
+            z_q_ind_branches = new_z_q_ind_branches
+            z_q_embed_branches = new_z_q_embed_branches
+            action_branches = new_action_branches
+
+            z_q_ind_branches = torch.cat(z_q_ind_branches)
+            z_q_embed_branches = torch.cat(z_q_embed_branches)
+            action_branches = torch.cat(action_branches)
+
+            # Forward through GPT again
 
 
         pass
