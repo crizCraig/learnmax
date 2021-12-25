@@ -95,7 +95,7 @@ class LearnMaxAgent:
         else:
             # Search through tree of predicted z,a to find most interesting future
             # TODO: Use the model.buffer to get the latest up to window size
-            ret = self.model.tree_search(self.model.buffer)
+            ret = self.model.tree_search()
 
         # # get the logits and pass through softmax for probability distribution
         # probabilities = F.softmax(self.net(states)).squeeze(dim=-1)

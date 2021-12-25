@@ -330,11 +330,12 @@ class GPT(nn.Module):
         """
         Expand state indexes into action-state indexes
         ----------------------------------------------
-        So we have a sequence of target state ints like
+        Say we have a sequence of target state ints like
 
-            2 1 0
+            0 1 2
 
-        and we have 3 actions, we'd want to map each state to 3 possible action-states, a_s
+        and we have 3 possible actions, we'd want to map of the 3 states to 3 action-states for 9
+        total action-states (a_s).
 
             s     a_s
             0 => 0 1 2
@@ -361,7 +362,7 @@ class GPT(nn.Module):
 
     def as_i_to_s_i(self, action_state_idx):
         """
-        State index to action-state index
+        Action-state index to state index
         inverse of get_action_state_idx_from_state_idx
         """
         return action_state_idx // self.num_actions

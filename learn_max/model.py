@@ -29,11 +29,12 @@ from pytorch_lightning.loggers import WandbLogger
 from torch import nn
 from torch.optim.optimizer import Optimizer
 from torch.utils.data import DataLoader
+from torch.nn import functional as F
 
 from learn_max import dvq
 from learn_max.agent import LearnMaxAgent, AgentState
 from learn_max.dvq.model.deepmind_enc_dec import ResBlock
-from learn_max.utils import topk_interesting, _init_weights, get_batch_vars, get_date_str
+from learn_max.utils import topk_interesting, _init_weights, get_batch_vars, get_date_str, get_action_states
 from learn_max.constants import SAVE_DIR, SEED, DEBUGGING, DATE_STR, ROOT_DIR, RUN_ID
 from learn_max.dvq.vqvae import VQVAE, DecayLR, DecayTemperature, RampBeta
 from learn_max.mingpt.lr_decay import GptWarmupCosineLearningRateDecay
@@ -886,10 +887,12 @@ class LearnMax(pl.LightningModule):
                 * insert new uncertainties with torch.cat - but also keep track of the associated sequence index in another
                   (unsorted) dimension of the the uncertainties pool
             * sequences just get appended to and are not sorted, so sequence index can be static.
-        * get topk_interesting(action-states, k) output indexes - (nb. interesting is defined as within 50-75pct
-          uncertainty) - however we may need to do 50-100pct to avoid state starvation
+        * get topk_interesting(action-states, k) actions - (nb. interesting is defined as within 50-100pct
+          action entropy) - however we may need to do 50-100pct to avoid state starvation
           there will be some trajectories at high saliency levels that are the most interesting. we hope that those
           trajectories remain most interesting for some amount of time so that we're not switching strats to often.
+        * Now get the most likely states arising from those actions according to the softmax output and add those to
+          the search tree.
         * feed the corresponding a,z embeddings at those indexes back into the transformer at the end of the
           current sequence (we are simulating the env in multiple future branches)
         * get new states and uncertainties for the next level of the search and add them to the sorted list according to above
@@ -954,37 +957,88 @@ class LearnMax(pl.LightningModule):
         """
 
         # TODO:
-        #   - Get action embeddings
-        #   - Forward most recent experience through GPT
         #   - If search finds termination, trim from tree. But what if all branches terminate???
 
-        # Maybe unsqueeze z_q_embed to 1,1,4410
-        # z_q_embed # 1,4410
-        # z_q_ind  # 1
-        # a_buff  # 1
-
-        # z_q_flat, z_q_ind, self.a_buff
-        z_q_flat = []
-        z_q_ind = []
-        a = []
+        z_q_flat_branches = []
+        z_q_ind_branches = []
+        action_branches = []
         n = min(len(self.buffer), self.gpt_block_size)
         buffer = self.buffer.buffer
         for i in reversed(range(n)):
             exp = buffer[i]
-            z_q_flat.append(exp.state.dvq_z_q_flat)
-            z_q_ind.append(exp.state.dvq_z_q_ind)
-            a.append(exp.action)
+            z_q_flat_branches.append(exp.state.dvq_z_q_flat)
+            z_q_ind_branches.append(exp.state.dvq_z_q_ind)
+            action_branches.append(exp.action)
 
-        # action_emb = self.action_emb(torch.tensor(a_buff)).squeeze()  # B, emb_dim = 128, 512
-        # deviations = self.gpt()
+        # Unsqueeze so we have batch, window, embed dims, where batch=1, e.g. 1, 80, 4410
+        z_q_flat_branches = torch.cat(z_q_flat_branches).unsqueeze(0)
+        z_q_ind_branches = torch.cat(z_q_ind_branches).unsqueeze(0)
+        action_branches = torch.tensor(action_branches).unsqueeze(0).to(self.device)
 
-        beam_i = topk_interesting(deviations, k=beam_batch_size)
-        # get actions associated with beam_i using decoder IN A BATCH
-        # add these actions to appropriate sequences
-        # add the new deviations for actions _after_ i.
+        """
+        So we're going to have batches which represent search paths, and each iteration we'll be adding
+        more search paths branching from the previous.
+        
+        We have three inputs z_q_flat, z_q_ind, and a
+        
+        Let's consider them as p
+        
+        So in one sense we need to push new elements onto the end of p like a deque. But in another sense we
+        will be adding more branches and thus increasing p's size.
+        
+        This can be achieved by just stacking more trajectories on top of p after pushing new elements onto the deque.
+        
+        We need to keep track of which branches to add on to. Let's say p looks like this
+        
+        ABC
+        ABD
+        ABE
+        
+        And C results in two new states, D and E, then we should have
+        
+        ABCD
+        ABCE
+        
+        in addition to whatever comes from ABD and ABE. 
+        
+        So we should only append to the branch that spawned the state.
+        """
 
-        #    0.6  0.8  0.8  0.7
+        logits, expected_deviation = self.gpt.forward(embed=z_q_flat_branches,
+                                                      idx=z_q_ind_branches,
+                                                      actions=action_branches)
+
+        B, W, _ = z_q_flat_branches.size()  # batch size, window size
+        assert B == 1, 'We should only start with one trunk'
+
+        search_area = 150
+        while len(z_q_flat_branches) < search_area:
+            # arrange so we can get entropy across each action
+            logits = logits.reshape(B, W, -1, self.num_actions).transpose(-1, -2)
+
+            probs = F.softmax(logits, dim=-1)
+            entropy = -torch.sum(probs * torch.log(probs), dim=-1)
+            # action_emb = self.action_emb(torch.tensor(a_buff)).squeeze()  # B, emb_dim = 128, 512
+            # deviations = self.gpt()
+
+            # TODO:
+            #   1. Pick a random action within the desired entropy range - 50-100%
+
+            actions = topk_interesting(entropy, k=beam_batch_size)
+            action_states = get_action_states(logits, actions)
+
+            for bi, branch in enumerate(action_states):
+                # batches are branches here
+                # TODO: Get this to broadcast z_q_ind_branches to duplicate and append branch[1]
+                z_q_ind_branches[bi].cat(branch[1])
+
+
+        # Now append the action states to the buffer and forward through GPT again
+
+
         pass
+
+
 
     # Perform gradient clipping on gradients associated with gpt (optimizer_idx=1)
     # def configure_gradient_clipping(self, optimizer, optimizer_idx, gradient_clip_val, gradient_clip_algorithm):
@@ -1106,6 +1160,10 @@ def cli_main():
     log.info(f'training for {args.num_epochs} epochs...')
     checkpoint_callback = ModelCheckpoint(monitor='train_loss', mode='min', every_n_train_steps=1000, save_top_k=3,
                                           verbose=True)
+
+    if not os.getenv('CUDA_VISIBLE_DEVICES'):
+        args.num_gpus = 0
+
     trainer = pl.Trainer(gpus=args.num_gpus,
                          max_epochs=args.num_epochs,
                          # gradient_clip_val=1.0, # lightning does not support with manual optimization which we need due to two optimizers
@@ -1139,7 +1197,7 @@ def cli_main():
 
 def load_pretrained_dvq(args, model):
     map_location = None
-    if 'CPU_ONLY' in os.environ:
+    if not os.getenv('CUDA_VISIBLE_DEVICES'):
         map_location = torch.device('cpu')
     _model = torch.load(args.dvq_checkpoint, map_location=map_location)
     state_dict = {k:v for k,v in _model['state_dict'].items() if k.startswith('dvq')}

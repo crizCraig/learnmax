@@ -11,9 +11,9 @@ from torch import nn
 from learn_max.constants import DATE_FMT
 
 
-def topk_interesting(deviations, k):
+def topk_interesting(entropy, k):
     """
-    i    deviations
+    i     entropy
     0:      0.1
     1:      0.2
     2:      0.3
@@ -25,45 +25,95 @@ def topk_interesting(deviations, k):
     8:      0.9
     9:      1.0
 
-    If k == 2, then we take index 5 and 6
+    Possible outputs are random samples without replacement of values between 0.6 and 1.0 so,
 
-    Algorithm:
-    k = 2
-    deviation = torch.arange(10)
-    >> tensor([0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
-    top = torch.topk(deviation, len(deviation)//2 + 1, sorted=True)
-    >> torch.return_types.topk(
-    >> values=tensor([9, 8, 7, 6, 5, 4]),
-    >> indices=tensor([9, 8, 7, 6, 5, 4]))
-
-    mid = torch.topk(top.indices, len(top.indices)//2, sorted=True, largest=False)
-    >> torch.return_types.topk(
-    >> values=tensor([4, 5, 6, 7]),
-    >> indices=tensor([5, 4, 3, 2]))
-
-    # Now values are indices and we want to return the middle k indices, 5 and 6
-    chop = len(mid.values) - k
-    return mid.values[chop//2:-chop//2]  => (5,6)
+    0.6, 0.9
+    or
+    1.0, 0.6
+    or
+    0.8, 0.9
 
     :param k: Beam width
-    :param deviations: Predicted probability change
+    :param entropy: Proxy for uncertainty / interesting-ness
     :return: Indices of most interesting path heads
     """
-    top = torch.topk(deviations, len(deviations) // 2 + 1, sorted=True)
-    mid = torch.topk(top.indices, int(len(top.indices)/2) + 1, sorted=True, largest=False)
+    top = torch.topk(entropy, entropy.size()[-1], sorted=True)
+    ret = top.indices[..., torch.randperm(top.indices.size()[-1])[:k]]
+    # TODO: We want to pick random values from the top half / perhaps normally distributed towards the middle
+    #   and with some option to anneal towards middle over time if the model capacity is reached in order
+    #   to reduce forgetting. Also, this can be "fooled" into aleatoric traps like slot machines as they
+    #   will always have high entropy. 
 
-    # mid's values are top's indices
-    chop = len(mid.values) - k
-    return mid.values[chop//2:-chop//2]
+    return ret
 
 
 def test_topk_interesting():
-    r = topk_interesting(torch.arange(10), 2)
-    assert list(r) == [5, 6]
+    r = topk_interesting(torch.arange(10), 5)
+    assert sorted(list(r.numpy())) == [5, 6, 7, 8, 9]
     r = topk_interesting(torch.arange(100), 10)
-    assert list(r) == [57, 58, 59, 60, 61, 62, 63, 64, 65, 66]
-    r = topk_interesting(torch.arange(512), 10)
-    assert list(r) == [314, 315, 316, 317, 318, 319, 320, 321, 322, 323]
+    assert not(set(list(r.numpy())) - set(range(51, 100)))
+
+
+def get_action_states(logits, actions):
+    """
+    logits: B, W, A, |S|
+    actions: B, W, num_interesting_actions
+
+    returns: B, 2, num_interesting_states - where we take the max probability state for each action in the last
+     window of each batch and 2 = actions,states
+
+    Batches represent different paths taken throughout the planning tree, so the first time
+    this is called, there's only one batch representing the trunk of the tree.
+
+    We only have 18 actions, so just get entropy across all 18.
+
+    IF we are searching greedily, then we get the top k highest entropy actions.
+
+    HOWEVER, we could also add some monte-carlo rollouts in order to find states with delayed learning.
+
+    For first level of the tree, only worry about one match (i.e. most recent action in env)
+      For subsequent levels, the batch will represent different possible futures
+      For ALL levels, on the last action in the window matters
+    """
+
+    ret = []
+    # TODO: Do this without for loop, something like logits.take_along_dim(actions) that allows extra
+    #  trailing dimensions in logits
+    for bi, batch in enumerate(logits):
+        wi, window = -1, batch[-1]  # we only care about most recent action-state
+        a = actions[bi][wi]
+        logits_a = window[a]
+        # Get most likely states
+        s_idx = torch.argmax(logits_a, dim=1)  # TODO: Possibly argsort here to get top k states instead of just top 1
+        ret.append(torch.stack((a, s_idx)))
+    ret = torch.stack(ret)
+    return ret
+
+
+def test_get_state():
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
+    B, W, A, S, K = 4, 5, 18, 4096, 10  # batch, window, action, state, top_k actions
+    logits = torch.rand(B, W, A, S)
+    actions = torch.randint(0, A-1, (B, W, K))
+    a_s = get_action_states(logits, actions)
+    wi = -1  # we only care about last window
+
+    def _test_action_state(bi, ai):
+        """
+        bi = batch index
+        ai = action index
+        """
+        s_exp = torch.argmax(logits[bi][wi][actions[bi][wi]][ai])
+        s_actual = a_s[bi][1][ai]
+        assert s_exp == s_actual
+
+    # Assert that logit for given action state is most likely
+    wi = -1
+    _test_action_state(bi=0,  ai=0)
+    _test_action_state(bi=-1, ai=-1)
+    _test_action_state(bi=-1, ai=0)
+    _test_action_state(bi=1, ai=1)
 
 
 # beam search
@@ -103,6 +153,7 @@ def main_example():
     # print result
     for seq in result:
         print(seq)
+
 
 def _init_weights(module):
     """
@@ -259,4 +310,4 @@ def accuracy(logits: torch.Tensor, target: torch.Tensor, topk=(1,)) -> List[torc
 
 
 if __name__ == '__main__':
-    test_topk_interesting()
+    test_get_state()
