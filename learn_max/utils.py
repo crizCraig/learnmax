@@ -38,14 +38,19 @@ def topk_interesting(entropy, k):
     :param entropy: Proxy for uncertainty / interesting-ness
     :return: Indices of most interesting path heads
     """
-    top = torch.topk(entropy, entropy.size()[-1], sorted=True)
-    ret = top.indices[..., torch.randperm(top.indices.size()[-1])[:k]]
+    # Get highest indexes (could also use argsort)
+    top = torch.topk(entropy, entropy.numel()//2, sorted=True)
+
+    # Pick k random actions from top half
+    k_ind = torch.randperm(top.indices.size()[-1])[:k]
+    actions = top.indices[..., k_ind]
+    action_entropy = top.values[..., k_ind]
     # TODO: We want to pick random values from the top half / perhaps normally distributed towards the middle
     #   and with some option to anneal towards middle over time if the model capacity is reached in order
     #   to reduce forgetting. Also, this can be "fooled" into aleatoric traps like slot machines as they
     #   will always have high entropy. 
 
-    return ret
+    return actions, action_entropy
 
 
 def test_topk_interesting():
