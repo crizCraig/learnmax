@@ -49,8 +49,6 @@ class LearnMax(pl.LightningModule):
             embedding_dim: int = None,
             num_embeddings: int = None,  # Number of possible discrete states shared between dvq and gpt
 
-            # TODO: Add more levels of transformers for salient events
-
             # dvq args - dvq = deep vector quantization
             dvq_n_hid: int = 64,  # number of channels controlling the size of the model
             # dvq_num_embeddings: int = 512,   # now num_embeddings,  vocabulary size; number of possible discrete states
@@ -926,7 +924,19 @@ class LearnMax(pl.LightningModule):
         This context token would allow forming a different plan (even if it’s longer than the transformer’s prediction
         window) depending on what the higher level dictates at that point.
 
-        Now let's say panama joe jumps onto the platform
+        A problem with uncertainty-defined saliency is that uncertainty will change and perhaps salience should not.
+        Therefore, it may be better to define salience as a KL divergence in the action-state softmax across a rollout.
+        Basically the idea is that salient states are defined by unlocking possibilities.
+        So when pananma joe is just jumping around on the initial platform, the state possibilities for the next
+        4 or 5 actions are largely the same. But when he jumps to the ladder or down to the bottom, the states reachable
+        from there are very different and so the softmax distribution changes quite a bit.
+
+        It may be that uncertainty measured via entropy and possibilities measured through KL divergence are largely
+        the same. I think the important point is that we look at the next n actions in the tree search to determine
+        how much uncertainty or possibility there is and create a new salient state from that instead of just
+        looking a single state. This way if it takes a few actions for panama joe to just end up at the same place,
+        (i.e. there's a cycle) then the normalized probability of future states will be less diverse and therefore
+        less interesting than if joe jumps to the ladder or down below.
 
 
         ----------------------
@@ -1033,8 +1043,14 @@ class LearnMax(pl.LightningModule):
             probs = F.softmax(logits, dim=-1)
             entropy = -torch.sum(probs * torch.log(probs), dim=-1)
             # TODO: Make sure we are searching for globally interesting actions, not just locally within branch
+            # TODO: Use entropy gathered thus far along search path, not just most recent action
+
             actions, action_entropy = topk_interesting(entropy, k=beam_batch_size)
             action_states = get_action_states(logits, actions)
+
+            # Squeeze out window dim as we only care about most recent (last) action-state in window. The same
+            # is done for actions in topk_interesting.
+            action_entropy = action_entropy.squeeze(1)
 
             # Branch out by copying beginning of path for each new action state and appending new action state to end
             new_z_q_ind_branches = []
@@ -1056,7 +1072,7 @@ class LearnMax(pl.LightningModule):
                 z_q_embed_head = (self.dvq.quantizer.embed_code(z_q_ind_branches[bi]) *
                                   torch.ones((z_q_ind_tail.size()[0], 1))).unsqueeze(-2)
                 action_head = action_branches[bi] * torch.ones((action_tail.size()[0], 1))
-                entropy_head = entropy_branches[bi] * torch.ones((z_q_ind_tail.size()[0], 1))
+                entropy_head = entropy_branches[bi] * torch.ones((z_q_ind_tail.size()[0]))
                 first_action_head = first_action_branches * torch.ones((z_q_ind_tail.size()[0], 1))
 
                 # Add head+tail to new branches
@@ -1076,11 +1092,6 @@ class LearnMax(pl.LightningModule):
             entropy_branches = torch.cat(new_entropy_branches)
             first_action_branches = torch.cat(new_first_action_branches)
 
-
-            # Forward through GPT again
-
-
-        pass
 
 
 
