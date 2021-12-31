@@ -39,7 +39,7 @@ def topk_interesting(entropy, k):
     :return:
         actions: k action sequences (i.e. plans) - list of tuples of (batch, action index)
         action_entropy: k entropies of all dvq states across above actions
-        actions_flat: k action indices indexing flattened array of length batch * num_actions
+        actions_flat: k action indices indexing flattened array of length beam_size * num_actions
     """
     B, W, A = entropy.size()
     assert W == 1, 'Should only be looking at most recent state in window'
@@ -83,7 +83,7 @@ def get_action_states(logits, actions_flat):
     Params
     ------
     logits: B, W, A, |S|
-    actions: beam_batch_size (num interesting states), 2: B,A action indexes into a B, W=1, A tensor
+    actions_flat: flat tensor of length beam_size * num_actions
 
     Returns
     -------
@@ -106,23 +106,23 @@ def get_action_states(logits, actions_flat):
 def test_get_state():
     torch.manual_seed(0)
     torch.cuda.manual_seed_all(0)
-    B, W, A, S, K = 4, 5, 18, 4096, 10  # batch, window, action, state, top_k actions
+    B, W, A, S, K = 4, 1, 18, 4096, 10  # batch, window, action, state, top_k actions
     logits = torch.rand(B, W, A, S)
-    actions = torch.randint(0, A-1, (B, W, K))
-    a_s = get_action_states(logits, actions)
-    wi = -1  # we only care about last window
+    logits_all_batches = logits.reshape(B * A, S)
+    actions_flat = torch.randint(0, B * A-1, (K,))
+    a_s = get_action_states(logits, actions_flat)
+    wi = 0
 
     def _test_action_state(bi, ai):
         """
         bi = batch index
         ai = action index
         """
-        s_exp = torch.argmax(logits[bi][wi][actions[bi][wi]][ai])
-        s_actual = a_s[bi][1][ai]
+        s_exp = torch.argmax(logits_all_batches[actions_flat][ai])
+        s_actual = a_s[ai]
         assert s_exp == s_actual
 
     # Assert that logit for given action state is most likely
-    wi = -1
     _test_action_state(bi=0,  ai=0)
     _test_action_state(bi=-1, ai=-1)
     _test_action_state(bi=-1, ai=0)

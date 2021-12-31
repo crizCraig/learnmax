@@ -1086,7 +1086,7 @@ class LearnMax(pl.LightningModule):
             entropy_branches = torch.stack(new_entropy_branches)
 
         # Return action for highest entropy path
-        ret = action_branches[torch.argmax(action_entropy_path)][1]   # 0th action was already taken
+        ret = action_branches[torch.argmax(action_entropy_path)][1]   # 0th action has already been taken
         return ret
 
 

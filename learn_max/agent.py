@@ -90,7 +90,7 @@ class LearnMaxAgent:
                 self.dvq_ready = True  # dvq outputs are now based on some training
 
         # Return a random action if we haven't filled buffer of z states.
-        if not self.model.buffer:  # TODO: Use self.dvq_ready for to do dvq training again
+        if len(self.model.buffer) < self.model.gpt_block_size:  # TODO: Use self.dvq_ready to do dvq training again
             ret = self.get_random_action(len(state))
         else:
             # Search through tree of predicted z,a to find most interesting future
