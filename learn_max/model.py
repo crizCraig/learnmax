@@ -838,7 +838,7 @@ class LearnMax(pl.LightningModule):
 
         return arg_parser
 
-    def tree_search(self):
+    def tree_search(self, beam_width=4, num_levels=10):
         """
         Need to keep track of action taken at start of search path, total uncertainty, and path nodes.
 
@@ -938,12 +938,21 @@ class LearnMax(pl.LightningModule):
         (i.e. there's a cycle) then the normalized probability of future states will be less diverse and therefore
         less interesting than if joe jumps to the ladder or down below.
 
+        However, we should also check that the future possibilities are low enough entropy such that we aren't just
+        totally unsure about the future and calling that a salient state.
+
+        When we see saliency in the tree search (i.e. expanded low entropy possibilities), we should add a salient
+        state to the training data at two levels: one where the salient state is the context,
+        and one where the salient state is the level above and we are predicting salient states.
 
         ----------------------
         Design
 
-        There should be a context tokens: (previous salient), goal (next salient) state, and saliency level embedding
-        added to each input token to the transformer.
+        There should be context tokens: (previous salient), goal (next salient) state, and saliency level embedding
+        added to each input token to the transformer. Also try splitting these across heads instead of adding so
+        that we can pass zeroes to them when we don't have context and reuse the learning that takes place without
+        context. We may also be able to reuse context when adding the tokens, but this (perhaps?) takes more network
+        power even so.
 
         The salient states are just dvq outputs, i.e. z states at each saliency level, which allows the same transformer to be
         used for each saliency level. The difference is that, the context token will dictate skipping lower level states
@@ -1010,8 +1019,10 @@ class LearnMax(pl.LightningModule):
         z_q_embed_branches = []
         z_q_ind_branches = []
         action_branches = []
+
         n = min(len(self.buffer), self.gpt_block_size)
         buffer = self.buffer.buffer
+        # Populate gpt window with recent experience
         for i in reversed(range(n)):
             exp = buffer[i]
             z_q_embed_branches.append(exp.state.dvq_z_q_flat)
@@ -1023,76 +1034,60 @@ class LearnMax(pl.LightningModule):
         z_q_ind_branches = torch.cat(z_q_ind_branches).unsqueeze(0)
         action_branches = torch.tensor(action_branches).unsqueeze(0).to(self.device)
         entropy_branches = torch.tensor([0]).to(self.device)  # Total entropy of branch
-        first_action_branches = []  # Initial action of branch
 
         assert z_q_embed_branches.size()[0] == 1, 'We should only start with one trunk'
-
-        beam_batch_size = 4
-        num_tree_levels = 10
-        search_area = beam_batch_size ** num_tree_levels
-        while len(z_q_embed_branches) < search_area:
+        action_entropy_path = None  # Declare for output
+        for _ in range(num_levels-1):  # first level already populated
             # Move forward one step in the search tree
-            logits, expected_deviation = self.gpt.forward(embed=z_q_embed_branches,
-                                                          idx=z_q_ind_branches,
-                                                          actions=action_branches)
+            logits, expected_deviation = self.gpt.forward(embed=z_q_embed_branches[:, -self.gpt_block_size:],
+                                                          idx=z_q_ind_branches[:, -self.gpt_block_size:],
+                                                          actions=action_branches[:, -self.gpt_block_size:])
 
             B, W, _ = z_q_embed_branches.size()  # batch size, window size
 
             # arrange so we can get entropy across each action
             logits = logits.reshape(B, W, -1, self.num_actions).transpose(-1, -2)
-            probs = F.softmax(logits, dim=-1)
-            entropy = -torch.sum(probs * torch.log(probs), dim=-1)
-            # TODO: Make sure we are searching for globally interesting actions, not just locally within branch
-            # TODO: Use entropy gathered thus far along search path, not just most recent action
+            logits = logits[:, -1:, ...]  # We only care about next step, so omit all but last part of window
+            probs = F.softmax(logits, dim=-1)  # Probability of dvq clusters for actions
+            entropy = -torch.sum(probs * torch.log(probs), dim=-1)  # Entropy across actions
 
-            actions, action_entropy = topk_interesting(entropy, k=beam_batch_size)
-            action_states = get_action_states(logits, actions)
+            # Add entropy gathered thus far in branches to entropy of most recent action
+            entropy_path = (entropy_branches * torch.ones((entropy.size()[-1], 1))).T.unsqueeze(1) + entropy
 
-            # Squeeze out window dim as we only care about most recent (last) action-state in window. The same
-            # is done for actions in topk_interesting.
-            action_entropy = action_entropy.squeeze(1)
+            actions, action_entropy_path, actions_flat = topk_interesting(entropy_path, k=beam_width)
+            action_states = get_action_states(logits, actions_flat)
 
             # Branch out by copying beginning of path for each new action state and appending new action state to end
             new_z_q_ind_branches = []
             new_z_q_embed_branches = []
             new_action_branches = []
             new_entropy_branches = []
-            new_first_action_branches = []
-            for bi, tail in enumerate(action_states):  # batches are branches
-                # Get tail with cat-able shape
-                z_q_ind_tail = tail[1, :].unsqueeze(1)
-                z_q_embed_tail = self.dvq.quantizer.embed_code(z_q_ind_tail)
-                action_tail = tail[0, :].unsqueeze(1)
-                if len(first_action_branches) == 0:
-                    first_action_branches = action_tail
-                entropy_tail = action_entropy[bi]
+            for i, (bi, ai) in enumerate(actions):  # batches are branches  TODO: Vectorize this
+                # Get heads
+                z_q_ind_head = z_q_ind_branches[bi]
+                z_q_embed_head = z_q_embed_branches[bi]
+                action_head = action_branches[bi]
 
-                # Broadcast branches to duplicate head
-                z_q_ind_head = z_q_ind_branches[bi] * torch.ones((z_q_ind_tail.size()[0], 1))
-                z_q_embed_head = (self.dvq.quantizer.embed_code(z_q_ind_branches[bi]) *
-                                  torch.ones((z_q_ind_tail.size()[0], 1))).unsqueeze(-2)
-                action_head = action_branches[bi] * torch.ones((action_tail.size()[0], 1))
-                entropy_head = entropy_branches[bi] * torch.ones((z_q_ind_tail.size()[0]))
-                first_action_head = first_action_branches * torch.ones((z_q_ind_tail.size()[0], 1))
+                # Get tails
+                z_q_ind_tail = action_states[i]
+                z_q_embed_tail = self.dvq.quantizer.embed_code(z_q_ind_tail)
+                action_tail = ai
 
                 # Add head+tail to new branches
-                new_z_q_ind_branches.append(torch.cat((z_q_ind_head, z_q_ind_tail), dim=-1))
-                new_z_q_embed_branches.append(torch.cat((z_q_embed_head, z_q_embed_tail), dim=-2))
-                new_action_branches.append(torch.cat((action_head, action_tail), dim=-1))
-                new_entropy_branches.append(entropy_head + entropy_tail)  # Sum entropy along search path
-                new_first_action_branches.append(first_action_head)  # No tail history needed, just want next action
+                new_z_q_ind_branches.append(torch.cat((z_q_ind_head, z_q_ind_tail.unsqueeze(0))))
+                new_z_q_embed_branches.append(torch.cat((z_q_embed_head, z_q_embed_tail.unsqueeze(0))))
+                new_action_branches.append(torch.cat((action_head, action_tail.unsqueeze(0))))
+                new_entropy_branches.append(action_entropy_path[i])  # Already summed entropy along search path
 
-            z_q_ind_branches = new_z_q_ind_branches
-            z_q_embed_branches = new_z_q_embed_branches
-            action_branches = new_action_branches
+            # Convert to tensor with window dim <= GPT block size
+            z_q_ind_branches = torch.stack(new_z_q_ind_branches)
+            z_q_embed_branches = torch.stack(new_z_q_embed_branches)
+            action_branches = torch.stack(new_action_branches)
+            entropy_branches = torch.stack(new_entropy_branches)
 
-            z_q_ind_branches = torch.cat(z_q_ind_branches)  # TODO: Truncate beginning to fit in window dim
-            z_q_embed_branches = torch.cat(z_q_embed_branches)
-            action_branches = torch.cat(action_branches)
-            entropy_branches = torch.cat(new_entropy_branches)
-            first_action_branches = torch.cat(new_first_action_branches)
-
-
+        # Return action for highest entropy path
+        ret = action_branches[torch.argmax(action_entropy_path)][1]   # 0th action was already taken
+        return ret
 
 
     # Perform gradient clipping on gradients associated with gpt (optimizer_idx=1)

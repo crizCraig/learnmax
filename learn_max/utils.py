@@ -36,60 +36,71 @@ def topk_interesting(entropy, k):
 
     :param k: Beam width
     :param entropy: Proxy for uncertainty / interesting-ness
-    :return: Indices of most interesting path heads
+    :return:
+        actions: k action sequences (i.e. plans) - list of tuples of (batch, action index)
+        action_entropy: k entropies of all dvq states across above actions
+        actions_flat: k action indices indexing flattened array of length batch * num_actions
     """
+    B, W, A = entropy.size()
+    assert W == 1, 'Should only be looking at most recent state in window'
+    entropy_flat = entropy.flatten()
     # Get highest indexes (could also use argsort)
-    top = torch.topk(entropy, entropy.numel()//2, sorted=True)
+    top = torch.topk(entropy_flat, entropy_flat.numel()//2, sorted=True)
 
     # Pick k random actions from top half
     k_ind = torch.randperm(top.indices.size()[-1])[:k]
-    actions = top.indices[..., k_ind]
+    actions_flat = top.indices[..., k_ind]
     action_entropy = top.values[..., k_ind]
+
+    # Unflatten action indexes
+    action_bi = actions_flat // A  # recover batch index
+    action_ai = actions_flat - A * action_bi  # recover action index
+
+    action_i = torch.stack((action_bi, action_ai)).T  # zip up action indexes
+
     # TODO: We want to pick random values from the top half / perhaps normally distributed towards the middle
     #   and with some option to anneal towards middle over time if the model capacity is reached in order
     #   to reduce forgetting. Also, this can be "fooled" into aleatoric traps like slot machines as they
     #   will always have high entropy. 
+    assert len(action_i) == len(action_entropy) == len(actions_flat)
 
-    return actions, action_entropy
+    return action_i, action_entropy, actions_flat
 
 
 def test_topk_interesting():
-    r = topk_interesting(torch.arange(10), 5)
-    assert sorted(list(r.numpy())) == [5, 6, 7, 8, 9]
-    r = topk_interesting(torch.arange(100), 10)
-    assert not(set(list(r.numpy())) - set(range(51, 100)))
+    a, e, _ = topk_interesting(torch.arange(10).reshape(2, 1, 5), 5)
+    assert sorted(list(e.cpu().numpy())) == [5, 6, 7, 8, 9]
+    assert all([b == 1 for b, a in a.cpu().numpy()])
+    a, e, _ = topk_interesting(torch.arange(100).reshape(10, 1, 10), 10)
+    assert not(set(list(e.cpu().numpy())) - set(range(50, 100)))
+    assert all([b >= 5 for b, a in a.cpu().numpy()])
 
 
-def get_action_states(logits, actions):
+def get_action_states(logits, actions_flat):
     """
     Get most likely state as a result of taking a given action
 
     Params
     ------
     logits: B, W, A, |S|
-    actions: B, W, num_interesting_actions
+    actions: beam_batch_size (num interesting states), 2: B,A action indexes into a B, W=1, A tensor
 
     Returns
     -------
-    Tensor of shape B, 2, num_interesting_states - where we take the max probability state for each action in the last
-     window of each batch and 2 = actions,states
+    Single dim tensor of length beam_batch_size - where we take the max probability state for each action in the last
+    window of each batch
 
     Batches represent different paths taken throughout the planning tree, so the first time
     this is called, there's only one batch representing the trunk of the tree.
     """
 
-    ret = []
-    # TODO: Do this without for loop, something like logits.take_along_dim(actions) that allows extra
-    #  trailing dimensions in logits
-    for bi, batch in enumerate(logits):
-        wi, window = -1, batch[-1]  # we only care about most recent action-state
-        a = actions[bi][wi]
-        logits_a = window[a]
-        # Get most likely states
-        s_idx = torch.argmax(logits_a, dim=1)  # TODO: Possibly argsort here to get top k states instead of just top 1
-        ret.append(torch.stack((a, s_idx)))
-    ret = torch.stack(ret)
-    return ret
+    B, W, A, S = logits.size()
+    assert W == 1
+    logits = logits.reshape(B*A, S)
+
+    logits_a = logits[actions_flat]
+    s_idx = torch.argmax(logits_a, dim=1)
+    return s_idx
 
 
 def test_get_state():
@@ -313,3 +324,4 @@ def accuracy(logits: torch.Tensor, target: torch.Tensor, topk=(1,)) -> List[torc
 
 if __name__ == '__main__':
     test_get_state()
+    test_topk_interesting()
