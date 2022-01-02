@@ -1016,6 +1016,12 @@ class LearnMax(pl.LightningModule):
         # TODO:
         #   - If search finds termination, trim from tree. But what if all branches terminate???
 
+        # Things to optimize if this is too slow (on GPU it's 100ms now with a 3090 so it's okay to play real time
+        #   at least)
+        #  1. optimize gpt forward
+        #  2. do 3 to 5 step look ahead and rely on saliency for long term planning
+        #  3. increase beam width for better quality look ahead (mostly parallel so is fast)
+        log.info('Starting tree search')
         z_q_embed_branches = []
         z_q_ind_branches = []
         action_branches = []
@@ -1039,11 +1045,12 @@ class LearnMax(pl.LightningModule):
         action_entropy_path = None  # Declare for output
         for _ in range(num_levels-1):  # first level already populated
             # Move forward one step in the search tree
+            log.debug('starting gpt forward')
             logits, expected_deviation = self.gpt.forward(embed=z_q_embed_branches[:, -self.gpt_block_size:],
                                                           idx=z_q_ind_branches[:, -self.gpt_block_size:],
                                                           actions=action_branches[:, -self.gpt_block_size:])
-
-            B, W, _ = z_q_embed_branches.size()  # batch size, window size
+            log.debug('done with gpt forward')
+            B, W, _ = z_q_embed_branches[:, -self.gpt_block_size:].size()  # batch size, window size
 
             # arrange so we can get entropy across each action
             logits = logits.reshape(B, W, -1, self.num_actions).transpose(-1, -2)
@@ -1052,7 +1059,8 @@ class LearnMax(pl.LightningModule):
             entropy = -torch.sum(probs * torch.log(probs), dim=-1)  # Entropy across actions
 
             # Add entropy gathered thus far in branches to entropy of most recent action
-            entropy_path = (entropy_branches * torch.ones((entropy.size()[-1], 1))).T.unsqueeze(1) + entropy
+            entropy_path = (entropy_branches *
+                            torch.ones((entropy.size()[-1], 1), device=self.device)).T.unsqueeze(1) + entropy
 
             actions, action_entropy_path, actions_flat = topk_interesting(entropy_path, k=beam_width)
             action_states = get_action_states(logits, actions_flat)
@@ -1062,7 +1070,10 @@ class LearnMax(pl.LightningModule):
             new_z_q_embed_branches = []
             new_action_branches = []
             new_entropy_branches = []
-            for i, (bi, ai) in enumerate(actions):  # batches are branches  TODO: Vectorize this
+            log.debug('starting top action loop')
+            for i, (bi, ai) in enumerate(actions):  # batches are branches
+                # TODO: Vectorize this for loop for high beam sizes (>10?)
+
                 # Get heads
                 z_q_ind_head = z_q_ind_branches[bi]
                 z_q_embed_head = z_q_embed_branches[bi]
@@ -1078,16 +1089,18 @@ class LearnMax(pl.LightningModule):
                 new_z_q_embed_branches.append(torch.cat((z_q_embed_head, z_q_embed_tail.unsqueeze(0))))
                 new_action_branches.append(torch.cat((action_head, action_tail.unsqueeze(0))))
                 new_entropy_branches.append(action_entropy_path[i])  # Already summed entropy along search path
-
+            log.debug('done with top action loop')
             # Convert to tensor with window dim <= GPT block size
             z_q_ind_branches = torch.stack(new_z_q_ind_branches)
             z_q_embed_branches = torch.stack(new_z_q_embed_branches)
             action_branches = torch.stack(new_action_branches)
             entropy_branches = torch.stack(new_entropy_branches)
 
+        log.info('Done with tree search')
         # Return action for highest entropy path
         ret = action_branches[torch.argmax(action_entropy_path)][1]   # 0th action has already been taken
-        return ret
+        # TODO: Return trajectory of actions as gpt forward is too slow to just do one action at at time.
+        return [ret]
 
 
     # Perform gradient clipping on gradients associated with gpt (optimizer_idx=1)
@@ -1211,7 +1224,7 @@ def cli_main():
     checkpoint_callback = ModelCheckpoint(monitor='train_loss', mode='min', every_n_train_steps=1000, save_top_k=3,
                                           verbose=True)
 
-    if not os.getenv('CUDA_VISIBLE_DEVICES'):
+    if os.getenv('CUDA_VISIBLE_DEVICES') == '':
         args.num_gpus = 0
 
     trainer = pl.Trainer(gpus=args.num_gpus,

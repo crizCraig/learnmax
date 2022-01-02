@@ -35,7 +35,7 @@ def topk_interesting(entropy, k):
     0.8, 0.9
 
     :param k: Beam width
-    :param entropy: Proxy for uncertainty / interesting-ness
+    :param entropy: Proxy for uncertainty / interesting-ness - shape: B,W,A
     :return:
         actions: k action sequences (i.e. plans) - list of tuples of (batch, action index)
         action_entropy: k entropies of all dvq states across above actions
@@ -48,15 +48,18 @@ def topk_interesting(entropy, k):
     top = torch.topk(entropy_flat, entropy_flat.numel()//2, sorted=True)
 
     # Pick k random actions from top half
-    k_ind = torch.randperm(top.indices.size()[-1])[:k]
-    actions_flat = top.indices[..., k_ind]
-    action_entropy = top.values[..., k_ind]
+    k_idx = torch.randperm(top.indices.size()[-1])[:k]
+    actions_flat = top.indices[..., k_idx]
+
+    # Sort by index to recover batch order which allows vectorized head+tail concat of branches later on
+    actions_flat, _ = actions_flat.sort()
+    action_entropy = entropy_flat[actions_flat]  # top.values[..., k_idx]
 
     # Unflatten action indexes
     action_bi = actions_flat // A  # recover batch index
     action_ai = actions_flat - A * action_bi  # recover action index
 
-    action_i = torch.stack((action_bi, action_ai)).T  # zip up action indexes
+    action_i = torch.stack((action_bi, action_ai)).T  # combine/zip up batch and action indexes
 
     # TODO: We want to pick random values from the top half / perhaps normally distributed towards the middle
     #   and with some option to anneal towards middle over time if the model capacity is reached in order
@@ -68,7 +71,7 @@ def topk_interesting(entropy, k):
 
 
 def test_topk_interesting():
-    a, e, _ = topk_interesting(torch.arange(10).reshape(2, 1, 5), 5)
+    a, e, _ = topk_interesting(torch.arange(10).reshape(2, 1, 5), k=5)
     assert sorted(list(e.cpu().numpy())) == [5, 6, 7, 8, 9]
     assert all([b == 1 for b, a in a.cpu().numpy()])
     a, e, _ = topk_interesting(torch.arange(100).reshape(10, 1, 10), 10)

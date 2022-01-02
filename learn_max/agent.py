@@ -63,7 +63,7 @@ class LearnMaxAgent:
 
         # Ways to measure uncertainty / interestingness
         # - We have a deviation head on the transformer that tries to just learn this from prob changes over time.
-        # - We can also group predicted next z(a,s) by the action - using a dict to map z's to actions, then
+        # - We can also group predicted next a_z by the action - using a dict to map z's to actions, then
         #   we can pursue actions that have the lowest variance - i.e. we are least confident about their next state
         #   This has the problem that some actions are just inherently stochastic. So it'd be addictive the way gambling
         #   is addictive to humans. This as opposed to the above, where we've already seen that uncertainty decreases
@@ -74,7 +74,7 @@ class LearnMaxAgent:
         #   for forward uncertainty though.
         # - Another way is a brute force - trajectory counting approach. The longer such trajectories are, the bigger
         #   the more keys a count dictionary would contain and the lower their constituent counts would be. This can
-        #   be used to check the above heuristics.
+        #   be used to check the above heuristics. Also psuedo-count methods cf Marc G Bellmare
         # - DVQ reconstruction loss - if the image hasn't been seen before, we will do a really bad job at reconstructing,
         #   esp. if it's a new level in zuma for example
 
@@ -93,7 +93,7 @@ class LearnMaxAgent:
         if len(self.model.buffer) < self.model.gpt_block_size:  # TODO: Use self.dvq_ready to do dvq training again
             ret = self.get_random_action(len(state))
         else:
-            # Search through tree of predicted z,a to find most interesting future
+            # Search through tree of predicted a,z to find most interesting future
             ret = self.model.tree_search()
 
         # # get the logits and pass through softmax for probability distribution

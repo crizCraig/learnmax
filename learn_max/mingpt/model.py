@@ -46,6 +46,7 @@ class CausalSelfAttention(nn.Module):
                                      .view(1, 1, block_size, block_size))
 
     def forward(self, x, layer_past=None):
+        # log.debug('entered attn forward')
         B, T, C = x.size()  # 64, 128, 256, Channels = token+pos embedding size
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -86,7 +87,9 @@ class Block(nn.Module):
             self.out_proj = None
 
     def forward(self, x):
+        log.debug('starting gpt attn')
         x = x + self.attn(self.ln1(x))
+        log.debug('done with gpt attn')
         x = x + self.mlp(self.ln2(x))
         if self.out_proj is not None:
             # We could do cross attention as in perceiver IO, but this seems simpler
@@ -265,6 +268,7 @@ class GPT(nn.Module):
             print('max_trajectory_count: ', self.max_trajectory_count)
 
     def forward(self, embed, idx, actions):
+        log.debug('entering gpt forward')
         # if self.should_input_embed:
         #     b, t, embed = idx_or_embed.size()
         # else:
@@ -285,10 +289,21 @@ class GPT(nn.Module):
 
         # x = self.drop(token_embed + position_embeddings + action_embeddings + dvq_proj)
         x = self.drop(token_embed + position_embed + action_embed + embed)
+        log.debug('starting gpt blocks')
         x = self.blocks(x)
+        log.debug('done with gpt blocks')
+
+        log.debug('starting layer norm')
         x = self.ln_f(x)
+        log.debug('done with layer norm')
+
+        log.debug('starting logit_p_head')
         logits = self.logit_p_head(x)
+        log.debug('done with logit_p_head')
+
+        log.debug('starting deviation_head')
         expected_deviation = self.deviation_head(x)  # Uses mean deviation instead of standard deviation https://stats.stackexchange.com/q/81986/18187
+        log.debug('done with deviation_head')
 
         # wandb.log({'train/expected_deviation_median': torch.quantile(expected_deviation, 0.5)})
         # wandb.log({'train/expected_deviation_90pct': torch.quantile(expected_deviation, 0.9 )})
@@ -297,8 +312,10 @@ class GPT(nn.Module):
         # wandb.log({'train/expected_deviation_mean': expected_deviation.mean()})
         # wandb.log({'train/expected_deviation_max': expected_deviation.max()})
         # wandb.log({'train/expected_deviation_min': expected_deviation.min()})
+
         wandb.log({'train/logits_std': logits.std()})
 
+        log.debug('exiting gpt forward')
         return logits, expected_deviation
 
     def step_(self, split, batch, batch_idx=None):
