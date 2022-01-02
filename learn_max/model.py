@@ -96,7 +96,7 @@ class LearnMax(pl.LightningModule):
             epoch_len: int = 1000,  # how many batches before pseudo epoch
             gamma: float = 1,  # discount factor - only used for evaluation metrics right now
             n_steps: int = 1,  # number of steps to return from each environment at once
-            replay_size: int = 30_000,  # number of steps in the replay buffer - tune w/ system memory
+            replay_size: int = 1000,  # number of steps in the replay buffer - tune w/ system memory
             env_id: str = 'MontezumaRevenge-v0',  # gym environment tag
             warm_start_size: int = 10_000,  # how many samples do we use to fill our buffer at the start of training
             batches_per_epoch: int = 10_000,  # number of batches per pseudo (RL) epoch
@@ -222,6 +222,8 @@ class LearnMax(pl.LightningModule):
             self.env.seed(SEED)
             self.test_env = make_env(env_id)
 
+        log.info('Actions\n' + '\n'.join(f'{i} {a}' for i, a in enumerate(self.env.unwrapped._action_set)))
+
         self.obs_shape = self.env.observation_space.shape
         self.num_actions = self.env.action_space.n
 
@@ -311,6 +313,7 @@ class LearnMax(pl.LightningModule):
         if not isinstance(state, torch.Tensor):
             state = torch.tensor(np.array(state), device=self.device)  # causes issues when num_workers > 0
         x, x_hat, z_q_emb, z_q_flat, latent_loss, recon_loss, dvq_loss, z_q_ind = self.dvq.forward(state)
+        z_q_flat.detach_()  # Allows GPT to backprop through this a second time
         agent_state = AgentState(state=state, dvq_x=x, dvq_x_hat=x_hat, dvq_z_q_emb=z_q_emb, dvq_z_q_flat=z_q_flat,
                                  dvq_latent_loss=latent_loss, dvq_recon_loss=recon_loss, dvq_loss=dvq_loss,
                                  dvq_z_q_ind=z_q_ind)
@@ -378,7 +381,7 @@ class LearnMax(pl.LightningModule):
         Contains the logic for generating a new batch of data to be passed to the DataLoader
 
         Returns:
-            yields a Experience tuple containing the state, action, reward, done and next_state.
+            yields tuple containing  state, action, reward, done, next_state, and agent_state dict.
         """
         episode_reward = 0
         episode_steps = 0
@@ -402,14 +405,8 @@ class LearnMax(pl.LightningModule):
                 continue
             for idx, _ in enumerate(dones):
                 # Lightning wants tensors, numpy arrays, numbers, dicts or lists in batch
-                if isinstance(agent_states[idx], AgentState):
-                    # agents_states only has a batch dimension, not window size
-                    agent_states = [_.dict() for _ in agent_states]
-                else:
-                    # agents_states has batch and window size dimensions
-                    agent_states = [_.dict() for _ in agent_states[idx]]
-                # print('states', states[idx][0][0])
-                yield states[idx], actions[idx], rewards[idx], dones[idx], new_states[idx], agent_states
+                agent_state = self.ensure_basic_type(agent_states[idx])
+                yield states[idx], actions[idx], rewards[idx], dones[idx], new_states[idx], agent_state
 
             self.total_steps += 1
 
@@ -421,6 +418,11 @@ class LearnMax(pl.LightningModule):
             # Simulates epochs
             if self.total_steps % self.batches_per_epoch == 0:
                 break
+
+    def ensure_basic_type(self, thing):
+        if isinstance(thing[0], AgentState):
+            # agents_states only has a batch dimension, not window size
+            return [_.dict() for _ in thing]
 
     def _take_action_and_sample(self, episode_reward, episode_steps):
         episode_reward, episode_steps, is_done = self._take_action(episode_reward, episode_steps)
@@ -436,9 +438,7 @@ class LearnMax(pl.LightningModule):
             # Sample sequentially from replay buffer
             # If training GPT, we need to return the dvq state indexes as well to be used in on_train_batch_end
             #   in lr_decay _, y = batch
-            states, actions, rewards, dones, new_states, agent_states, next_agent_states = \
-                self.sample_latest_sequential()
-            # agent_states, actions, rewards, dones, new_agent_states = self.sample_latest_sequential()
+            states, actions, rewards, dones, new_states, agent_states, next_agent_states = self.sample_sequential()
         else:
             # Sample randomly from replay buffer
             agent_states, actions, rewards, dones, new_agent_states = self.buffer.sample(
@@ -475,7 +475,7 @@ class LearnMax(pl.LightningModule):
         log.info('Done profiling torch objects')
         log.info('-----------------------')
 
-    def sample_latest_sequential(self):
+    def sample_sequential(self):
         """Get batch size X gpt_block_size windows for GPT"""
         start_indices = np.random.choice(len(self.buffer) - self.gpt_block_size + 1, self.gpt_batch_size, replace=False)
         ret_states = []
@@ -490,23 +490,22 @@ class LearnMax(pl.LightningModule):
             # TODO: pad with -100 when last index? We just avoid by making sure we sample early enough in the buffer
             indices = s + block_idx
             agent_states, actions, rewards, dones, next_agent_states = zip(*[self.buffer.buffer[idx] for idx in indices])
-            states = agent_states['state']
-            ret_states.append([s[0] for s in states])
+            ret_states.append([ags.state for ags in agent_states])
             ret_agent_states.append(agent_states)
             ret_actions.append(actions)
             ret_rewards.append(rewards)
             ret_dones.append(dones)
-            next_states = next_agent_states['state']
-            ret_next_states.append(next_states)
+            ret_next_states.append([ags.state for ags in next_agent_states])
             ret_next_agent_states.append(next_agent_states)
         # TODO: Speed this up with numba?
-        # TODO: Just put everything in the agent_states, next_agent_states dict's
+        # TODO: Just put everything in the agent_states and next_agent_states dict's
+
         ret = (
-            np.array(ret_states),
+            torch.stack([torch.cat(rs) for rs in ret_states]),
             np.array(ret_actions),
             np.array(ret_rewards, dtype=np.float32),
             np.array(ret_dones, dtype=bool),
-            np.array(ret_next_states),
+            torch.stack([torch.cat(rs) for rs in ret_next_states]),
             ret_agent_states,
             ret_next_agent_states,
         )
@@ -566,7 +565,7 @@ class LearnMax(pl.LightningModule):
                 "dvq_latent_loss": latent_loss, })
 
         self.log_dict({
-            "total_reward": self.total_rewards[-1] if self.total_rewards else 0,
+            "total_reward": float(self.total_rewards[-1]) if self.total_rewards else 0,
             "avg_reward": self.avg_rewards,
             "train_loss": loss,
             "episodes": self.done_episodes,
@@ -744,9 +743,10 @@ class LearnMax(pl.LightningModule):
                     prop.zero_grad()
             batch_size = self.gpt_batch_size
             self.dvq.set_do_kmeans(False)
-            log.info(f'Not training dvq so setting warm start size to batch size. '
-                     f'Was {self.warm_start_size}, now  is {self.batch_size}')
-            self.warm_start_size = self.gpt_batch_size * self.gpt_block_size
+            warm_start_size = self.gpt_batch_size * self.gpt_block_size
+            log.info(f'Not training dvq so setting warm start size to batch size * gpt_block_size. '
+                     f'Was {self.warm_start_size}, now  is {warm_start_size}')
+            self.warm_start_size = warm_start_size
         else:
             batch_size = self.batch_size  # Already set in __init__ but in case we toggle training gpt, set here too
         self.buffer = MultiStepBuffer(self.replay_size, self.n_steps)
@@ -815,7 +815,7 @@ class LearnMax(pl.LightningModule):
         arg_parser.add_argument(
             "--replay_size",
             type=int,
-            default=30_000,  # Tune with system memory
+            default=1000,  # Tune with system memory
             help="capacity of the replay buffer",
         )
         arg_parser.add_argument(
@@ -1011,6 +1011,14 @@ class LearnMax(pl.LightningModule):
         For subsequent levels, the batch will represent different possible futures
         For ALL levels, only the last action in the window matters
 
+        TODO: Find salient events in this search:
+            Look for when sets of high prob (2x random?) reachable states (not action_states) change significantly.
+            So instead of just jumping up and down and coming back to the same set of reachable states over 4-5 (num_levels)
+            actions, moving right allows reaching the ladder state or the falling states or the ground states.
+            So the reachable states change a lot. We could look at KL divergence from the previous 4-5 to the current
+            4-5 states, so long as the post-softmax entropy is adequetely low (i.e. we are confident in the states
+            we can reach).
+
         """
 
         # TODO:
@@ -1021,7 +1029,7 @@ class LearnMax(pl.LightningModule):
         #  1. optimize gpt forward
         #  2. do 3 to 5 step look ahead and rely on saliency for long term planning
         #  3. increase beam width for better quality look ahead (mostly parallel so is fast)
-        log.info('Starting tree search')
+        log.debug('Starting tree search')
         z_q_embed_branches = []
         z_q_ind_branches = []
         action_branches = []
@@ -1030,7 +1038,7 @@ class LearnMax(pl.LightningModule):
         buffer = self.buffer.buffer
         # Populate gpt window with recent experience
         for i in reversed(range(n)):
-            exp = buffer[i]
+            exp = buffer[-(i+1)]
             z_q_embed_branches.append(exp.state.dvq_z_q_flat)
             z_q_ind_branches.append(exp.state.dvq_z_q_ind)
             action_branches.append(exp.action)
@@ -1096,12 +1104,11 @@ class LearnMax(pl.LightningModule):
             action_branches = torch.stack(new_action_branches)
             entropy_branches = torch.stack(new_entropy_branches)
 
-        log.info('Done with tree search')
+        log.debug('Done with tree search')
         # Return action for highest entropy path
         ret = action_branches[torch.argmax(action_entropy_path)][1]   # 0th action has already been taken
         # TODO: Return trajectory of actions as gpt forward is too slow to just do one action at at time.
-        return [ret]
-
+        return [int(ret)]
 
     # Perform gradient clipping on gradients associated with gpt (optimizer_idx=1)
     # def configure_gradient_clipping(self, optimizer, optimizer_idx, gradient_clip_val, gradient_clip_algorithm):

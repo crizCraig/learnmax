@@ -56,7 +56,7 @@ def topk_interesting(entropy, k):
     action_entropy = entropy_flat[actions_flat]  # top.values[..., k_idx]
 
     # Unflatten action indexes
-    action_bi = actions_flat // A  # recover batch index
+    action_bi = torch.div(actions_flat, A, rounding_mode='floor')  # actions_flat // A => recover batch index
     action_ai = actions_flat - A * action_bi  # recover action index
 
     action_i = torch.stack((action_bi, action_ai)).T  # combine/zip up batch and action indexes
@@ -235,7 +235,7 @@ def get_batch_vars(batch, use_next=False, return_agent_state=False, populate_gpt
 
         # Okay, then we just need to shift the targets so that we are predicting the next token
 
-        batch_size = batch[0].shape[0]
+        # batch_size = batch[0].shape[0]
 
         # 80, 16, 1, 4410 => 16, 80, 4410
         # Here we omit the first state with `1:` in order to pass action-states where the action leads to the state

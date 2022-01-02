@@ -10,7 +10,7 @@ from torch import nn
 
 @dataclass
 class AgentState:
-    state: torch.Tensor = None  # sensor state returned by env
+    state: torch.Tensor = None  # sensor state returned by env TODO(OOM): Don't populate this when only training GPT as it's not needed
     dvq_x: torch.Tensor = None
     dvq_x_hat: torch.Tensor = None
     dvq_z_q_emb: torch.Tensor = None
