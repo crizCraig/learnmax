@@ -16,7 +16,6 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
 
-from learn_max.dvq.constants import SINGLE_TOKEN2_NUM_EMBEDDINGS, SINGLE_TOKEN2_EMBEDDING_DIM
 from learn_max.data.cifar10 import CIFAR10Data
 from learn_max.dvq.model.deepmind_enc_dec import DeepMindEncoder, DeepMindDecoder
 from learn_max.dvq.model.openai_enc_dec import OpenAIEncoder, OpenAIDecoder

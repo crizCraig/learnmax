@@ -392,13 +392,11 @@ class LearnMax(pl.LightningModule):
 
         while True:
             if self.total_steps == 0 or 'OVERFIT' not in os.environ:
-                # TODO: Do more than one action per batch, but not so much that we can't learn from recent experience
-                #   i.e. allow learning within the episode
                 # TODO: Move this tuple into a @dataclass
                 (states, actions, rewards, dones, new_states, agent_states, next_agent_states, episode_steps,
                     episode_reward) = self._take_action_and_sample(episode_reward, episode_steps)
-
-                # actions, agent_states, dones, new_states, rewards, states, episode_steps, episode_reward = \
+                # TODO: If viz'ing add state here, then send state through dvq decoder and output as video
+                #   and sequences of images.
             if dones is None:
                 log.error('dones is None, what is going on??? - trying to continue')
                 time.sleep(5)
@@ -543,6 +541,7 @@ class LearnMax(pl.LightningModule):
 
             if batch_idx % 1000 == 0:
                 self.viz_gpt(gpt_ret, state=s, batch_idx=batch_idx)
+                self.viz_movie(batch_idx)
 
             # We use multiple optimizers so need to manually backward each one separately
             self.gpt_optimizer.zero_grad()
@@ -578,7 +577,7 @@ class LearnMax(pl.LightningModule):
         #     "avg_reward": self.avg_rewards,
         # })
 
-    def viz_all_dvq_clusters(self):
+    def viz_all_dvq_clusters(self, image_per_cluster=False):
         self.cuda()
         wandb.init(entity='crizcraig', mode='disabled')
         n = self.dvq_num_embeddings
@@ -586,17 +585,26 @@ class LearnMax(pl.LightningModule):
         col_i = 0
         row = []
         rows = []
+        per_cluster_folder = None
+        if image_per_cluster:
+            per_cluster_folder = f'{ROOT_DIR}/images/all_dvq_clusters_{DATE_STR}'
+            os.makedirs(per_cluster_folder)
         for i in range(n):
             _i = 3070 if 'FAKE_Z_Q_EMB' in os.environ else i
             emb = self.dvq.quantizer.embed_code(torch.tensor([_i]).cuda())  # TODO: Speed up with batching
             img_t = self.dvq.decode_flat(emb, output_proj=self.dvq.quantizer.output_proj)
             img_t = img_t.squeeze().permute(1, 2, 0).clamp(0, 1)
-            row.append(img_t.detach().cpu().numpy())
+            img_np = img_t.detach().cpu().numpy()
+            row.append(img_np)
+            if image_per_cluster:
+                im = Image.fromarray(np.uint8(img_np * 255))
+                im.save(f'{per_cluster_folder}/{str(i).zfill(math.ceil(math.log10(n)))}.png')
             col_i += 1
             if col_i > width:
                 col_i = 0
                 rows.append(np.concatenate(row, axis=1))
                 row = []
+
         last_row = np.concatenate(row, axis=1)
         last_row_remain = rows[-1].shape[1] - last_row.shape[1]
         last_row_padded = np.concatenate((last_row, np.zeros((rows[-1].shape[0], last_row_remain, 3))), axis=1)
@@ -622,7 +630,7 @@ class LearnMax(pl.LightningModule):
         # states, actions, rewards, dones, new_states = next(iter(test_loader))
         # x = torch.cat([states, new_states])
         num_cols = 20
-        xcols = torch.cat([x[:num_cols], x_hat[:num_cols]], axis=2)  # side by side x_pre and xhat
+        xcols = torch.cat([x[:num_cols], x_hat[:num_cols]], axis=2)  # side by side x and xhat
         xrows = torch.cat([xcols[i] for i in range(num_cols)], axis=2)
 
         # TODO: Just save image with PIL here
@@ -681,7 +689,9 @@ class LearnMax(pl.LightningModule):
             imgs_display = np.concatenate(imgs_display)
             im = Image.fromarray(np.uint8(imgs_display * 255))
             # im.show()
-            filename = f'{ROOT_DIR}/images/viz_gpt_{get_date_str()}_r_{RUN_ID}_e_{self.current_epoch}_b_{batch_idx}.png'
+            folder = f'{ROOT_DIR}/images/viz_gpt/{DATE_STR}r_{RUN_ID}_{get_date_str()}'
+            os.makedirs(folder)
+            filename = f'{folder}/e_{self.current_epoch}_b_{batch_idx}.png'
             log.info(f'Saving gpt viz to {filename}')
             im.save(filename)
             wandb.log({'train/gpt-viz': [wandb.Image(im)]})
@@ -693,6 +703,21 @@ class LearnMax(pl.LightningModule):
             # TODO: Visualize image with action, cluster index + distance, probability, uncertainty
             #   Make sure you're extracting the logits correctly for the image
             #   Look at disappear and teleport images bad clustering cases.
+
+    def viz_movie(self, batch_idx):
+        os.makedirs(f'{ROOT_DIR}/images/viz_movie', exist_ok=True)
+        folder = f'{ROOT_DIR}/images/viz_movie/{get_date_str()}_r_{RUN_ID}_e_{self.current_epoch}_b_{batch_idx}'
+        os.makedirs(folder, exist_ok=True)
+        for i, x in enumerate(self.buffer.buffer):
+            state = x.state.state.squeeze(0).permute(1, 2, 0).cpu()
+            im = Image.fromarray(np.uint8(state * 255))
+            # # im.show()
+            filename = f'{folder}/{str(i).zfill(9)}.png'
+            im.save(filename)
+            # TODO: dvq
+        # TODO: ffmpeg
+        log.info(f'Saved movie to {folder}')
+
 
     def _train_step_dvq(self, batch, batch_idx):
         self.dvq.set_do_kmeans(True)
@@ -1022,7 +1047,8 @@ class LearnMax(pl.LightningModule):
         """
 
         # TODO:
-        #   - If search finds termination, trim from tree. But what if all branches terminate???
+        #   - If search finds termination, trim from tree. But what if all branches terminate - should not be possible
+        #       really need to confirm though.
 
         # Things to optimize if this is too slow (on GPU it's 100ms now with a 3090 so it's okay to play real time
         #   at least)
@@ -1051,7 +1077,7 @@ class LearnMax(pl.LightningModule):
 
         assert z_q_embed_branches.size()[0] == 1, 'We should only start with one trunk'
         action_entropy_path = None  # Declare for output
-        for _ in range(num_levels-1):  # first level already populated
+        for lvl in range(num_levels-1):  # first level already populated
             # Move forward one step in the search tree
             log.debug('starting gpt forward')
             logits, expected_deviation = self.gpt.forward(embed=z_q_embed_branches[:, -self.gpt_block_size:],
@@ -1061,10 +1087,11 @@ class LearnMax(pl.LightningModule):
             B, W, _ = z_q_embed_branches[:, -self.gpt_block_size:].size()  # batch size, window size
 
             # arrange so we can get entropy across each action
-            logits = logits.reshape(B, W, -1, self.num_actions).transpose(-1, -2)
+            logits = logits.reshape(B, W, -1, self.num_actions).transpose(-1, -2)  # B, W, N * A => B, W, A, N where N = num_embed
             logits = logits[:, -1:, ...]  # We only care about next step, so omit all but last part of window
             probs = F.softmax(logits, dim=-1)  # Probability of dvq clusters for actions
             entropy = -torch.sum(probs * torch.log(probs), dim=-1)  # Entropy across actions
+            wandb.log({f'entropy/entropy_lvl_{lvl}': entropy.mean()})
 
             # Add entropy gathered thus far in branches to entropy of most recent action
             entropy_path = (entropy_branches *
@@ -1186,7 +1213,7 @@ def cli_main():
     if args.viz_dvq is not None:
         return model.viz_dvq()
     elif args.viz_all_dvq_clusters:
-        return model.viz_all_dvq_clusters()
+        return model.viz_all_dvq_clusters(image_per_cluster=True)
     else:
         delattr(args, 'viz_dvq')
         delattr(args, 'viz_all_dvq_clusters')

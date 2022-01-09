@@ -11,9 +11,11 @@ from torch import nn
 from learn_max.constants import DATE_FMT
 
 
-def topk_interesting(entropy, k):
+def topk_interesting(entropy, k, rand_half=False):
     """
-    Pick random action in 50-100 percentile
+    Get top k actions with most entropy
+
+    if rand_half: Pick random action in 50-100 percentile
     i     entropy
     0:      0.1
     1:      0.2
@@ -36,6 +38,8 @@ def topk_interesting(entropy, k):
 
     :param k: Beam width
     :param entropy: Proxy for uncertainty / interesting-ness - shape: B,W,A
+    :rand_half: If true, sample k randomly from top half of actions, else just get top k
+
     :return:
         actions: k action sequences (i.e. plans) - list of tuples of (batch, action index)
         action_entropy: k entropies of all dvq states across above actions
@@ -44,12 +48,18 @@ def topk_interesting(entropy, k):
     B, W, A = entropy.size()
     assert W == 1, 'Should only be looking at most recent state in window'
     entropy_flat = entropy.flatten()
+    half_entropy = entropy_flat.numel() // 2
+    assert half_entropy > k, 'Not enough actions to sample k from top half'
+
     # Get highest indexes (could also use argsort)
     top = torch.topk(entropy_flat, entropy_flat.numel()//2, sorted=True)
 
-    # Pick k random actions from top half
-    k_idx = torch.randperm(top.indices.size()[-1])[:k]
-    actions_flat = top.indices[..., k_idx]
+    if rand_half:
+        # Pick k random actions from top half
+        k_idx = torch.randperm(top.indices.size()[-1])[:k]
+        actions_flat = top.indices[..., k_idx]
+    else:
+        actions_flat = top.indices[..., :k]  # Get first k as torch.topk sorts descending
 
     # Sort by index to recover batch order which allows vectorized head+tail concat of branches later on
     actions_flat, _ = actions_flat.sort()
