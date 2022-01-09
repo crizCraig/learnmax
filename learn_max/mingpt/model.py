@@ -328,9 +328,11 @@ class GPT(nn.Module):
         one_hot = F.one_hot(target_idx, num_classes=self.vocab_size).squeeze()
         probs = F.softmax(logits, dim=-1)
 
-        self.accuracy(logits, target_idx)
+        entropy = -torch.sum(probs * torch.log(probs), dim=-1)  # Entropy across action-states
+        wandb.log({'entropy/action-state': entropy.mean()})
+        wandb.log({'probs_std': probs.std()})
 
-        wandb.log({'train/probs_std': probs.std()})
+        self.accuracy(logits, target_idx)
         p_diff = (one_hot - probs).abs()  # actual deviation
         d_diff = p_diff - expected_deviation
         d_loss = d_diff.square().sum() / d_diff.numel()
@@ -351,7 +353,7 @@ class GPT(nn.Module):
 
             0 1 2
 
-        and we have 3 possible actions, we'd want to map of the 3 states to 3 action-states for 9
+        and we have 3 possible actions, we'd want to map the 3 states to 3 action-states for 9
         total action-states (a_s).
 
             s     a_s
@@ -386,7 +388,7 @@ class GPT(nn.Module):
 
     def accuracy(self, logits, target_idx):
 
-        # TODO: State based accuracy (current action-state)
+        # TODO: State based accuracy (currently action-state)
 
         top_acc_lvls = (self.vocab_size // 10, self.vocab_size // 100, 3, 1, self.num_actions)
 

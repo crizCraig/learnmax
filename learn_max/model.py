@@ -1086,12 +1086,24 @@ class LearnMax(pl.LightningModule):
             log.debug('done with gpt forward')
             B, W, _ = z_q_embed_branches[:, -self.gpt_block_size:].size()  # batch size, window size
 
-            # arrange so we can get entropy across each action
-            logits = logits.reshape(B, W, -1, self.num_actions).transpose(-1, -2)  # B, W, N * A => B, W, A, N where N = num_embed
+            # Get entropy across actions, see GPT.s_i_to_as_i() for train ordering
+            logits = logits.reshape(B, W, -1, self.num_actions)  # B, W, S * A => # B, W, S, A where S = dvq state index
+            self.log_p_a_given_rs(logits)
+            logits = logits.transpose(-1, -2)  # B, W, S, A => B, W, A, S
             logits = logits[:, -1:, ...]  # We only care about next step, so omit all but last part of window
-            probs = F.softmax(logits, dim=-1)  # Probability of dvq clusters for actions
+            assert logits.size()[1] == 1   # assert W == 1 now
+            probs = F.softmax(logits, dim=-1)  # Probability of dvq clusters given actions
+
+            # Log p(s|a)
+            max_p_s_given_a = probs.max(dim=-1)
+            wandb.log({f'max p(s|a)/max': max_p_s_given_a.values.max()})
+            wandb.log({f'max p(s|a)/mean': max_p_s_given_a.values.mean()})
+            wandb.log({f'max p(s|a)/min': max_p_s_given_a.values.min()})
+
+            # TODO: Use bayes to verify logit normalization across states = actions
+
             entropy = -torch.sum(probs * torch.log(probs), dim=-1)  # Entropy across actions
-            wandb.log({f'entropy/entropy_lvl_{lvl}': entropy.mean()})
+            wandb.log({f'entropy/action': entropy.mean()})
 
             # Add entropy gathered thus far in branches to entropy of most recent action
             entropy_path = (entropy_branches *
@@ -1136,6 +1148,20 @@ class LearnMax(pl.LightningModule):
         ret = action_branches[torch.argmax(action_entropy_path)][1]   # 0th action has already been taken
         # TODO: Return trajectory of actions as gpt forward is too slow to just do one action at at time.
         return [int(ret)]
+
+    def log_p_a_given_rs(self, logits):
+        """
+        Takes B,W,S,A logits and logs probability of action across states
+
+        Note this is action given the resulting state, not the typical action given current state.
+
+        I'm doing this to try and understand why conditional entropy does not drop while action-state entropy does.
+        """
+        probs = F.softmax(logits, dim=-1)  # Probability of action given resulting state
+        max_p_a_given_rs = probs.max(dim=-1)  # Max prob action for each state
+        wandb.log({f'max p(a|rs)/max': max_p_a_given_rs.values.max()})
+        wandb.log({f'max p(a|rs)/mean': max_p_a_given_rs.values.mean()})
+        wandb.log({f'max p(a|rs)/min': max_p_a_given_rs.values.min()})
 
     # Perform gradient clipping on gradients associated with gpt (optimizer_idx=1)
     # def configure_gradient_clipping(self, optimizer, optimizer_idx, gradient_clip_val, gradient_clip_algorithm):
