@@ -1,3 +1,4 @@
+import os
 from datetime import datetime
 from typing import List
 
@@ -49,10 +50,11 @@ def topk_interesting(entropy, k, rand_half=False):
     assert W == 1, 'Should only be looking at most recent state in window'
     entropy_flat = entropy.flatten()
     half_entropy = entropy_flat.numel() // 2
-    assert half_entropy > k, 'Not enough actions to sample k from top half'
+    assert half_entropy >= k, 'Not enough actions to sample k from top half'
 
+    ent_coeff = -1 if 'REVERSE_ENTROPY' in os.environ else 1
     # Get highest indexes (could also use argsort)
-    top = torch.topk(entropy_flat, entropy_flat.numel()//2, sorted=True)
+    top = torch.topk(ent_coeff * entropy_flat, entropy_flat.numel()//2, sorted=True)
 
     if rand_half:
         # Pick k random actions from top half

@@ -3,6 +3,7 @@ import json
 import math
 import os
 import time
+from collections import deque
 from copy import copy
 from typing import Tuple, List, Optional
 
@@ -281,6 +282,9 @@ class LearnMax(pl.LightningModule):
         self.batch_states = []
         self.batch_actions = []
 
+        # Trajectory visualization data
+        self.trajectory_buffer = deque(maxlen=self.replay_size)
+
         if self.is_single_token2:
             self.dvq = VQVAE(n_hid=dvq_n_hid, num_embeddings=num_embeddings, embedding_dim=self.dvq_embedding_dim,
                              loss_flavor=dvq_loss_flavor, input_channels=dvq_input_channels,
@@ -351,7 +355,7 @@ class LearnMax(pl.LightningModule):
         if warm_start > 0:
             agent_state = self.reset()
             for _ in range(warm_start):
-                action = self.agent.get_action(agent_state, self.device)
+                action, trajectories = self.agent.get_action(agent_state, self.device)
                 next_state, reward, done, info = self.env.step(action[0])
                 next_agent_state = self.get_agent_state(next_state)
                 exp = Experience(state=self.agent_state, action=action[0], reward=reward, done=done,
@@ -449,13 +453,14 @@ class LearnMax(pl.LightningModule):
                 episode_reward)
 
     def _take_action(self, episode_reward, episode_steps):
-        action = self.agent.get_action(self.agent_state, self.device)
+        action, trajectories = self.agent.get_action(self.agent_state, self.device)
         next_state, r, is_done, _ = self.env.step(action[0])
         next_agent_state = self.get_agent_state(next_state)
         episode_reward += r
         episode_steps += 1
         exp = Experience(state=self.agent_state, action=action[0], reward=r, done=is_done, new_state=next_agent_state)
         self.buffer.append(exp)
+        self.trajectory_buffer.append(trajectories)
         self.agent_state = next_agent_state
         return episode_reward, episode_steps, is_done
 
@@ -539,9 +544,13 @@ class LearnMax(pl.LightningModule):
 
             gpt_ret = self.gpt.training_step(batch=(gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y), batch_idx=batch_idx)
 
-            if batch_idx % 1000 == 0:
+            if batch_idx % self.replay_size == 0:
+                # One action per batch, so there's replay_size new frames
                 self.viz_gpt(gpt_ret, state=s, batch_idx=batch_idx)
                 self.viz_movie(batch_idx)
+
+            if len(self.trajectory_buffer) == self.trajectory_buffer.maxlen:
+                self.viz_trajectories()
 
             # We use multiple optimizers so need to manually backward each one separately
             self.gpt_optimizer.zero_grad()
@@ -708,6 +717,7 @@ class LearnMax(pl.LightningModule):
         os.makedirs(f'{ROOT_DIR}/images/viz_movie', exist_ok=True)
         folder = f'{ROOT_DIR}/images/viz_movie/{get_date_str()}_r_{RUN_ID}_e_{self.current_epoch}_b_{batch_idx}'
         os.makedirs(folder, exist_ok=True)
+
         for i, x in enumerate(self.buffer.buffer):
             state = x.state.state.squeeze(0).permute(1, 2, 0).cpu()
             im = Image.fromarray(np.uint8(state * 255))
@@ -718,6 +728,16 @@ class LearnMax(pl.LightningModule):
         # TODO: ffmpeg
         log.info(f'Saved movie to {folder}')
 
+    def viz_trajectories(self):
+        return  # Need to finish implementing
+        for i, traj in enumerate(self.trajectory_buffer):
+            # Write JSON with trajectories
+            state = self.buffer.buffer[i].state
+            assert traj['z_q_ind'][0] == state.dvq_z_q_ind[0]
+            traj = {k: v.cpu().numpy().tolist() for (k, v) in traj.items()}
+            # TODO: Write top row images with state.state then write column json to index with cluster images
+            # TODO: Also write top row z_q index so we can compare with an overlay / residual
+            # json.dumps(, indent=2)
 
     def _train_step_dvq(self, batch, batch_idx):
         self.dvq.set_do_kmeans(True)
@@ -1073,11 +1093,13 @@ class LearnMax(pl.LightningModule):
         z_q_embed_branches = torch.cat(z_q_embed_branches).unsqueeze(0)
         z_q_ind_branches = torch.cat(z_q_ind_branches).unsqueeze(0)
         action_branches = torch.tensor(action_branches).unsqueeze(0).to(self.device)
-        entropy_branches = torch.tensor([0]).to(self.device)  # Total entropy of branch
+        entropy_branches = torch.tensor([0]).unsqueeze(0).to(self.device)  # Total entropy of branch
 
         assert z_q_embed_branches.size()[0] == 1, 'We should only start with one trunk'
         action_entropy_path = None  # Declare for output
-        for lvl in range(num_levels-1):  # first level already populated
+        N = num_levels - 1  # first level already populated
+        for lvl in range(N):
+            should_log_wandb = lvl == N - 1
             # Move forward one step in the search tree
             log.debug('starting gpt forward')
             logits, expected_deviation = self.gpt.forward(embed=z_q_embed_branches[:, -self.gpt_block_size:],
@@ -1086,30 +1108,50 @@ class LearnMax(pl.LightningModule):
             log.debug('done with gpt forward')
             B, W, _ = z_q_embed_branches[:, -self.gpt_block_size:].size()  # batch size, window size
 
-            # Get entropy across actions, see GPT.s_i_to_as_i() for train ordering
+            # Get entropy across actions, see GPT.s_i_to_as_i() for ordering
             logits = logits.reshape(B, W, -1, self.num_actions)  # B, W, S * A => # B, W, S, A where S = dvq state index
+            # logits = logits.reshape(B, W, self.num_actions, -1)  # Trying this idk why
             self.log_p_a_given_rs(logits)
             logits = logits.transpose(-1, -2)  # B, W, S, A => B, W, A, S
             logits = logits[:, -1:, ...]  # We only care about next step, so omit all but last part of window
             assert logits.size()[1] == 1   # assert W == 1 now
             probs = F.softmax(logits, dim=-1)  # Probability of dvq clusters given actions
 
-            # Log p(s|a)
-            max_p_s_given_a = probs.max(dim=-1)
-            wandb.log({f'max p(s|a)/max': max_p_s_given_a.values.max()})
-            wandb.log({f'max p(s|a)/mean': max_p_s_given_a.values.mean()})
-            wandb.log({f'max p(s|a)/min': max_p_s_given_a.values.min()})
+            if should_log_wandb:
+                # Log p(s|a)
+                max_p_s_given_a = probs.max(dim=-1)
+                wandb.log({f'max p(s|a)/max_a': max_p_s_given_a.values.max()})
+                wandb.log({f'max p(s|a)/mean_a': max_p_s_given_a.values.mean()})
+                wandb.log({f'max p(s|a)/min_a': max_p_s_given_a.values.min()})
 
             # TODO: Use bayes to verify logit normalization across states = actions
 
-            entropy = -torch.sum(probs * torch.log(probs), dim=-1)  # Entropy across actions
-            wandb.log({f'entropy/action': entropy.mean()})
+            entropy = -torch.sum(probs * torch.log(probs), dim=-1)  # Action entropy across states
 
-            # Add entropy gathered thus far in branches to entropy of most recent action
-            entropy_path = (entropy_branches *
-                            torch.ones((entropy.size()[-1], 1), device=self.device)).T.unsqueeze(1) + entropy
+            if should_log_wandb:
+                wandb.log({f'entropy/action min': entropy.min()})
+                wandb.log({f'entropy/action mean': entropy.mean()})
+                wandb.log({f'entropy/action max': entropy.max()})
 
-            actions, action_entropy_path, actions_flat = topk_interesting(entropy_path, k=beam_width)
+            # Add entropy gathered thus far in branches to path entropy of most recent action
+            entropy_total = entropy_branches[:, -1]  # Summed along the way so last index has total
+
+            # Broadcast to all actions - B => B, A
+            entropy_total = entropy_total.unsqueeze(1)
+            B, A = entropy_total.size()[0], entropy.size()[-1]
+            assert (B == 1 and lvl == 0) or B == beam_width, 'Unexpected num branches'
+            assert A == self.num_actions, 'Unexpected action dim size'
+            entropy_total = entropy_total * torch.ones((B, A), device=self.device)
+
+            # Add entropy of latest action to totals with window dim of length 1
+            entropy_total = entropy_total.unsqueeze(1) + entropy
+
+            actions, action_entropy_path, actions_flat = topk_interesting(entropy_total, k=beam_width,
+                                                                          rand_half='RAND_HALF' in os.environ)
+            if should_log_wandb:
+                wandb.log({f'entropy/traj min': action_entropy_path.min()})
+                wandb.log({f'entropy/traj mean': action_entropy_path.mean()})
+                wandb.log({f'entropy/traj max': action_entropy_path.max()})
             action_states = get_action_states(logits, actions_flat)
 
             # Branch out by copying beginning of path for each new action state and appending new action state to end
@@ -1119,23 +1161,25 @@ class LearnMax(pl.LightningModule):
             new_entropy_branches = []
             log.debug('starting top action loop')
             for i, (bi, ai) in enumerate(actions):  # batches are branches
-                # TODO: Vectorize this for loop for high beam sizes (>10?)
+                # TODO: Vectorize this loop for high beam sizes (>10?)
 
                 # Get heads
                 z_q_ind_head = z_q_ind_branches[bi]
                 z_q_embed_head = z_q_embed_branches[bi]
                 action_head = action_branches[bi]
+                entropy_head = entropy_branches[bi]
 
                 # Get tails
                 z_q_ind_tail = action_states[i]
                 z_q_embed_tail = self.dvq.quantizer.embed_code(z_q_ind_tail)
                 action_tail = ai
+                entropy_tail = action_entropy_path[i]
 
                 # Add head+tail to new branches
                 new_z_q_ind_branches.append(torch.cat((z_q_ind_head, z_q_ind_tail.unsqueeze(0))))
                 new_z_q_embed_branches.append(torch.cat((z_q_embed_head, z_q_embed_tail.unsqueeze(0))))
                 new_action_branches.append(torch.cat((action_head, action_tail.unsqueeze(0))))
-                new_entropy_branches.append(action_entropy_path[i])  # Already summed entropy along search path
+                new_entropy_branches.append(torch.cat((entropy_head, entropy_tail.unsqueeze(0))))
             log.debug('done with top action loop')
             # Convert to tensor with window dim <= GPT block size
             z_q_ind_branches = torch.stack(new_z_q_ind_branches)
@@ -1144,10 +1188,17 @@ class LearnMax(pl.LightningModule):
             entropy_branches = torch.stack(new_entropy_branches)
 
         log.debug('Done with tree search')
-        # Return action for highest entropy path
-        ret = action_branches[torch.argmax(action_entropy_path)][1]   # 0th action has already been taken
-        # TODO: Return trajectory of actions as gpt forward is too slow to just do one action at at time.
-        return [int(ret)]
+        # Return branches for highest entropy path
+        most_interesting_i = torch.argmax(action_entropy_path)
+        trajectories = {
+            # Return current and future trajectory without past
+            'action': action_branches[most_interesting_i][-num_levels:],
+            'z_q_ind': z_q_ind_branches[most_interesting_i][-num_levels:],
+            'entropy': entropy_branches[most_interesting_i],
+        }
+
+        next_action = action_branches[most_interesting_i][n+1]  # n actions are context / have already been taken
+        return [int(next_action)], trajectories
 
     def log_p_a_given_rs(self, logits):
         """
@@ -1159,9 +1210,9 @@ class LearnMax(pl.LightningModule):
         """
         probs = F.softmax(logits, dim=-1)  # Probability of action given resulting state
         max_p_a_given_rs = probs.max(dim=-1)  # Max prob action for each state
-        wandb.log({f'max p(a|rs)/max': max_p_a_given_rs.values.max()})
-        wandb.log({f'max p(a|rs)/mean': max_p_a_given_rs.values.mean()})
-        wandb.log({f'max p(a|rs)/min': max_p_a_given_rs.values.min()})
+        wandb.log({f'max p(a|rs)/max_rs': max_p_a_given_rs.values.max()})
+        wandb.log({f'max p(a|rs)/mean_rs': max_p_a_given_rs.values.mean()})
+        wandb.log({f'max p(a|rs)/min_rs': max_p_a_given_rs.values.min()})
 
     # Perform gradient clipping on gradients associated with gpt (optimizer_idx=1)
     # def configure_gradient_clipping(self, optimizer, optimizer_idx, gradient_clip_val, gradient_clip_algorithm):

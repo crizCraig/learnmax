@@ -11,7 +11,7 @@ from torch import nn
 @dataclass
 class AgentState:
     state: torch.Tensor = None  # sensor state returned by env TODO(OOM): Don't populate this when only training GPT as it's not needed
-    dvq_x: torch.Tensor = None
+    dvq_x: torch.Tensor = None  # state preprocessed for dvq
     dvq_x_hat: torch.Tensor = None
     dvq_z_q_emb: torch.Tensor = None
     dvq_z_q_flat: torch.Tensor = None  # same as dvq_z_q_emb just flattened for use as single token
@@ -57,6 +57,7 @@ class LearnMaxAgent:
 
         Returns:
             action defined by policy
+            trajectories of action-states considered when choosing above action
         """
         state = agent_state.dvq_x
             # print(f'states {device=}')
@@ -91,10 +92,10 @@ class LearnMaxAgent:
 
         # Return a random action if we haven't filled buffer of z states.
         if len(self.model.buffer) < self.model.gpt_block_size:  # TODO: Use self.dvq_ready to do dvq training again
-            ret = self.get_random_action(len(state))
+            ret, trajs = self.get_random_action(len(state)), None
         else:
             # Search through tree of predicted a,z to find most interesting future
-            ret = self.model.tree_search()
+            ret, trajs = self.model.tree_search()
 
         # # get the logits and pass through softmax for probability distribution
         # probabilities = F.softmax(self.net(states)).squeeze(dim=-1)
@@ -106,7 +107,7 @@ class LearnMaxAgent:
         # return actions
         self.a_buff.append(ret)
 
-        return ret
+        return ret, trajs
 
     def get_random_action(self, num: int) -> List[int]:
         """returns a random action"""
