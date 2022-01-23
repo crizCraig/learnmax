@@ -18,7 +18,7 @@ from einops import rearrange
 from loguru import logger as log
 from torch.nn import functional as F
 
-from learn_max.utils import accuracy
+from learn_max.utils import accuracy, wandb_try_log
 
 
 class CausalSelfAttention(nn.Module):
@@ -163,6 +163,8 @@ class GPT(nn.Module):
         self.should_input_embed = should_input_embed
         self.should_input_and_learn_embed = should_input_and_learn_embed
         self.num_actions = num_actions
+
+        self.global_step = 0
 
         log.info("number of parameters: %e" % sum(p.numel() for p in self.parameters()))
 
@@ -313,7 +315,7 @@ class GPT(nn.Module):
         # wandb.log({'train/expected_deviation_max': expected_deviation.max()})
         # wandb.log({'train/expected_deviation_min': expected_deviation.min()})
 
-        wandb.log({'train/logits_std': logits.std()})
+        wandb_try_log({'train/logits_std': logits.std()}, self.global_step)
 
         log.debug('exiting gpt forward')
         return logits, expected_deviation
@@ -329,8 +331,8 @@ class GPT(nn.Module):
         probs = F.softmax(logits, dim=-1)
 
         entropy = -torch.sum(probs * torch.log(probs), dim=-1)  # Entropy across action-states
-        wandb.log({'entropy/action-state': entropy.mean()})
-        wandb.log({'probs_std': probs.std()})
+        wandb_try_log({'entropy/action-state': entropy.mean()}, self.global_step)
+        wandb_try_log({'probs_std': probs.std()}, self.global_step)
 
         self.accuracy(logits, target_idx)
         p_diff = (one_hot - probs).abs()  # actual deviation
@@ -397,7 +399,7 @@ class GPT(nn.Module):
                        target=rearrange(target_idx, 'd0 d1 -> (d0 d1)'),
                        topk=top_acc_lvls)
         for lvl_i, lvl in enumerate(top_acc_lvls):
-            wandb.log({f'train/acc/top{lvl}': acc[lvl_i]})
+            wandb_try_log({f'train/acc/top{lvl}': acc[lvl_i]}, self.global_step)
 
     def training_step(self, *args, **kwargs):
         return self.step_('train', *args, **kwargs)

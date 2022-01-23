@@ -9,7 +9,7 @@ import wandb
 from numpy import array
 from torch import nn
 
-from learn_max.constants import DATE_FMT
+from learn_max.constants import DATE_FMT, WANDB_LOG_PERIOD
 
 
 def topk_interesting(entropy, k, rand_half=False):
@@ -198,11 +198,12 @@ def _init_weights(module):
         module.weight.data.fill_(1.0)
 
 
-def wandb_try_log(msg_dict):
-    try:
-        wandb.log(msg_dict)
-    except:
-        pass
+def wandb_try_log(msg_dict, global_step):
+    if global_step % WANDB_LOG_PERIOD == 0:
+        try:
+            wandb.log(msg_dict)
+        except:
+            pass
 
 
 def get_batch_vars(batch, use_next=False, return_agent_state=False, populate_gpt=False):

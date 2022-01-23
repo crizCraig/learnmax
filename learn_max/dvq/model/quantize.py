@@ -63,6 +63,8 @@ class VQVAEQuantize(nn.Module):
         self.initial_point_spread = None
         self.initial_centroid_spread = None
 
+        self.global_step = 0
+
         # TODO: If we train the transformer and auto-encoder jointly, consider doing weight initialization in
         #  the same way for both. Right now pytorch does the dvq, with the quantizer initialized with k-means.
 
@@ -99,13 +101,18 @@ class VQVAEQuantize(nn.Module):
             #  If that doesn't work, we can try youtube videos, or use randomly drawn samples from a large replay
             #  buffer to retrain.
             kmeans_points_per_cluster_init = 1 if os.getenv('QUICK_KMEANS') else 15 #  orig was 64 but i think even 1 works haha.
+            # We are running this every 2000 iterations so its not really data init points
+            # Also periodically running kmeans could be so effective because k-means clustering is better than
+            # sgd clustering + reconstruction,
+            # OR it could be that the recency of the data in self.data_init_points skews clustering towards newer values.
+            # Seems like the former, but would be good to rule out the latter.
             print(f'kmeans batch {round(self.data_init_points/(self.n_embed * kmeans_points_per_cluster_init) * 100, 2)}%')
             if self.data_init_points < (self.n_embed * kmeans_points_per_cluster_init):  # Ensure enough points per cluster
                 self.data_init_buffer.append(flatten)
                 self.data_init_points += flatten.size(0)
             else:
                 # Stack data inits into tensor
-                print('running kmeans!!') # data driven initialization for the embeddings
+                print('running kmeans!!')  # data driven initialization for the embeddings
                 init_data = torch.cat(self.data_init_buffer, dim=0)
                 # rp = torch.randperm(init_data.size(0))
                 kd = kmeans2(init_data.data.cpu().numpy(), self.n_embed, minit='points')  # flatten: 512,1024 vs 8192,64
@@ -125,7 +132,7 @@ class VQVAEQuantize(nn.Module):
             self.data_initialized.fill_(0)
 
         if self.initial_centroid_spread is not None:
-            wandb_try_log({'initial_centroid_spread': self.initial_centroid_spread})
+            self.wandb_try_log({'initial_centroid_spread': self.initial_centroid_spread}, self.global_step)
 
         # Extract indexes from embedding and computes distance (similar to k-means here?)
         dist = (
@@ -137,9 +144,9 @@ class VQVAEQuantize(nn.Module):
         # TODO: First just see if we can set latent loss to zero and get good single token performance
 
         _, z_q_ind = (-dist).max(1)
-        wandb_try_log({'unique_closest_clusters': torch.unique(z_q_ind).numel()})
+        wandb_try_log({'unique_closest_clusters': torch.unique(z_q_ind).numel()}, self.global_step)
         if self.forward_iter % 100 == 0:
-            wandb_try_log({'centroid_spread': self.get_centroid_spread()})
+            wandb_try_log({'centroid_spread': self.get_centroid_spread()}, self.global_step)
         # Dist between centroids
         # Avg Dist betweeen points
         if 'SINGLE_TOKEN' not in os.environ and not self.is_single_token2:
@@ -153,11 +160,11 @@ class VQVAEQuantize(nn.Module):
             z_q_ind = 0 * z_q_ind + 3070
         z_q_emb = self.embed_code(z_q_ind)  # (B, H, W, C) (128, 8, 8, 64) OR ST2=> (B, E) (128, 4096)
         point_spread = self.get_point_spread(z_e, z_q_emb)
-        wandb_try_log({'point_spread': point_spread})
+        wandb_try_log({'point_spread': point_spread}, self.global_step)
         if self.initial_point_spread is None:
             self.initial_point_spread = point_spread
             log.debug(f'initial_point_spread {self.initial_point_spread}')
-        wandb_try_log({'initial_point_spread': self.initial_point_spread})
+        wandb_try_log({'initial_point_spread': self.initial_point_spread}, self.global_step)
 
         commitment_cost = 0.25
         latent_loss = commitment_cost * (z_q_emb.detach() - z_e).pow(2).mean() + (z_q_emb - z_e.detach()).pow(2).mean()

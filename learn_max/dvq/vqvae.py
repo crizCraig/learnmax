@@ -23,7 +23,7 @@ from learn_max.dvq.model.openai_enc_dec import Conv2d as PatchedConv2d
 from learn_max.dvq.model.quantize import VQVAEQuantize, GumbelQuantize
 from learn_max.dvq.model.loss import Normal, LogitLaplace
 from learn_max import dvq
-from learn_max.utils import get_batch_vars
+from learn_max.utils import get_batch_vars, wandb_try_log
 
 if 'TRAIN_DVQ_ONLY' in os.environ:
     dvq_module = pl.LightningModule
@@ -85,12 +85,14 @@ class VQVAE(dvq_module):
             # todo: add vqgan
         }[loss_flavor]
         self.recon_loss = ReconLoss
+        self.global_step = 0
 
     def forward(self, x):
 
         z = self.encoder(x)
         
         z_q_emb, z_q_flat, latent_loss, z_q_ind = self.quantizer.forward(z)  # zq 128, 64, 8, 8 vs 128, 1024
+        self.quantizer.global_step = self.global_step
         if 'TRY_NON_QUANTIZED' in os.environ:
             x_hat = self.decoder.forward(z)
         else:
@@ -140,16 +142,16 @@ class VQVAE(dvq_module):
             # Includes gpt block size in shape, flatten first two dimensions
             x = x.view(x.shape[0] * x.shape[1], x.shape[2], x.shape[3], x.shape[4])
         x, x_hat, z_q_emb, z_q_flat, latent_loss, recon_loss, dvq_loss, z_q_ind = self.forward(x)
-        wandb.log({'dvq_val_recon_loss': recon_loss})
-        wandb.log({'dvq_val_latent_loss': latent_loss})
+        wandb_try_log({'dvq_val_recon_loss': recon_loss}, self.global_step)
+        wandb_try_log({'dvq_val_latent_loss': latent_loss}, self.global_step)
 
         # debugging: cluster perplexity. when perplexity == num_embeddings then all clusters are used exactly equally
         encodings = F.one_hot(z_q_ind, self.quantizer.n_embed).float().reshape(-1, self.quantizer.n_embed)
         avg_probs = encodings.mean(0)
         perplexity = (-(avg_probs * torch.log(avg_probs + 1e-10)).sum()).exp()
         cluster_use = torch.sum(avg_probs > 0)
-        wandb.log({'dvq_val_perplexity': perplexity})
-        wandb.log({'dvq_val_cluster_use': cluster_use})
+        wandb_try_log({'dvq_val_perplexity': perplexity}, self.global_step)
+        wandb_try_log({'dvq_val_cluster_use': cluster_use}, self.global_step)
         return dvq_loss, recon_loss, latent_loss, x_hat, z_q_ind, z_q_flat
 
     def configure_optimizers(self):

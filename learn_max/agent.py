@@ -57,9 +57,8 @@ class LearnMaxAgent:
 
         Returns:
             action defined by policy
-            trajectories of action-states considered when choosing above action
+            predicted_trajectory of action-states considered most likely when choosing above action
         """
-        state = agent_state.dvq_x
             # print(f'states {device=}')
 
         # Ways to measure uncertainty / interestingness
@@ -78,12 +77,12 @@ class LearnMaxAgent:
         #   be used to check the above heuristics. Also psuedo-count methods cf Marc G Bellmare
         # - DVQ reconstruction loss - if the image hasn't been seen before, we will do a really bad job at reconstructing,
         #   esp. if it's a new level in zuma for example
-
+        dvq_x = agent_state.dvq_x
         if not self.model.training_gpt:
             # TODO: We have already forwarded these through the model, so there's no reason to re-forward. We just
             #   need to compute the average loss and run the manual backward.
             # TODO: Move self.dvq_ready setting to LearnMax model
-            self.s_buff.append(state)
+            self.s_buff.append(dvq_x)
             dvq_batch_ready = self.model.training and len(self.s_buff) == self.s_buff.maxlen
             if dvq_batch_ready:
                 dvq_x = torch.cat(tuple(self.s_buff))  # Stack states in 0th (batch) dimension
@@ -92,10 +91,10 @@ class LearnMaxAgent:
 
         # Return a random action if we haven't filled buffer of z states.
         if len(self.model.buffer) < self.model.gpt_block_size:  # TODO: Use self.dvq_ready to do dvq training again
-            ret, trajs = self.get_random_action(len(state)), None
+            ret, predicted_trajectory = self.get_random_action(len(dvq_x)), None
         else:
             # Search through tree of predicted a,z to find most interesting future
-            ret, trajs = self.model.tree_search()
+            ret, predicted_trajectory = self.model.tree_search()
 
         # # get the logits and pass through softmax for probability distribution
         # probabilities = F.softmax(self.net(states)).squeeze(dim=-1)
@@ -107,7 +106,7 @@ class LearnMaxAgent:
         # return actions
         self.a_buff.append(ret)
 
-        return ret, trajs
+        return ret, predicted_trajectory
 
     def get_random_action(self, num: int) -> List[int]:
         """returns a random action"""
