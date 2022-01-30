@@ -309,9 +309,9 @@ class GPT(nn.Module):
 
     def step_(self, split, batch, batch_idx=None):
         embed, idx, next_idx, a, a_next = batch  # gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y
-        B, W, E = embed.size()
         if split == 'train':
-            assert W == self.block_size, 'Not filling block size in train will result in untrained end positions.'
+            assert embed.size()[1] == self.block_size, \
+                'Not filling block size in train will result in untrained latter positions.'
 
         target_idx = self.s_i_to_as_i(next_idx, a)
         logits, expected_deviation = self.forward(embed, idx, a)

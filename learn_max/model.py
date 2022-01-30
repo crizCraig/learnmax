@@ -325,7 +325,8 @@ class LearnMax(pl.LightningModule):
             state = torch.tensor(np.array(state), device=self.device)  # causes issues when num_workers > 0
         x, x_hat, z_q_emb, z_q_flat, latent_loss, recon_loss, dvq_loss, z_q_ind = self.dvq.forward(state)
 
-        # Allows GPT to forward (and store intermediate activations used for backprop) a second time
+        # Allow GPT to forward and store intermediate activations used for backprop
+        # TODO: Check if we need to do requires_grad_() - I think it's already being done for us
         z_q_flat.detach_()
 
         agent_state = AgentState(state=state, dvq_x=x, dvq_x_hat=x_hat, dvq_z_q_emb=z_q_emb, dvq_z_q_flat=z_q_flat,
@@ -1136,8 +1137,6 @@ class LearnMax(pl.LightningModule):
             4-5 states, so long as the post-softmax entropy is adequetely low (i.e. we are confident in the states
             we can reach).
 
-
-
         """
 
         # TODO:
@@ -1170,7 +1169,7 @@ class LearnMax(pl.LightningModule):
                 z_q_ind_branches.append(exp.new_state.dvq_z_q_ind)
                 action_branches.append(exp.action)
         if look_back == 0:
-            # just died
+            # Just died
             return None, None
 
         # Unsqueeze so we have batch, window, embed dims, where batch=1, e.g. 1, 80, 4410
@@ -1184,7 +1183,8 @@ class LearnMax(pl.LightningModule):
         num_levels -= 1  # first level already populated
         for lvl in range(num_levels):
             should_log_wandb = (lvl == num_levels - 1) and self.global_step % WANDB_LOG_PERIOD == 0
-            # Move forward one step in the search tree
+
+            # Forward predict one step in the search tree
             logits, expected_deviation = self.gpt.forward(
                 embed=z_q_embed_branches[:, -self.gpt_block_size:],
                 idx=z_q_ind_branches[:, -self.gpt_block_size:],
@@ -1214,7 +1214,9 @@ class LearnMax(pl.LightningModule):
 
             # TODO: Use bayes to verify logit normalization across states = actions
 
-            entropy = -torch.sum(probs * torch.log(probs), dim=-1)  # Action entropy across states
+            # Action entropy across states
+            entropy = -torch.sum(probs * torch.log(probs), dim=-1)
+
             if should_log_wandb:
                 wandb_try_log({f'entropy/action min': entropy.min()}, self.global_step)
                 wandb_try_log({f'entropy/action mean': entropy.mean()}, self.global_step)
@@ -1278,12 +1280,12 @@ class LearnMax(pl.LightningModule):
         most_interesting_i = torch.argmax(action_entropy_path)
         predicted_traj = {
             # Return current and future trajectory without past
-            'action': action_branches[most_interesting_i][-num_levels-1:],
-            'z_q_ind': z_q_ind_branches[most_interesting_i][-num_levels-1:],
+            'action': action_branches[most_interesting_i][-num_levels-1:],  # -1 to include most recent step
+            'z_q_ind': z_q_ind_branches[most_interesting_i][-num_levels-1:],  # -1 to include most recent step
             'entropy': entropy_branches[most_interesting_i],
         }
 
-        # look_back actions are context / have already been taken so return action after look_back
+        # look_back actions are context / have already been taken so return first action after look_back
         next_action = action_branches[most_interesting_i][look_back+1]
         return [int(next_action)], predicted_traj
 
