@@ -515,7 +515,11 @@ class LearnMax(pl.LightningModule):
 
     def sample_sequential(self):
         """Get batch size X gpt_block_size windows for GPT"""
-        start_indices = np.random.choice(len(self.buffer) - self.gpt_block_size + 1, self.gpt_batch_size, replace=False)
+
+        # Sample 2 extra as we shift actions back 1 for action-states and targets forward 1 see sa2as()
+        num_extra_win_indices = 2
+        start_range = len(self.buffer) - self.gpt_block_size + 1 - num_extra_win_indices
+        start_indices = np.random.choice(start_range, self.gpt_batch_size, replace=False)
         ret_states = []
         ret_agent_states = []
         ret_actions = []
@@ -523,7 +527,7 @@ class LearnMax(pl.LightningModule):
         ret_dones = []
         ret_next_states = []
         ret_next_agent_states = []
-        block_idx = np.array(list(range(self.gpt_block_size)))
+        block_idx = np.array(list(range(self.gpt_block_size + num_extra_win_indices)))
         for s in start_indices:
             # TODO: pad with -100 when last index? We just avoid by making sure we sample early enough in the buffer
             indices = s + block_idx
@@ -1145,12 +1149,11 @@ class LearnMax(pl.LightningModule):
         #  1. optimize gpt forward
         #  2. do 3 to 5 step look ahead and rely on saliency for long term planning
         #  3. increase beam width for better quality look ahead (mostly parallel so is fast)
-        log.debug('Starting tree search')
         z_q_embed_branches = []
         z_q_ind_branches = []
         action_branches = []
 
-        look_back = min(len(self.buffer), self.gpt_block_size + 1)
+        look_back = min(len(self.buffer), self.gpt_block_size)
         buffer = self.buffer
         # Populate gpt window with recent experience
         for i in reversed(range(look_back)):
@@ -1169,10 +1172,6 @@ class LearnMax(pl.LightningModule):
         if look_back == 0:
             # just died
             return None, None
-        elif look_back == 1:
-            # just respawned, not enough actions since we shift them back one to get action-states
-
-            return 0, None  # noop
 
         # Unsqueeze so we have batch, window, embed dims, where batch=1, e.g. 1, 80, 4410
         z_q_embed_branches = torch.cat(z_q_embed_branches).unsqueeze(0)
@@ -1186,12 +1185,11 @@ class LearnMax(pl.LightningModule):
         for lvl in range(num_levels):
             should_log_wandb = (lvl == num_levels - 1) and self.global_step % WANDB_LOG_PERIOD == 0
             # Move forward one step in the search tree
-            log.debug('starting gpt forward')
             logits, expected_deviation = self.gpt.forward(
                 embed=z_q_embed_branches[:, -self.gpt_block_size:],
                 idx=z_q_ind_branches[:, -self.gpt_block_size:],
-                # Shift actions 1 back to input action-states cf: sa2as()
-                actions=action_branches[:, -self.gpt_block_size-1:-1]
+                # No need to shift actions as we use new_state from buffer, also see: sa2as()
+                actions=action_branches[:, -self.gpt_block_size:]
             )
             B, W, _ = z_q_embed_branches[:, -self.gpt_block_size:].size()  # batch size, window size
 
@@ -1201,7 +1199,9 @@ class LearnMax(pl.LightningModule):
             if should_log_wandb:
                 self.log_p_a_given_rs(logits)
             logits = logits.transpose(-1, -2)  # B, W, S, A => B, W, A, S
-            logits = logits[:, -1:, ...]  # We only care about next step, so omit all but last part of window
+
+            # We only care about next step uncertainty/entropy, so omit all but last step from window
+            logits = logits[:, -1:, ...]
             assert logits.size()[1] == 1   # assert W == 1 now
             probs = F.softmax(logits, dim=-1)  # Probability of dvq clusters given actions
 
@@ -1215,7 +1215,6 @@ class LearnMax(pl.LightningModule):
             # TODO: Use bayes to verify logit normalization across states = actions
 
             entropy = -torch.sum(probs * torch.log(probs), dim=-1)  # Action entropy across states
-
             if should_log_wandb:
                 wandb_try_log({f'entropy/action min': entropy.min()}, self.global_step)
                 wandb_try_log({f'entropy/action mean': entropy.mean()}, self.global_step)
@@ -1234,6 +1233,8 @@ class LearnMax(pl.LightningModule):
             # Add entropy of latest action to totals with window dim of length 1
             entropy_total = entropy_total.unsqueeze(1) + entropy
 
+            # Get globally interesting next actions across all branch tips,
+            # some branches may have more than 1 interesting action, others 0
             actions, action_entropy_path, actions_flat = topk_interesting(entropy_total, k=beam_width,
                                                                           rand_half='RAND_HALF' in os.environ)
             if should_log_wandb:
@@ -1247,7 +1248,6 @@ class LearnMax(pl.LightningModule):
             new_z_q_embed_branches = []
             new_action_branches = []
             new_entropy_branches = []
-            log.debug('starting top action loop')
             for i, (bi, ai) in enumerate(actions):  # batches are branches
                 # TODO: Vectorize this loop for high beam sizes (>10?)
 
@@ -1268,14 +1268,12 @@ class LearnMax(pl.LightningModule):
                 new_z_q_embed_branches.append(torch.cat((z_q_embed_head, z_q_embed_tail.unsqueeze(0))))
                 new_action_branches.append(torch.cat((action_head, action_tail.unsqueeze(0))))
                 new_entropy_branches.append(torch.cat((entropy_head, entropy_tail.unsqueeze(0))))
-            log.debug('done with top action loop')
             # Convert to tensor with window dim <= GPT block size
             z_q_ind_branches = torch.stack(new_z_q_ind_branches)
             z_q_embed_branches = torch.stack(new_z_q_embed_branches)
             action_branches = torch.stack(new_action_branches)
             entropy_branches = torch.stack(new_entropy_branches)
 
-        log.debug('Done with tree search')
         # Return branches for highest entropy path
         most_interesting_i = torch.argmax(action_entropy_path)
         predicted_traj = {
@@ -1285,7 +1283,7 @@ class LearnMax(pl.LightningModule):
             'entropy': entropy_branches[most_interesting_i],
         }
 
-        # look_back actions are context / have already been taken
+        # look_back actions are context / have already been taken so return action after look_back
         next_action = action_branches[most_interesting_i][look_back+1]
         return [int(next_action)], predicted_traj
 

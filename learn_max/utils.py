@@ -16,7 +16,7 @@ def topk_interesting(entropy, k, rand_half=False):
     """
     Get top k actions with most entropy
 
-    if rand_half: Pick random action in 50-100 percentile
+    if rand_half: Pick random action in top 50-100 percentile entropy
     i     entropy
     0:      0.1
     1:      0.2
@@ -278,11 +278,11 @@ def sa2as(z_q_flat, z_q_ind, a):
     # TODO: Remove squeeze, doesn't work with batch size of 1 due to squeeze
     # TODO: BE SURE THIS ISN'T CAUSING AN EMBEDDING FROM A DIFFERENT RELATIVE TIMESTAMP VS FORWARD (i.e. state-action vs action-state)
     gpt_x = z_q_flat.squeeze().permute(1, 0, 2)[:, 1:-1, :]
-    z_q_ind = z_q_ind.squeeze().permute(1, 0)[:, 1:]  # shift window by one to get action-states
+    z_q_ind = z_q_ind.squeeze().permute(1, 0)[:, 1:]
     # z_q_ind = z_q_ind.view(batch_size, z_q_flat.shape[0] // batch_size, -1)
     z_q_ind_x = z_q_ind[:, :-1]
     z_q_ind_y = z_q_ind[:, 1:]  # GPT just predicts next state so we shift z_q_ind by one
-    a_x = a[:, :-2]
+    a_x = a[:, :-2]  # shift window left so we have action-states
     a_y = a[:, 1:-1]
     return a_x, a_y, gpt_x, z_q_ind_x, z_q_ind_y
 
