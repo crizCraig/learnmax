@@ -324,7 +324,10 @@ class LearnMax(pl.LightningModule):
         if not isinstance(state, torch.Tensor):
             state = torch.tensor(np.array(state), device=self.device)  # causes issues when num_workers > 0
         x, x_hat, z_q_emb, z_q_flat, latent_loss, recon_loss, dvq_loss, z_q_ind = self.dvq.forward(state)
-        z_q_flat.detach_()  # Allows GPT to backprop through this a second time
+
+        # Allows GPT to forward (and store intermediate activations used for backprop) a second time
+        z_q_flat.detach_()
+
         agent_state = AgentState(state=state, dvq_x=x, dvq_x_hat=x_hat, dvq_z_q_emb=z_q_emb, dvq_z_q_flat=z_q_flat,
                                  dvq_latent_loss=latent_loss, dvq_recon_loss=recon_loss, dvq_loss=dvq_loss,
                                  dvq_z_q_ind=z_q_ind)
@@ -591,7 +594,7 @@ class LearnMax(pl.LightningModule):
                     ('DEBUG_TRAJ_BUFF' in os.environ or (batch_idx % self.replay_size == 0)) and
                     len(self.predicted_trajectory_buffer) == self.predicted_trajectory_buffer.maxlen
             ):
-                self.viz_predicted_trajectories(batch_idx)
+                self.save_predicted_trajectories(batch_idx)
 
             # We use multiple optimizers so need to manually backward each one separately
             self.gpt_optimizer.zero_grad()
@@ -669,7 +672,10 @@ class LearnMax(pl.LightningModule):
         # im.show()
         im.save(f'{ROOT_DIR}/images/all_dvq_clusters_{DATE_STR}.png')
 
-    def viz_dvq(self):
+    def viz_dvq_standalone(self, num_cols=20):
+        """
+        Visualize num_cols images and their reconstructions
+        """
         self.cuda()
         wandb.init(entity='crizcraig', mode='disabled')
 
@@ -684,7 +690,7 @@ class LearnMax(pl.LightningModule):
         x2, x_hat, z_q_emb, z_q_flat, latent_loss, recon_loss, dvq_loss, z_q_ind = self.dvq.forward(x)
         # states, actions, rewards, dones, new_states = next(iter(test_loader))
         # x = torch.cat([states, new_states])
-        num_cols = 20
+
         xcols = torch.cat([x[:num_cols], x_hat[:num_cols]], axis=2)  # side by side x and xhat
         xrows = torch.cat([xcols[i] for i in range(num_cols)], axis=2)
 
@@ -780,28 +786,27 @@ class LearnMax(pl.LightningModule):
         im.save(filename)
         return im
 
-    def viz_predicted_trajectories(self, batch_idx):
+    def save_predicted_trajectories(self, batch_idx):
         os.makedirs(f'{ROOT_DIR}/images/viz_traj', exist_ok=True)
         folder = f'{ROOT_DIR}/images/viz_traj/{get_date_str()}_r_{RUN_ID}_e_{self.current_epoch}_b_{batch_idx}'
         os.makedirs(folder, exist_ok=True)
-        N = len(self.predicted_trajectory_buffer)
+        traj_len = len(self.predicted_trajectory_buffer)
         for i, traj in enumerate(self.predicted_trajectory_buffer):
             # Write JSON with trajectories
-            state = self.buffer[-N+i].state
-            if traj['z_q_ind'][0] != state.dvq_z_q_ind[0]:
-                log.error('Buffer and predicted trajectory out of sync, skipping trajectory')   # -N+i-1 is equal 3154, -N+i=3779
+            state = self.buffer[-traj_len+i].state
+            if traj is None:
+                log.debug('No predicted trajectory on death')
+                continue
+            elif traj['z_q_ind'][0] != state.dvq_z_q_ind[0]:
+                log.error('Buffer and predicted trajectory out of sync, skipping trajectory')
                 log.error(f"traje {traj['z_q_ind'][0]}")
                 log.error(f"state {state.dvq_z_q_ind[0]}")
                 continue
             traj = {k: v.cpu().numpy().tolist() for (k, v) in traj.items()}
-            json.dump(traj, open(f'{folder}/traj_{i}.json', 'w'))
+            str_i = str(i).zfill(9)
+            json.dump(traj, open(f'{folder}/traj_{str_i}.json', 'w'))
             self.save_state_to_image(state.state, folder, i)  # TODO: We save this for movie too, reuse?
-            # # im.show()
-
-
-            # TODO: Write top row images with state.state then write column json to index with cluster images
-            # TODO: Also write top row z_q index so we can compare with an overlay / residual
-            # json.dumps(, indent=2)
+            # im.show()
 
     def _train_step_dvq(self, batch, batch_idx):
         self.dvq.set_do_kmeans(True)
@@ -1065,7 +1070,7 @@ class LearnMax(pl.LightningModule):
         power even so.
 
         The salient states are just dvq outputs, i.e. z states at each saliency level, which allows the same transformer to be
-        used for each saliency level. The difference is that, the context token will dictate skipping lower level states
+        reused for each saliency level. The difference is that, the context token will dictate skipping lower level states
         directly to the next salient state at that level.
 
         We need to stop adding levels when we run out of memory.
@@ -1074,12 +1079,12 @@ class LearnMax(pl.LightningModule):
         We only know the goal state when we've searched for the most interesting path and we know the next salient
         state on the way at the current level.
 
-        Compression:
+        Compression (does not apply to possibility-based saliency):
             If the next salient state is reached and it's no longer surprising, i.e. it's by far the most probable state
             and it has small reconstruction error, then we can train the level above to just skip this state as the
             current level can readily predict it. But we don't want this new transition to cause surprise that
             leads to a salient state above it. Checking to see if the predicted state (the old transition) was
-            encountered at the lower level seems to complicated, so we can just avoid compression for now.
+            encountered at the lower level seems too complicated, so we can just avoid compression for now.
             **We do however need to keep track of when the goal state is reached and advance the saliency levels
               above when this happens**
 
@@ -1110,8 +1115,6 @@ class LearnMax(pl.LightningModule):
 
         So we should only append to the branch that spawned the state.
 
-
-
         IF we are searching greedily, then we just pursue the top k highest entropy actions. Saliency levels
         will mitigate the shortsightedness of this approach.
 
@@ -1129,6 +1132,8 @@ class LearnMax(pl.LightningModule):
             4-5 states, so long as the post-softmax entropy is adequetely low (i.e. we are confident in the states
             we can reach).
 
+
+
         """
 
         # TODO:
@@ -1145,7 +1150,7 @@ class LearnMax(pl.LightningModule):
         z_q_ind_branches = []
         action_branches = []
 
-        look_back = min(len(self.buffer), self.gpt_block_size)
+        look_back = min(len(self.buffer), self.gpt_block_size + 1)
         buffer = self.buffer
         # Populate gpt window with recent experience
         for i in reversed(range(look_back)):
@@ -1162,8 +1167,12 @@ class LearnMax(pl.LightningModule):
                 z_q_ind_branches.append(exp.new_state.dvq_z_q_ind)
                 action_branches.append(exp.action)
         if look_back == 0:
-            # Just died
+            # just died
             return None, None
+        elif look_back == 1:
+            # just respawned, not enough actions since we shift them back one to get action-states
+
+            return 0, None  # noop
 
         # Unsqueeze so we have batch, window, embed dims, where batch=1, e.g. 1, 80, 4410
         z_q_embed_branches = torch.cat(z_q_embed_branches).unsqueeze(0)
@@ -1178,10 +1187,12 @@ class LearnMax(pl.LightningModule):
             should_log_wandb = (lvl == num_levels - 1) and self.global_step % WANDB_LOG_PERIOD == 0
             # Move forward one step in the search tree
             log.debug('starting gpt forward')
-            logits, expected_deviation = self.gpt.forward(embed=z_q_embed_branches[:, -self.gpt_block_size:],
-                                                          idx=z_q_ind_branches[:, -self.gpt_block_size:],
-                                                          actions=action_branches[:, -self.gpt_block_size:])
-            log.debug('done with gpt forward')
+            logits, expected_deviation = self.gpt.forward(
+                embed=z_q_embed_branches[:, -self.gpt_block_size:],
+                idx=z_q_ind_branches[:, -self.gpt_block_size:],
+                # Shift actions 1 back to input action-states cf: sa2as()
+                actions=action_branches[:, -self.gpt_block_size-1:-1]
+            )
             B, W, _ = z_q_embed_branches[:, -self.gpt_block_size:].size()  # batch size, window size
 
             # Get entropy across actions, see GPT.s_i_to_as_i() for ordering
@@ -1269,8 +1280,8 @@ class LearnMax(pl.LightningModule):
         most_interesting_i = torch.argmax(action_entropy_path)
         predicted_traj = {
             # Return current and future trajectory without past
-            'action': action_branches[most_interesting_i][-num_levels:],
-            'z_q_ind': z_q_ind_branches[most_interesting_i][-num_levels:],
+            'action': action_branches[most_interesting_i][-num_levels-1:],
+            'z_q_ind': z_q_ind_branches[most_interesting_i][-num_levels-1:],
             'entropy': entropy_branches[most_interesting_i],
         }
 
@@ -1366,7 +1377,7 @@ def cli_main():
         load_pretrained_dvq(args, model)
 
     if args.viz_dvq is not None:
-        return model.viz_dvq()
+        return model.viz_dvq_standalone()
     elif args.viz_all_dvq_clusters:
         return model.viz_all_dvq_clusters_standalone()
     else:

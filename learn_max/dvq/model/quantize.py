@@ -69,33 +69,29 @@ class VQVAEQuantize(nn.Module):
         #  the same way for both. Right now pytorch does the dvq, with the quantizer initialized with k-means.
 
     def forward(self, z):
-        if 'SINGLE_TOKEN' in os.environ:
-            B, E = z.size()  # B, Embed dim
-            z_e = self.proj(z)
+        B, C, H, W = z.size()
+        z_e = self.proj(z)  #  (B, E, H, W)  # Output proj channels = E
+        z_e = z_e.permute(0, 2, 3, 1)  # make (B, H, W, E)  128, 8, 8, 64
+        if self.is_single_token2:
+            # Enlarge token size (embedding_dim) so that we get one image per token,
+            # instead of a grid of image patch tokens
+
+            # B,  8, 8, 64 CIFAR
+            # B, 21, 21, 8 Atari
+            # We want to get a batch of embeddings, so n 4096. We shouldn't project down so much.
+            # Fastest thing to do would be to resize, but CIFAR is 32x32 and we start out 84x84.
+            # So instead of proj going down from 64 to 8, we go 64 to 10. Then the token size is
+            # 10 * 441 = 4410.
+            z_e = z_e.reshape(B, self.embedding_dim)  # B * H * W, E => B, H * W * E
+
             flatten = z_e
         else:
-            B, C, H, W = z.size()
-            z_e = self.proj(z)  #  (B, E, H, W)  # Output proj channels = E
-            z_e = z_e.permute(0, 2, 3, 1)  # make (B, H, W, E)  128, 8, 8, 64
-            if self.is_single_token2:
-                # Enlarge token size (embedding_dim) so that we get one image per token,
-                # instead of a grid of image patch tokens
-
-                # B,  8, 8, 64 CIFAR
-                # B, 21, 21, 8 Atari
-                # We want to get a batch of embeddings, so n 4096. We shouldn't project down so much.
-                # Fastest thing to do would be to resize, but CIFAR is 32x32 and we start out 84x84.
-                # So instead of proj going down from 64 to 8, we go 64 to 10. Then the token size is
-                # 10 * 441 = 4410.
-                z_e = z_e.reshape(B, self.embedding_dim)  # B * H * W, E => B, H * W * E
-
-                flatten = z_e
-            else:
-                flatten = z_e.reshape(-1, self.embedding_dim)  # 8192 (128*8*8), 64  and flatten out space, so (B, E, H, W) -> (B*H*W, E) - a bunch of embeddings
+            # 8192 (128*8*8), 64  and flatten out space, so (B, E, H, W) -> (B*H*W, E) - a bunch of embeddings
+            flatten = z_e.reshape(-1, self.embedding_dim)
 
         # DeepMind def does not do this but I find I have to... ;/
         # Works just as well with one point per cluster in single token CIFAR which is somewhat sus.
-        # HOWEVER, super important for Montezuma
+        # HOWEVER, super important for single token in Montezuma
         if self.enable_kmeans and self.training and self.data_initialized.item() == 0:
             # TODO: We need to do this on the batch after performing some random actions, or just try random init.
             #  If that doesn't work, we can try youtube videos, or use randomly drawn samples from a large replay
@@ -127,6 +123,7 @@ class VQVAEQuantize(nn.Module):
             # TODO: this won't work in multi-GPU setups
 
         if self.training and self.forward_iter % 4000 == 0:
+            # Causes k-means to rerun periodically which is needed for img=>token to work
             # This actually ends up happening every 2000 updates due to validation iters or something
             # TODO: Use the global train step through a lightning hook like the learning rate
             self.data_initialized.fill_(0)
@@ -135,13 +132,14 @@ class VQVAEQuantize(nn.Module):
             self.wandb_try_log({'initial_centroid_spread': self.initial_centroid_spread}, self.global_step)
 
         # Extract indexes from embedding and computes distance (similar to k-means here?)
+        # this is the distance that's learned by the embedding table between each input token and each centroid
+        # so (flatten - embed.weight)^2 = flatten^2 - 2 * flatten @ embed.weight + embed.weight^2
         dist = (
             flatten.pow(2).sum(1, keepdim=True)
             - 2 * flatten @ self.embed.weight.t()
             + self.embed.weight.pow(2).sum(1, keepdim=True).t()
-        )  # this is the distance that's learned by the embedding table between each token and each centroid
+        )
         # dimensions are (num_tokens, num_embeddings)
-        # TODO: First just see if we can set latent loss to zero and get good single token performance
 
         _, z_q_ind = (-dist).max(1)
         wandb_try_log({'unique_closest_clusters': torch.unique(z_q_ind).numel()}, self.global_step)
@@ -149,7 +147,7 @@ class VQVAEQuantize(nn.Module):
             wandb_try_log({'centroid_spread': self.get_centroid_spread()}, self.global_step)
         # Dist between centroids
         # Avg Dist betweeen points
-        if 'SINGLE_TOKEN' not in os.environ and not self.is_single_token2:
+        if not self.is_single_token2:
             # tensor([[[371, 371, 371,  ..., 371, 371, 371],
             #          [371, 371, 371,  ..., 371, 371, 371],
             #          [371, 371, 371,  ..., 371, 371, 371]]], device='cuda:0')
@@ -170,15 +168,19 @@ class VQVAEQuantize(nn.Module):
         latent_loss = commitment_cost * (z_q_emb.detach() - z_e).pow(2).mean() + (z_q_emb - z_e.detach()).pow(2).mean()
         latent_loss *= self.kld_scale
 
-        z_q_emb = z_e + (z_q_emb - z_e).detach() # noop in forward pass, straight-through gradient estimator in backward pass
-        z_q_flat = z_q_emb
+        z_q_flat = z_q_emb  # Do this before the "noop" as it's not exactly a noop and we input this flat vector to GPT
+
+        # noop in forward pass, straight-through gradient estimator in backward pass
+        # There do end up being small differences made to z_q_emb on forward here due to floating point stuff,
+        # where 93pct_delta=1.6e-10 and max=2.4e-7 for tensors with values max=3.6, min(abs(x))=3.89e-5
+        z_q_emb = z_e + (z_q_emb - z_e).detach()
+
         if self.is_single_token2:
             # (B, E) = (B, H*W*output_proj) => (B, H, W, output_proj)
             # (128, 4410) = (128, 21*21*10) => (128, 21, 21, 10)
             z_q_emb = z_q_emb.reshape(B, H, W, self.output_proj)
-        if 'SINGLE_TOKEN' not in os.environ:
-            z_q_emb = z_q_emb.permute(0, 3, 1, 2)  # stack encodings into channels again: (B, C, H, W)
 
+        z_q_emb = z_q_emb.permute(0, 3, 1, 2)  # stack encodings into channels again: (B, C, H, W)
         self.forward_iter += 1
         return z_q_emb, z_q_flat, latent_loss, z_q_ind
 

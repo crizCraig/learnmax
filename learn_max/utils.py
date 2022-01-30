@@ -237,43 +237,54 @@ def get_batch_vars(batch, use_next=False, return_agent_state=False, populate_gpt
 
         # print(f'{dvq_loss=}')
         # print(f'dvq_loss_avg={sum([a["dvq_loss"].mean() for a in agent_state]) / len(agent_state)}')
-
-        # here we need to get the cluster indexes OR we could feed in the actual token as it already has semantic
-        # information and is the right size tensor. Regardless, the gpt targets will be integers.
-        # Feeding in the index allows the size of the token to vary.
-        # There's a question as to whether inputting centroids vs centroid indexes will make the model more
-        # robust to changes in centroids over time. It seems that the indexes are arbitrary, but they will
-        # be consistent most likely in terms of their semantic meaning. Although, feeding the whole centroid
-        # tensor would be even better.
-
-        # Okay, then we just need to shift the targets so that we are predicting the next token
-
-        # batch_size = batch[0].shape[0]
-
-        # 80, 16, 1, 4410 => 16, 80, 4410
-        # Here we omit the first state with `1:` in order to pass action-states where the action leads to the state
-        # vs what we have now which are state-actions, where the action is taken in the state.
-        # We additionally index with `:-1` to keep the last state for the last target.
-        #  in s:  s0 s1 s2 s3 s4
-        #  in a:  a0 a1 a2 a3 a4
-        #
-        #  out ax, sx, ay, sy
-        #  -------------------
-        #  ax: a0 a1 a2
-        #  sx: s1 s2 s3
-        #
-        #  ay: a1 a2 a3
-        #  sy: s2 s3 s4
-        gpt_x = z_q_flat.squeeze().permute(1, 0, 2)[:, 1:-1, :]
-        z_q_ind = z_q_ind.squeeze().permute(1, 0)[:, 1:]  # shift window by one to get action-states
-        # z_q_ind = z_q_ind.view(batch_size, z_q_flat.shape[0] // batch_size, -1)
-        z_q_ind_x = z_q_ind[:, :-1]
-        z_q_ind_y = z_q_ind[:, 1:]  # GPT just predicts next state so we shift z_q_ind by one
-        a_x = a[:, :-2]
-        a_y = a[:, 1:-1]
+        a_x, a_y, gpt_x, z_q_ind_x, z_q_ind_y = sa2as(z_q_flat, z_q_ind, a)
         return gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y, s
         # idx_or_embed = idx_or_embed.view(int(idx_or_embed.shape[0] / self.block_size) - 1, self.block_size,
         #                                  idx_or_embed.shape[1])
+
+
+def sa2as(z_q_flat, z_q_ind, a):
+    """
+    Reorder gpt inputs/targets as action-states, i.e. action that leads to state, whereas inputs are state-actions,
+    i.e. I'm in a state, take this action
+
+    here we need to get the cluster indexes OR we could feed in the actual token as it already has semantic
+    information and is the right size tensor. Regardless, the gpt targets will be integers.
+    Feeding in the index allows the size of the token to vary.
+    There's a question as to whether inputting centroids vs centroid indexes will make the model more
+    robust to changes in centroids over time. It seems that the indexes are arbitrary, but they will
+    be consistent most likely in terms of their semantic meaning. Although, feeding the whole centroid
+    tensor would be even better.
+
+    Okay, then we just need to shift the targets so that we are predicting the next token
+
+    batch_size = batch[0].shape[0]
+
+    80, 16, 1, 4410 => 16, 80, 4410
+    Here we omit the first state with `1:` in order to pass action-states where the action leads to the state
+    vs what we have now which are state-actions, where an action is taken in the state.
+    We additionally index with `:-1` to keep the last state for the last target.
+    in s:  s0 s1 s2 s3 s4
+    in a:  a0 a1 a2 a3 a4
+
+    out ax, sx, ay, sy
+    -------------------
+    ax: a0 a1 a2
+    sx: s1 s2 s3
+
+    ay: a1 a2 a3
+    sy: s2 s3 s4
+    """
+    # TODO: Remove squeeze, doesn't work with batch size of 1 due to squeeze
+    # TODO: BE SURE THIS ISN'T CAUSING AN EMBEDDING FROM A DIFFERENT RELATIVE TIMESTAMP VS FORWARD (i.e. state-action vs action-state)
+    gpt_x = z_q_flat.squeeze().permute(1, 0, 2)[:, 1:-1, :]
+    z_q_ind = z_q_ind.squeeze().permute(1, 0)[:, 1:]  # shift window by one to get action-states
+    # z_q_ind = z_q_ind.view(batch_size, z_q_flat.shape[0] // batch_size, -1)
+    z_q_ind_x = z_q_ind[:, :-1]
+    z_q_ind_y = z_q_ind[:, 1:]  # GPT just predicts next state so we shift z_q_ind by one
+    a_x = a[:, :-2]
+    a_y = a[:, 1:-1]
+    return a_x, a_y, gpt_x, z_q_ind_x, z_q_ind_y
 
 
 def get_date_str():

@@ -270,7 +270,6 @@ class GPT(nn.Module):
             print('max_trajectory_count: ', self.max_trajectory_count)
 
     def forward(self, embed, idx, actions):
-        log.debug('entering gpt forward')
         # if self.should_input_embed:
         #     b, t, embed = idx_or_embed.size()
         # else:
@@ -291,21 +290,10 @@ class GPT(nn.Module):
 
         # x = self.drop(token_embed + position_embeddings + action_embeddings + dvq_proj)
         x = self.drop(token_embed + position_embed + action_embed + embed)
-        log.debug('starting gpt blocks')
         x = self.blocks(x)
-        log.debug('done with gpt blocks')
-
-        log.debug('starting layer norm')
         x = self.ln_f(x)
-        log.debug('done with layer norm')
-
-        log.debug('starting logit_p_head')
         logits = self.logit_p_head(x)
-        log.debug('done with logit_p_head')
-
-        log.debug('starting deviation_head')
         expected_deviation = self.deviation_head(x)  # Uses mean deviation instead of standard deviation https://stats.stackexchange.com/q/81986/18187
-        log.debug('done with deviation_head')
 
         # wandb.log({'train/expected_deviation_median': torch.quantile(expected_deviation, 0.5)})
         # wandb.log({'train/expected_deviation_90pct': torch.quantile(expected_deviation, 0.9 )})
@@ -317,11 +305,10 @@ class GPT(nn.Module):
 
         wandb_try_log({'train/logits_std': logits.std()}, self.global_step)
 
-        log.debug('exiting gpt forward')
         return logits, expected_deviation
 
     def step_(self, split, batch, batch_idx=None):
-        embed, idx, next_idx, a, a_next = batch
+        embed, idx, next_idx, a, a_next = batch  # gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y
         target_idx = self.s_i_to_as_i(next_idx, a)
         logits, expected_deviation = self.forward(embed, idx, a)
 
