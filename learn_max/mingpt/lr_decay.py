@@ -23,7 +23,7 @@ class GptWarmupCosineLearningRateDecay(pl.Callback):
         self.tokens = 0
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx=None):
-        gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y, s = get_batch_vars(batch, return_agent_state=True, populate_gpt=True)
+        gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y, s = get_batch_vars(batch, return_agent_state=False, populate_gpt=True)
         # _, y = batch
         self.tokens += (z_q_ind_y >= 0).sum()  # y == -100 is "ignore", so don't count these
         if self.tokens < self.warmup_tokens:

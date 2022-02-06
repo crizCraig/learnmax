@@ -19,6 +19,8 @@ class AgentState:
     dvq_latent_loss: torch.Tensor = None
     dvq_recon_loss: torch.Tensor = None
     dvq_loss: torch.Tensor = None
+    append_i: torch.tensor = -1  # for bug hunting
+    split: torch.tensor = 0  # 0 for train 1 for test
 
     def dict(self):
         return self.__dict__
@@ -90,7 +92,7 @@ class LearnMaxAgent:
                 self.dvq_ready = True  # dvq outputs are now based on some training
 
         # Return a random action if we haven't filled buffer of z states.
-        if len(self.model.buffer) < self.model.gpt_block_size:  # TODO: Use self.dvq_ready to do dvq training again
+        if len(self.model.train_buf) < self.model.gpt_block_size:  # TODO: Use self.dvq_ready to do dvq training again
             ret, predicted_trajectory = self.get_random_action(len(dvq_x)), None
         else:
             # Search through tree of predicted a,z to find most interesting future
@@ -111,6 +113,8 @@ class LearnMaxAgent:
         # return actions
         # self.a_buff.append(ret)
 
+        if 'GO_RIGHT_AGENT' in os.environ:
+            ret = [3]
         return ret, predicted_trajectory
 
     def get_random_action(self, num: int) -> List[int]:

@@ -1,0 +1,23 @@
+- ~~Pass the action in as an embedding~~
+  - Learn new state embedding so that the embedding can change to adapt with the added position embedding
+  - ~~Understand why recent ViT models don't use the position encoding~~ (they just use conv for position)
+  - ~~Try summing it with the state just like the position embedding~~
+- ~~since loss is not decreasing, we should try to overfit on a single batch~~
+- ~~visualize actual states and predicted states. right now we are not searching through a tree, so we should just be playing random actions and predicting the latent state results.~~
+- ~~integrate transformer to take actions~~
+- Resume accurate 1 step model, predict most likely state-action trajectories, and visualize them
+- ~~See if multistep prediction problem is due to forwarding outside of training~~
+- Count state visits
+- ~~Reverse entropy to plan along well understood paths~~
+- So I accidentally trained GPT from a randomized DVQ and was able to achieve high prediction accuracy. This suggests we can train them together or not train the DVQ at all to reconstruct...
+- Try predicting action-states with sequences of image-patch-tokens, instead of or in addition to image-tokens as this should allow for better generalization / translation invariance. This as it enables the position encoding to learn 2D relationships vs now where the position encoding just represents a single dimensional frame number. An alternative easier solution would be to add a fully connected layer to the top of the DVQ before the quantization that learns 2D => 1D that can reconstruct. This hopefully will help build a 1D representation that conveys some translation invariance and other generalization which the transformer can use. Basically, spatial abstraction is already achievable in CNNs (e.g. classification). Pixel / feature prediction and self-supervised learning could also be helpful (or any supervised task that you have labels for) for creating a better spatial abstraction which can then be tokenized/discretized and used in GPT for temporal abstraction. Discretization seems to be critical for temporal abstraction in that it makes the number of predicted possibilities tractable for prediction in search trees.
+- Rather than weight entropy by saliency level to encourage more abstract plans, perhaps the weighting should just be based on the total entropy expected divided by the expected duration of the abstract plan cf [Semi-MDP](http://user.engineering.uiowa.edu/~dbricker/Stacks_pdf1/SMDP_Intro.pdf).
+- We can predict latent states for a single action, go-right, within a couple hours of training. Also, we have many aliased states (see [50-neighbor-knn](results/first_100_clusters_50_knn.PNG)). Finally we have many action aliases, e.g. right-up and right, noop and up, etc... So the 70k softmax at the end of GPT is 50 to 100x bigger than we need it.
+
+
+Notes:
+#### Comparison with hierarchy of abstract machines (HAMs)
+These have discrete action, call, choice, and stop where execution is occurring at one level of abstraction at a time (i.e. sequentially). A big difference between this and learnmax is that learnmax can search within different levels of abstraction in parallel. Since high level plans don't change as often, most searching is done in the lower levels even when executing a high level plan to find some long term entropy. So your basically optimizing for entropy reduction per unit time. However since high level entropy possibly unlocks new vistas and worlds of low level entropy, we still should perhaps afford more weight to high level entropy just based on level alone. 
+
+#### Comparison with options in hierarchical RL
+It seems that options may support planning at multiple levels simultaneously. However, I don't see a way to automatically learn the options. Rather they are provided by humans. 

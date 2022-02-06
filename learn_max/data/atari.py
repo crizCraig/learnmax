@@ -10,7 +10,6 @@ from torchvision.datasets import CIFAR10
 import pytorch_lightning as pl
 
 from learn_max.constants import SAVE_DIR
-from learn_max.dvq.data.experience_source import ExperienceSourceDataset
 from learn_max.dvq.model.loss import LogitLaplace, Normal
 
 

@@ -109,9 +109,9 @@ class VQVAE(dvq_module):
 
     def decode_flat(self, z_q_emb_flat, output_proj):
         """
-        Takes flat embedding and decodes it into an image
+        Takes flat embedding of dims B,E, i.e. 1,4410 and decodes it into an image
         """
-        in_dims = z_q_emb_flat.size()  # e.g. (1, 21, 21, 10)
+        in_dims = z_q_emb_flat.size()
 
         width = int(np.sqrt(in_dims[-1] // output_proj))
         z_q_emb_flat = z_q_emb_flat.reshape((np.prod(in_dims[:-1]), width, width, output_proj))
@@ -216,7 +216,7 @@ class VQVAE(dvq_module):
         parser.add_argument("--num_embeddings", type=int, default=default_num_embeddings, help="vocabulary size; number of possible discrete states")
         parser.add_argument("--embedding_dim", type=int, default=default_embedding_dim, help="size of the vector of the embedding of each discrete token")
         parser.add_argument("--n_hid", type=int, default=64, help="number of channels controlling the size of the model")
-        parser.add_argument("--dvq_quantize_proj", type=int, default=None)
+        parser.add_argument("--dvq_quantize_proj", type=int, default=10)
         return parser
 
 

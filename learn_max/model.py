@@ -35,12 +35,14 @@ from torch.nn import functional as F
 from learn_max import dvq
 from learn_max.agent import LearnMaxAgent, AgentState
 from learn_max.dvq.model.deepmind_enc_dec import ResBlock
+from learn_max.replay_buffer import ReplayBuffers
 from learn_max.utils import topk_interesting, _init_weights, get_batch_vars, get_date_str, get_action_states, \
     wandb_try_log, no_train
-from learn_max.constants import SAVE_DIR, SEED, DEBUGGING, DATE_STR, ROOT_DIR, RUN_ID, WANDB_LOG_PERIOD
+from learn_max.constants import SAVE_DIR, SEED, DEBUGGING, DATE_STR, ROOT_DIR, RUN_ID, WANDB_LOG_PERIOD, ACC_LOG_PERIOD
 from learn_max.dvq.vqvae import VQVAE, DecayLR, DecayTemperature, RampBeta
 from learn_max.mingpt.lr_decay import GptWarmupCosineLearningRateDecay
 from learn_max.mingpt.model import GPT
+from learn_max.viz_predicted_trajectories import get_np_txt_caption, get_action_text, get_np_txt_caption2
 
 
 class LearnMax(pl.LightningModule):
@@ -103,10 +105,11 @@ class LearnMax(pl.LightningModule):
             env_id: str = 'MontezumaRevenge-v0',  # gym environment tag
             warm_start_size: int = 10_000,  # how many samples do we use to fill our buffer at the start of training
             batches_per_epoch: int = 10_000,  # number of batches per pseudo (RL) epoch
+            actions_per_batch: int = 10,  # adds more samples per action to prevent overfitting
 
             # Tree search
             beam_width: int = 4,  # How many trajectories to predict in tree search
-            num_search_levels: int = 10,  # How many steps to predict out in each trajectory
+            num_search_steps: int = 10,  # How many steps to predict out in each trajectory
 
             # Standard stuff
             num_workers: int = 0,  # data loader workers - pycharm has issues debugging these. also gen batch requires NN for action so can't use > 0 at runtime either yet
@@ -157,8 +160,6 @@ class LearnMax(pl.LightningModule):
         self.dvq_checkpoint = dvq_checkpoint
         self.dvq_ready = False  #  Whether the dvq has enough data to train a batch
 
-        if not should_train_gpt:
-            raise NotImplementedError('Revise dvq training or set should_train_gpt')
         self.should_train_gpt = should_train_gpt
 
         # the "width" of the model (embedding_dim), number of channels in each Transformer
@@ -182,13 +183,14 @@ class LearnMax(pl.LightningModule):
         self.env_id = env_id
         self.warm_start_size = warm_start_size
         self.batches_per_epoch = batches_per_epoch
+        self.actions_per_batch = actions_per_batch
 
         # RL / sensorimotor stuff
         self.num_workers = num_workers
         self.data_dir = data_dir
 
         self.beam_width = beam_width
-        self.num_search_levels = num_search_levels
+        self.num_search_steps = num_search_steps
 
         # TODO: Set a separate DVQ batch size
         self.batch_size = gpt_batch_size if self.should_train_gpt else batch_size
@@ -300,8 +302,11 @@ class LearnMax(pl.LightningModule):
         self.batch_states = []
         self.batch_actions = []
 
-        # Replay buffer
-        self.buffer = deque(maxlen=self.replay_size)  # TODO: Move this off-GPU for better catastrophic forgetting avoidance
+        # Replay buffers (test and train)
+        self.buffers = ReplayBuffers(env_id=self.env_id, short_term_mem=self.gpt_block_size * 2)
+        self.train_buf = self.buffers.train_buf
+        self.test_buf = self.buffers.test_buf
+        self.recent_experience = self.buffers.recent_experience
 
         # Trajectory visualization data
         self.predicted_trajectory_buffer = deque(maxlen=self.replay_size if 'DEBUG_TRAJ_BUFF' not in os.environ else 10)
@@ -319,7 +324,8 @@ class LearnMax(pl.LightningModule):
                              enc_dec_flavor=dvq_enc_dec_flavor, vq_flavor=dvq_vq_flavor, quantize_proj=None,
                              is_single_token2=self.is_single_token2)
 
-        self.gpt = GPT(vocab_size=num_embeddings * self.num_actions, block_size=gpt_block_size, n_layer=gpt_n_layer,
+        self.gpt = GPT(output_size=num_embeddings * self.num_actions, num_input_embeddings=num_embeddings,
+                       block_size=gpt_block_size, n_layer=gpt_n_layer,
                        input_embedding_dim=self.gpt_input_embedding_dim, n_head=gpt_n_head,
                        learning_rate=gpt_learning_rate, weight_decay=gpt_weight_decay, betas=gpt_betas,
                        embd_pdrop=gpt_embd_pdrop, resid_pdrop=gpt_resid_pdrop, attn_pdrop=gpt_attn_pdrop,
@@ -337,6 +343,8 @@ class LearnMax(pl.LightningModule):
             state = [state]
         if not isinstance(state, torch.Tensor):
             state = torch.tensor(np.array(state), device=self.device)  # causes issues when num_workers > 0
+
+        # TODO: Check if we should train DVQ and if not, put this in a no_train block
         x, x_hat, z_q_emb, z_q_flat, latent_loss, recon_loss, dvq_loss, z_q_ind = self.dvq.forward(state)
 
         # Allow GPT to forward and store intermediate activations used for backprop
@@ -385,8 +393,10 @@ class LearnMax(pl.LightningModule):
                 next_agent_state = self.get_agent_state(next_state)
                 exp = Experience(state=self.agent_state, action=action[0], reward=reward, done=done,
                                  new_state=next_agent_state)
-                self.buffer.append(exp)
-                self.agent_state = next_agent_state
+                self.buffers.append(exp)
+
+                # Creates new AgentState so append_i is correct
+                self.agent_state = self.get_agent_state(next_state)
                 if done:
                     self.reset_after_death()
 
@@ -415,15 +425,20 @@ class LearnMax(pl.LightningModule):
         episode_reward = 0
         episode_steps = 0
 
-        self.profile_cuda_usage_tensors()
+        # self.profile_cuda_usage_tensors()
 
         actions, agent_states, dones, new_states, rewards, states = (None, None, None, None, None, None)
 
         while True:
             if self.total_steps == 0 or 'OVERFIT' not in os.environ:
                 # TODO: Move this tuple into a @dataclass
-                (states, actions, rewards, dones, new_states, agent_states, next_agent_states, episode_steps,
-                    episode_reward) = self._take_action_and_sample(episode_reward, episode_steps)
+                (states,
+                 actions,
+                 rewards,
+                 dones,
+                 new_states,
+                 agent_states,
+                 next_agent_states) = self._take_action_and_sample(episode_reward, episode_steps)
                 # TODO: If viz'ing add state here, then send state through dvq decoder and output as video
                 #   and sequences of images.
             if dones is None:
@@ -452,15 +467,17 @@ class LearnMax(pl.LightningModule):
             return [_.dict() for _ in thing]
 
     def _take_action_and_sample(self, episode_reward, episode_steps):
-        episode_reward, episode_steps, is_done = self._take_action(episode_reward, episode_steps)
-        if is_done:
-            self.done_episodes += 1
-            self.total_rewards.append(episode_reward)
-            self.total_episode_steps.append(episode_steps)
-            self.avg_rewards = float(np.mean(self.total_rewards[-self.avg_reward_len:]))
-            self.reset_after_death()
-            episode_steps = 0
-            episode_reward = 0
+        for a_i in range(self.actions_per_batch):
+            # TODO: If there's a very surprising experience, train on it right away
+            episode_reward, episode_steps, is_done = self._take_action(episode_reward, episode_steps)
+            if is_done:
+                self.done_episodes += 1
+                self.total_rewards.append(episode_reward)
+                self.total_episode_steps.append(episode_steps)
+                self.avg_rewards = float(np.mean(self.total_rewards[-self.avg_reward_len:]))
+                self.reset_after_death()
+                episode_steps = 0
+                episode_reward = 0
         if self.should_train_gpt:
             # Sample sequentially from replay buffer
             # If training GPT, we need to return the dvq state indexes as well to be used in on_train_batch_end
@@ -475,28 +492,28 @@ class LearnMax(pl.LightningModule):
             states = np.array([x for x in states[:, 0]])
             new_states, agent_states = new_states[:, 0], new_states[:, 1]
             new_states = np.array([x for x in new_states])
-        return (states, actions, rewards, dones, new_states, agent_states, next_agent_states, episode_steps,
-                episode_reward)
+        return states, actions, rewards, dones, new_states, agent_states, next_agent_states
 
     def reset_after_death(self):
         # TODO: The replay buffer should know reset boundaries so that we can avoid sampling across resets.
         #   This is important for AGI safety in that humans / life cannot respawn, and AI should reason about
         #   exploration in the same context.
         #   We sample in both the DVQ with sample(), but also in tree search by directly accessing the buffer (DONE)
-        #   We also sample in train GPT batch with random start points and need to NOT sample across resets here.
+        #   We also sample in train GPT batch in sample_sequential with random start points and need to
+        #   NOT sample across resets here.
         # TODO: We need to add a death prediction logistic regression head to GPT for tree search to use to reduce
         #   expected entropy/reward for post-death actions by prob(death)
         # If in tree search and just died, then is_done=True, return early, no need to search
         dead_state = self.agent_state
         spawn_state = self.reset()
-        self.buffer.append(Experience(state=dead_state,
-
-                                      # Reset action is noop - refer to self.env.unwrapped._action_set
-                                      # to ensure this is true for your env. Montezuma=Yes
-                                      action=0,
-                                      reward=0,
-                                      done=False,
-                                      new_state=spawn_state))
+        self.buffers.append(Experience(
+            state=dead_state,
+            # Reset action is noop - refer to self.env.unwrapped._action_set
+            # to ensure this is true for your env. Montezuma=Yes
+            action=0,
+            reward=0,
+            done=False,
+            new_state=spawn_state))
         self.predicted_trajectory_buffer.append(None)
 
     def _take_action(self, episode_reward, episode_steps):
@@ -509,9 +526,9 @@ class LearnMax(pl.LightningModule):
         # If is_done, we need to append an experience with last_state, reset_state, action=None
         # The replay buffer should know reset boundaries so that we can avoid sampling across resets
         # If in tree search and just died, then is_done=True, return early, no need to search
-        self.buffer.append(exp)
+        self.buffers.append(exp)
         self.predicted_trajectory_buffer.append(predicted_trajectory)
-        self.agent_state = next_agent_state
+        self.agent_state = self.get_agent_state(next_state)  # Create new AgentState so append_i is correct
         return episode_reward, episode_steps, is_done
 
     def profile_cuda_usage_tensors(self):
@@ -528,13 +545,13 @@ class LearnMax(pl.LightningModule):
         log.info('Done profiling torch objects')
         log.info('-----------------------')
 
-    def sample_sequential(self):
+    def sample_sequential(self, start_indices=None):
         """Get batch size X gpt_block_size windows for GPT"""
-
         # Sample 2 extra as we shift actions back 1 for action-states and targets forward 1 see sa2as()
         num_extra_win_indices = 2
-        start_range = np.arange(len(self.buffer) - self.gpt_block_size + 1 - num_extra_win_indices)
-        start_indices = np.random.choice(start_range, self.gpt_batch_size, replace=False)
+        start_range = np.arange(len(self.train_buf) - self.gpt_block_size + 1 - num_extra_win_indices)
+        if start_indices is None:
+            start_indices = np.random.choice(start_range, self.gpt_batch_size, replace=False)
         if 'ALWAYS_SAMPLE_LATEST' in os.environ:
             start_indices[0] = start_range[-1]
         ret_states = []
@@ -544,11 +561,11 @@ class LearnMax(pl.LightningModule):
         ret_dones = []
         ret_next_states = []
         ret_next_agent_states = []
-        block_idx = np.array(list(range(self.gpt_block_size + num_extra_win_indices)))
-        for s in start_indices:
+        block_len = self.gpt_block_size + num_extra_win_indices
+        for start in start_indices:
             # TODO: pad with -100 when last index? We just avoid by making sure we sample early enough in the buffer
-            indices = s + block_idx
-            agent_states, actions, rewards, dones, next_agent_states = zip(*[self.buffer[idx] for idx in indices])
+            exps, _ = self.train_buf.get(start, block_len)
+            agent_states, actions, rewards, dones, next_agent_states = zip(*exps)
             ret_states.append([ags.state for ags in agent_states])
             ret_agent_states.append(agent_states)
             ret_actions.append(actions)
@@ -594,10 +611,9 @@ class LearnMax(pl.LightningModule):
 
         if self.should_train_gpt:
             self.dvq.set_do_kmeans(False)
-            gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y, s = get_batch_vars(batch, return_agent_state=True, populate_gpt=True)
-            # print('gptx', gpt_x[0][0])
-            # Train gpt on dvq tokens shifted for prediction
-
+            gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y, s, agent_state = get_batch_vars(batch,
+                                                                                   return_agent_state=True,
+                                                                                   populate_gpt=True)
             if self.gpt_learning_rate == 0 or 'ZERO_LR' in os.environ:
                 # For testing that train step and visualize methods produce same output, basically disable dropout
                 self.eval()
@@ -608,28 +624,39 @@ class LearnMax(pl.LightningModule):
             if 'ZERO_LR' in os.environ:
                 test_logits, _ = self.gpt.forward(gpt_x, z_q_ind_x, a_x)
                 test_target = self.gpt.s_i_to_as_i(z_q_ind_y, a_x)
-                self.viz_gpt(test_logits, test_target, state=s, batch_idx=6969696)
-                self.viz_simple_predict_trajectory(gpt_x, z_q_ind_x, a_x, batch_idx)
+                self.viz_gpt(test_logits, test_target, state=s, batch_idx=79797979)
+                self.viz_simple_predict_trajectory(gpt_x, z_q_ind_x, a_x, gpt_ret, batch_idx)
 
+            if (
+                    self.should_viz_predict_trajectory and
+                    len(self.recent_experience) >= self.gpt_block_size and
+                    batch_idx % self.replay_size == 0
+            ):
+                self.viz_simple_predict_trajectory(gpt_x, z_q_ind_x, a_x, gpt_ret, batch_idx)
             if batch_idx % self.replay_size == 0:
                 # One action per batch, so there's replay_size new frames
                 self.viz_gpt(gpt_ret['logits'], gpt_ret['target_idx'], state=s, batch_idx=batch_idx)
+
+                # Also try this in a no_train
+                test_logits, _ = self.gpt.forward(gpt_x, z_q_ind_x, a_x)
+                test_target = self.gpt.s_i_to_as_i(z_q_ind_y, a_x)
+                self.viz_gpt(test_logits, test_target, state=s, batch_idx=batch_idx, postfix='_forward_only')
+
                 self.viz_movie(batch_idx)
             if self.global_step == 0:
                 # TODO: Make sure to call again if we update clusters as visualizing predicted trajectories
                 #   uses the cluster images
                 self.viz_dvq_clusters(batch_idx)
-            if (
-                    self.should_viz_predict_trajectory and
-                    len(self.buffer) >= self.gpt_block_size and
-                    batch_idx % self.replay_size == 0
-            ):
-                self.viz_simple_predict_trajectory(gpt_x, z_q_ind_x, a_x, batch_idx)
+
             if (
                     ('DEBUG_TRAJ_BUFF' in os.environ or (batch_idx % self.replay_size == 0)) and
                     len(self.predicted_trajectory_buffer) == self.predicted_trajectory_buffer.maxlen
             ):
                 self.save_predicted_trajectories(batch_idx)  # View this with viz_predicted_trajectories.py
+
+            if batch_idx % ACC_LOG_PERIOD == 0:
+                log.info('train replay appends', self.train_buf.length)
+                log.info('test replay appends', self.test_buf.length)
 
             # We use multiple optimizers so need to manually backward each one separately
             self.gpt_optimizer.zero_grad()
@@ -670,6 +697,30 @@ class LearnMax(pl.LightningModule):
         self._viz_dvq_clusters(
             f'{ROOT_DIR}/images/viz_clusters/{get_date_str()}_r_{RUN_ID}_e_{self.current_epoch}_b_{batch_idx}'
         )
+
+    @no_train
+    def viz_dvq_clusters_knn_standalone(self):
+        from sklearn.neighbors import NearestNeighbors
+        emb = self.dvq.quantizer.embed_code(torch.tensor(list(range(self.dvq_num_embeddings))))
+        nbrs = NearestNeighbors(n_neighbors=50, algorithm='auto').fit(emb)
+        distances, indices = nbrs.kneighbors(emb)
+        num_clusters_per_image = 100
+        im = None
+        clusters_in_im = 0
+        for cluster in indices:
+            imz = self.dvq.decode_flat(emb[cluster], output_proj=self.dvq.quantizer.output_proj)
+            imz = imz.squeeze().permute(2, 0, 3, 1).clamp(0, 1)
+            imz = imz.reshape(imz.shape[0], imz.shape[1] * imz.shape[2], -1)
+            imz = imz.detach().cpu().numpy()
+            if clusters_in_im == 0:
+                im = imz
+            elif clusters_in_im < num_clusters_per_image:
+                im = np.concatenate((im, imz), axis=0)
+            clusters_in_im += 1
+            if clusters_in_im == num_clusters_per_image:
+                clusters_in_im = 0
+                ims = Image.fromarray(np.uint8(im * 255))
+                ims.show()
 
     @no_train
     def viz_all_dvq_clusters_standalone(self):
@@ -741,16 +792,17 @@ class LearnMax(pl.LightningModule):
         plt.show()
 
     @no_train
-    def viz_gpt(self, logits, target_idx, state, batch_idx):
-        batch_index = -1  # Viz last batch to compare with simple predict trajectory
+    def viz_gpt(self, logits, target_idx, state, batch_idx, postfix=None):
+        postfix = postfix or ''
+        batch_index = 0  # Viz first batch (set ALWAYS_SAMPLE_LATEST) to compare with simple predict trajectory
         num_imgs_to_viz = 10
         top_n = 3
-        imgs = state[batch_index][:num_imgs_to_viz]  # Check start of sequence
+        imgs = state[batch_index][-num_imgs_to_viz:]  # Check end of sequence
 
-        logits = logits.detach().cpu().numpy()[batch_index][:num_imgs_to_viz]
+        logits = logits.detach().cpu().numpy()[batch_index][-num_imgs_to_viz:]
 
         # dvq states are action agnostic, so get base state by dividing by num_actions
-        target_idx = self.gpt.as_i_to_s_i(target_idx[batch_index][:num_imgs_to_viz])
+        target_idx = self.gpt.as_i_to_s_i(target_idx[batch_index][-num_imgs_to_viz:])
 
         emb = self.dvq.quantizer.embed_code(target_idx)
         imgs_target = self.dvq.decode_flat(emb, output_proj=self.dvq.quantizer.output_proj)
@@ -789,7 +841,7 @@ class LearnMax(pl.LightningModule):
         # im.show()
         folder = f'{ROOT_DIR}/images/viz_gpt/{DATE_STR}r_{RUN_ID}_{get_date_str()}'
         os.makedirs(folder)
-        filename = f'{folder}/e_{self.current_epoch}_b_{batch_idx}.png'
+        filename = f'{folder}/viz_gpt_e_{self.current_epoch}_b_{batch_idx}{postfix}.png'
         log.info(f'Saving gpt viz to {filename}')
         im.save(filename)
         wandb_try_log({'train/gpt-viz': [wandb.Image(im)]}, self.global_step)
@@ -807,65 +859,118 @@ class LearnMax(pl.LightningModule):
         folder = f'{ROOT_DIR}/images/viz_movie/{get_date_str()}_r_{RUN_ID}_e_{self.current_epoch}_b_{batch_idx}'
         os.makedirs(folder, exist_ok=True)
 
-        for i, x in enumerate(self.buffer):
-            im = save_state_to_image(x.state.state, folder, i)
-            # # im.show()
+        for i, x in enumerate(self.test_buf.get(self.test_buf.length - 1000, length=1000)):
+            im = x.state.state.squeeze(0).permute(1, 2, 0).detach().cpu().numpy()
+            imz = self.dvq.decode_flat(x.state.dvq_z_q_flat, output_proj=self.dvq.quantizer.output_proj)
+            imz = imz.squeeze().permute(1, 2, 0).clamp(0, 1)
+            imz = imz.detach().cpu().numpy()
+            imo = Image.fromarray(np.uint8(np.concatenate((im, imz), axis=0) * 255))
             filename = f'{folder}/{str(i).zfill(9)}.png'
-            im.save(filename)
+            imo.save(filename)
             # TODO: dvq
         # TODO: ffmpeg
         log.info(f'Saved movie to {folder}')
 
     @no_train
-    def viz_simple_predict_trajectory(self, gpt_x, z_q_ind_x, a_x, batch_idx):
+    def viz_simple_predict_trajectory(self, gpt_x, z_q_ind_x, a_x, gpt_ret, batch_idx):
         # TODO: Delete/disable as viz_predicted_trajectories is better than this (created for debugging specific issue)
         parent_folder = f'{ROOT_DIR}/images/viz_simple_predict_trajectory'
         os.makedirs(parent_folder, exist_ok=True)
         folder = f'{parent_folder}/{get_date_str()}_r_{RUN_ID}_e_{self.current_epoch}_b_{batch_idx}'
         os.makedirs(folder, exist_ok=True)
 
+        num_viz = 10
+        num_predict = self.num_search_steps
+        sync_to_latest_batch = True
+        if 'VIZ_OLD_TRAJECTORY' in os.environ:
+            raise NotImplementedError('New disk based viz trajectory not implemented, use train_buf or ' +
+                                      'test_buf instead of recent_experience')
+            # start_delay = len(self.recent_experience) - num_predict * (num_viz - 1)
+        elif sync_to_latest_batch:
+            start_delay = 3
+        else:
+            start_delay = 0
+        if start_delay < 0 or (len(self.recent_experience) - start_delay) < num_predict * (num_viz - 1):
+            print('Not enough buffer to predict')
+            return
+        for i in range(num_viz):
+            self._viz_simple_predict_trajectory(
+                folder,
+                num_predict,
+                # delay 3 to sync with the latest train batch and compare
+                delay=start_delay + i * num_predict,
+                gpt_x=gpt_x,
+                z_q_ind_x=z_q_ind_x,
+                a_x=a_x,
+                gpt_ret=gpt_ret)
+
+    def _viz_simple_predict_trajectory(self, folder, num_predict, delay, gpt_x, z_q_ind_x, a_x, gpt_ret):
         # Seed with recent actions, new_states from buffer
-        action_branches, just_died, look_back, z_q_embed_branches, z_q_ind_branches = self.get_recent_experience()
-        truncate = self.gpt_block_size  # Reduce to make sure we've seen these before
+        (action_branches,
+         just_died,
+         look_back,
+         z_q_embed_branches,
+         z_q_ind_branches) = self.get_recent_experience(delay=delay)
+
+        if just_died:
+            return
+
+        truncate = self.gpt_block_size
         # TODO: Check logit/prob KL divergence from train step to the forward here and visualize it as a histogram
-        action_branches = action_branches[:, :truncate]
-        z_q_embed_branches = z_q_embed_branches[:, :truncate]
-        z_q_ind_branches = z_q_ind_branches[:, :truncate]
-        num_predict = self.num_search_levels
-        for _ in range(num_predict):
-            as_ind = self.gpt.s_i_to_as_i(z_q_ind_branches, action_branches)
+        for p_i in range(num_predict):
             logits, expected_deviation = self.gpt.forward(
                 embed=z_q_embed_branches[:, -truncate:],
-                action_state_idx=as_ind[:, -truncate:],
+                idx=z_q_ind_branches[:, -truncate:],
                 # No need to shift actions as we use new_state from buffer, also see: sa2as()
-                actions=action_branches[:, -truncate:]
+                actions=action_branches[:, -truncate:],
             )
-            B, W, ASE = logits.size()
+            # Equal up to 151, 25 - turns out there's interaction between samples in the batch on forward ;/
+            # torch.equal(torch.topk(self.gpt_ret['logits'][0], 151)[1], torch.topk(logits[0], 151)[1])
+
+            B, W, action_state_logits = logits.size()
             assert B == 1 and W <= truncate
             logits_last_step = logits[0][-1]
             probs = F.softmax(logits_last_step, dim=-1)
             # TODO: Get most likely state given some action
-            action_state = torch.argmax(logits_last_step)  # Get most likely action-state
-            action, z_q_ind = self.gpt.split_as_i(int(action_state))  # Extract action and state from action_state
+            # target_action_state_idx = torch.multinomial(probs, num_samples=2)[1]  # 2nd most likely
+            target_action_state_idx = torch.argmax(logits_last_step)  # Get most likely action-state
+
+            # Extract action and state from action_state
+            action, z_q_ind = self.gpt.split_as_i(int(target_action_state_idx))
+            if 'PREDICT_LEFT_RIGHT' in os.environ:
+                action = p_i % 2 + 3
+
             z_q_flat = self.dvq.quantizer.embed_code(torch.tensor(z_q_ind).to(self.device))  # Get embedding from index
 
             # Autoregress: Add predictions to end of gpt input
             z_q_embed_branches = torch.cat((z_q_embed_branches, z_q_flat.reshape(1, 1, -1)), dim=1)
             action_branches = torch.cat((action_branches, torch.tensor(action).to(self.device).reshape(1, 1)), dim=1)
             z_q_ind_branches = torch.cat((z_q_ind_branches, torch.tensor(z_q_ind).to(self.device).reshape(1, 1)), dim=1)
-
         imgs = self.dvq.decode_flat(z_q_embed_branches, output_proj=self.dvq.quantizer.output_proj)
         imgs = imgs.permute(0, 1, 3, 4, 2)  # CHW => HWC
         num_actual = 5
-        imgs = imgs[:, -(num_predict + num_actual):]  # Show 5 actual frames followed by num_search_levels predicted
+        num_out = num_actual + num_predict
+        imgs = imgs[:, -num_out:]  # Show 5 actual frames followed by num_search_levels predicted
         sz = imgs.size()
         assert sz[0] == 1
         imgs = imgs.reshape(sz[1], sz[2], *sz[3:])
         imgs = np.uint8(imgs.clamp(0, 1).detach().cpu().numpy() * 255)
-        imgs = np.concatenate([img for img in imgs], axis=1)  # Align side by side
-        im = Image.fromarray(imgs)
+        imgs = np.concatenate(imgs, axis=1)  # Align side by side
+        width = int(imgs.shape[1] / (num_predict + num_actual))
+        actions = action_branches[0][-num_out:]
+        frames = []
+        for i in range(num_out):
+            frame_im = imgs[:, width * i: width * (i+1)]
+            txt_im = get_np_txt_caption2(frame_im, get_action_text(self.env, actions[i]), size=42)
+            frame_im = np.concatenate((frame_im, txt_im), axis=0)
+            # concat img along height dim
+            frames.append(frame_im)
+
+        im = Image.fromarray(np.concatenate(frames, axis=1))  # Align side by side
         # im.show()
-        im.save(f'{folder}/viz_simple_predict_trajectory_num_actual_{num_actual}_num_predict_{num_predict}.png')
+        im_name = f'{folder}/viz_simple_predict_trajectory_num_actual_{num_actual}_num_predict_{num_predict}_delay_{delay}.png'
+        im.save(im_name)
+        print('Saved', im_name)
 
     def save_predicted_trajectories(self, batch_idx):
         os.makedirs(f'{ROOT_DIR}/images/viz_traj', exist_ok=True)
@@ -874,7 +979,7 @@ class LearnMax(pl.LightningModule):
         traj_len = len(self.predicted_trajectory_buffer)
         for i, traj in enumerate(self.predicted_trajectory_buffer):
             # Write JSON with trajectories
-            state = self.buffer[-traj_len+i].state
+            state = self.train_buf.get(-traj_len + i).state
             if traj is None:
                 log.debug('No predicted trajectory on death')
                 continue
@@ -886,7 +991,7 @@ class LearnMax(pl.LightningModule):
             traj = {k: v.cpu().numpy().tolist() for (k, v) in traj.items()}
             str_i = str(i).zfill(9)
             json.dump(traj, open(f'{folder}/traj_{str_i}.json', 'w'))
-            save_state_to_image(state.state, folder, i)  # TODO: We save this for movie too, reuse?
+            get_image_from_state(state.state, folder, i)  # TODO: We save this for movie too, reuse data?
             # im.show()
 
     def _train_step_dvq(self, batch, batch_idx):
@@ -985,12 +1090,13 @@ class LearnMax(pl.LightningModule):
 
     @staticmethod
     def add_model_specific_args(arg_parser: argparse.ArgumentParser, ) -> argparse.ArgumentParser:
-        arg_parser.add_argument("--dvq_quantize_proj", type=int, default=None)
+        arg_parser.add_argument("--dvq_quantize_proj", type=int, default=10)
         arg_parser.add_argument("--num_gpus", type=int, default=1)
         arg_parser.add_argument("--single_token2", action='store_true', default=True)
         arg_parser.add_argument('--num_workers', type=int, default=None, help="number of workers for dataloading")
         arg_parser.add_argument('--viz_dvq', action='store_true', help="visualize dvq images", default=False)
         arg_parser.add_argument('--viz_all_dvq_clusters', action='store_true', help="visualize all dvq clusters", default=False)
+        arg_parser.add_argument('--viz_dvq_clusters_knn', action='store_true', help="visualize dvq clusters knn", default=False)
         arg_parser.add_argument('--viz_predict_trajectory', action='store_true', help="visualize all dvq clusters", default=False)
         arg_parser.add_argument('--dvq_checkpoint', type=str, help="DVQ checkpoint to restore", default=None)
         arg_parser.add_argument('--checkpoint', type=str, help="Full (DVQ+GPT) checkpoint to restore", default=None)
@@ -998,6 +1104,7 @@ class LearnMax(pl.LightningModule):
         arg_parser.add_argument('--gpt_learning_rate', type=float, help="GPT batch size", default=6e-4)
         arg_parser.add_argument('--gpt_batch_size', type=int, help="GPT batch size", default=8)
         arg_parser.add_argument('--gpt_block_size', type=int, help="block size for the model (length of window of context)", default=40)
+        arg_parser.add_argument('--actions_per_batch', type=int, help="avoids overfitting with more data generated between updates", default=10)
         return arg_parser
 
     @staticmethod
@@ -1155,23 +1262,40 @@ class LearnMax(pl.LightningModule):
         we have a harder time learning new languages.
 
         ----------------------
-        Design
+        ## Saliency level design
 
         There should be context tokens: (previous salient), goal (next salient) state, and saliency level embedding
         added to each input token to the transformer. Also try splitting these across heads instead of adding so
         that we can pass zeroes to them when we don't have context and reuse the learning that takes place without
-        context. We may also be able to reuse context when adding the tokens, but this (perhaps?) takes more network
-        power even so.
+        context.
 
         The salient states are just dvq outputs, i.e. z states at each saliency level, which allows the same transformer to be
         reused for each saliency level. The difference is that, the context token will dictate skipping lower level states
-        directly to the next salient state at that level.
+        directly to the next salient state at that level. The distance between salient states is variable, e.g.
+        "first i'll climb this mountain (for 1 hour), then I'll take a picture (2 minutes), and eat lunch (20 minutes)."
 
-        We need to stop adding levels when we run out of memory.
+        We need to stop adding levels when we run out of memory. cf visual cortex levels => prefrontal cortex
 
         I think we'll have to pass zeroes in for the next salient when we are starting out (or just don't add it).
         We only know the goal state when we've searched for the most interesting path and we know the next salient
         state on the way at the current level.
+
+        We need to know when a goal state is no longer likely due to unpredicted changes in lower level action-states.
+        Two ways we can do this are 1) predict time-to-salient as a GPT output and/or 2) use lower level context tokens
+        as well. The problem with 2) is that we need to maintain a stable prediction with all possible low level
+        states as context which seems like it would greatly reduce sample efficiency.
+
+        A solution to this is for the higher and lower level context tokens should be special input tokens added to the
+        front of the window, rather than summing them with the current tokens like position, action, etc... This as
+        it allows all heads to see it without prior connections to other token positions needing to change when the
+        context changes / is learned. Initially zeros should be passed for context when salient states have not yet
+        been learned. Then as salient levels are formed, the context token can just be the logits (output) of the
+        transformer above / below the current level. This allows all tokens in the window adjacent to a level to
+        inform its predictions. We still need a goal salient state, which we are pursuing for entropy, and this goal
+        could be summed with the logits or provided as a separate equally sized token. However, once the goal salient
+        state is no longer the most likely next state, we need to rerun tree search at that level. We may still also need
+        to output a max number of low level states we expect to see before a given next state, after which the state
+        should no longer be considered a valid goal state. Hopefully the low level context confers this though.
 
         Compression (does not apply to possibility-based saliency):
             If the next salient state is reached and it's no longer surprising, i.e. it's by far the most probable state
@@ -1181,6 +1305,9 @@ class LearnMax(pl.LightningModule):
             encountered at the lower level seems too complicated, so we can just avoid compression for now.
             **We do however need to keep track of when the goal state is reached and advance the saliency levels
               above when this happens**
+
+
+        ## Tree search (batches are branches)
 
         So we're going to have batches which represent search paths, and each iteration we'll be adding
         more search paths branching from the previous.
@@ -1226,10 +1353,20 @@ class LearnMax(pl.LightningModule):
             4-5 states, so long as the post-softmax entropy is adequetely low (i.e. we are confident in the states
             we can reach).
 
+        TODO:
+            Since high level novelty takes longer to reduce and high level states change less frequently,
+            we can run tree search at intermediate/lower levels as they change. Then so long as we don't
+            encounter low level novelty, we can continue pursuing high level novelty. But when we do encounter
+            low level novelty, we should immediately sample that and learn from it. See get_recent_experience()
+            Anytime a saliency level is trained, we should rerun tree search on that level to see if there's
+            potential learning there that would lead us to change our plan. Such changes to intermediate level
+            goals doesn't necessarily mean our high level goals need to change, but we'll need some way of knowing
+            whether we are off-track wrt our high level goals by realizing goal states are no longer high probability
+            outcomes of the current context - at which point we will need to replan up through all saliency levels.
         """
 
         beam_width = self.beam_width
-        num_levels = self.num_search_levels
+        num_steps = self.num_search_steps
         # TODO:
         #   - If search finds termination, trim from tree. But what if all branches terminate - should not be possible
         #       really need to confirm though.
@@ -1249,15 +1386,15 @@ class LearnMax(pl.LightningModule):
 
         assert z_q_embed_branches.size()[0] == 1, 'We should only start with one trunk'
         action_entropy_path = None  # Declare for output
-        num_levels -= 1  # first level already populated
-        for lvl in range(num_levels):
-            should_log_wandb = (lvl == num_levels - 1) and self.global_step % WANDB_LOG_PERIOD == 0
+        num_steps -= 1  # first step already populated
+        for step in range(num_steps):
+            should_log_wandb = (step == num_steps - 1) and self.global_step % WANDB_LOG_PERIOD == 0
 
             # Forward predict one step in the search tree
-            as_ind = self.gpt.s_i_to_as_i(z_q_ind_branches, action_branches)  # action, state => action_state
+            # as_ind = self.gpt.s_i_to_as_i(z_q_ind_branches, action_branches)  # action, state => action_state
             logits, expected_deviation = self.gpt.forward(
                 embed=z_q_embed_branches[:, -self.gpt_block_size:],
-                action_state_idx=as_ind[:, -self.gpt_block_size:],
+                idx=z_q_ind_branches[:, -self.gpt_block_size:],
                 # No need to shift actions as we use new_state from buffer, also see: sa2as()
                 actions=action_branches[:, -self.gpt_block_size:]
             )
@@ -1298,7 +1435,7 @@ class LearnMax(pl.LightningModule):
             # Broadcast to all actions - B => B, A
             entropy_total = entropy_total.unsqueeze(1)
             B, A = entropy_total.size()[0], entropy.size()[-1]
-            assert (B == 1 and lvl == 0) or B == beam_width, 'Unexpected num branches'
+            assert (B == 1 and step == 0) or B == beam_width, 'Unexpected num branches'
             assert A == self.num_actions, 'Unexpected action dim size'
             entropy_total = entropy_total * torch.ones((B, A), device=self.device)
 
@@ -1350,8 +1487,8 @@ class LearnMax(pl.LightningModule):
         most_interesting_i = torch.argmax(action_entropy_path)
         predicted_traj = {
             # Return current and future trajectory without past
-            'action': action_branches[most_interesting_i][-num_levels-1:],  # -1 to include most recent step
-            'z_q_ind': z_q_ind_branches[most_interesting_i][-num_levels-1:],  # -1 to include most recent step
+            'action': action_branches[most_interesting_i][-num_steps-1:],  # -1 to include most recent step
+            'z_q_ind': z_q_ind_branches[most_interesting_i][-num_steps-1:],  # -1 to include most recent step
             'entropy': entropy_branches[most_interesting_i],
         }
 
@@ -1359,23 +1496,43 @@ class LearnMax(pl.LightningModule):
         next_action = action_branches[most_interesting_i][look_back+1]
         return [int(next_action)], predicted_traj
 
-    def get_recent_experience(self):
-        """Return recent embeddings, embedding indexes, and actions in action-state order"""
+    def get_recent_experience(self, delay=0, max_size=None):
+        """
+        Return recent embeddings, embedding indexes, and actions in action-state order. May not return a full
+        window if agent was recently born. (language: using "born" is better than "spawned" for promoting thinking
+        more about algorithmic alignment with humans)
+
+        delay (int): Number of frames to shift window left, leaving out most recent
+        """
+        # TODO: Allow sampling replay buffer based on reconstruction error for dvq or prediction error for
+        #   GPT to emphasize learning surprising/novel events. We should mark such experiences for immediate
+        #   inclusion into the next batch as well.
+        #   Alternatively we could just keep these experiences for longer so they are sampled more throughout training.
+        #   We learn more from such experiences by default due to high error, however, sample efficiency may be improved
+        #   even more through sampling.
+
         z_q_embed_branches = []
         z_q_ind_branches = []
         action_branches = []
-        look_back = min(len(self.buffer), self.gpt_block_size)
+        max_size = max_size or self.gpt_block_size
+        recent_exp = self.buffers.recent_experience
+        look_back = min(len(recent_exp), max_size)
         just_died = False
-        buffer = self.buffer
+        all_branches = [z_q_embed_branches, z_q_ind_branches, action_branches]
         # Populate gpt window with recent experience
         for i in reversed(range(look_back)):
-            exp = buffer[-(i + 1)]
-            if exp.done is True:
-                # Don't sample across resets - important for valuing life, AGI safety
-                z_q_embed_branches.clear()
-                z_q_ind_branches.clear()
-                action_branches.clear()
+            b_i = -i - 1 - delay
+            if -b_i > len(recent_exp):
+                # delay caused us to look back before beginning of buffer
                 look_back = i
+                continue
+            exp = recent_exp[b_i]
+            if exp.done is True:
+                # Don't sample across resets - important for valuing life, algorithmic alignment, AGI safety
+                look_back = i
+                # Void beginning of branches before death
+                [b.clear() for b in all_branches]
+                continue
             else:
                 # Use new state as our tokens are action-states, i.e. the agent took an action and ended up in state
                 z_q_embed_branches.append(exp.new_state.dvq_z_q_flat)
@@ -1383,11 +1540,14 @@ class LearnMax(pl.LightningModule):
                 action_branches.append(exp.action)
         if look_back == 0:
             just_died = True
-
-        # Unsqueeze so we have batch, window, embed dims, where batch=1, e.g. 1, 80, 4410
-        z_q_embed_branches = torch.cat(z_q_embed_branches).unsqueeze(0)
-        z_q_ind_branches = torch.cat(z_q_ind_branches).unsqueeze(0)
-        action_branches = torch.tensor(action_branches).unsqueeze(0).to(self.device)
+            z_q_embed_branches = None
+            z_q_ind_branches = None
+            action_branches = None
+        else:
+            # Unsqueeze so we have batch, window, embed dims, where batch=1, e.g. 1, 80, 4410
+            z_q_embed_branches = torch.cat(z_q_embed_branches).unsqueeze(0)
+            z_q_ind_branches = torch.cat(z_q_ind_branches).unsqueeze(0)
+            action_branches = torch.tensor(action_branches).unsqueeze(0).to(self.device)
         return action_branches, just_died, look_back, z_q_embed_branches, z_q_ind_branches
 
     def log_p_a_given_rs(self, logits):
@@ -1474,24 +1634,36 @@ def cli_main():
     del learn_max_args['num_gpus']  # This is for trainer later
     del learn_max_args['viz_dvq']  # Not for model
     del learn_max_args['viz_all_dvq_clusters']  # Not for model
-    if learn_max_args['viz_predict_trajectory']:
+    del learn_max_args['viz_dvq_clusters_knn']  # Not for model
+    del learn_max_args['checkpoint']  # Not a model property
+    if 'viz_predict_trajectory' in learn_max_args:
         learn_max_args['should_viz_predict_trajectory'] = learn_max_args['viz_predict_trajectory']
         del learn_max_args['viz_predict_trajectory']  # Changed the name for class
-    model = LearnMax(**learn_max_args)
+
     if args.checkpoint:
         assert not args.dvq_checkpoint, ('dvq_checkpoint and checkpoint are mutually exclusive, ' +
                                          'set dvq_checkpoint if you want to train gpt from scratch')
-        load_pretrained_dvq_and_gpt(args, model)
+        # model = LearnMax.load_from_checkpoint(args.checkpoint)
+        model = LearnMax.load_from_checkpoint(args.checkpoint, **learn_max_args)
+        # load_pretrained_dvq_and_gpt(args, model)
+    else:
+        model = LearnMax(**learn_max_args)
+
     if args.dvq_checkpoint:
+        assert not args.checkpoint, ('dvq_checkpoint and checkpoint are mutually exclusive, ' +
+                                     'set checkpoint if you want to load gpt and dvq')
         load_pretrained_dvq(args, model)
 
     if args.viz_dvq:
         return model.viz_dvq_standalone()
     elif args.viz_all_dvq_clusters:
         return model.viz_all_dvq_clusters_standalone()
+    elif args.viz_dvq_clusters_knn:
+        return model.viz_dvq_clusters_knn_standalone()
     else:
         delattr(args, 'viz_dvq')
         delattr(args, 'viz_all_dvq_clusters')
+        delattr(args, 'viz_dvq_clusters_knn')
 
     # common = {'batch_size': args.gpt_batch_size, 'pin_memory': bool(args.pin_memory), 'num_workers': args.num_workers}
     # trainer args  # TODO: Check that our defaults above are preserved for overlapping things like pin-memory
@@ -1657,11 +1829,12 @@ def get_default_embeddings(is_single_token2=False):
     return default_num_embeddings, default_embedding_dim
 
 
-def save_state_to_image(state, folder, i):
+def get_image_from_state(state, folder, i, should_save=True):
     state = state.squeeze(0).permute(1, 2, 0).cpu()
     im = Image.fromarray(np.uint8(state * 255))
-    filename = f'{folder}/{str(i).zfill(9)}.png'
-    im.save(filename)
+    if should_save:
+        filename = f'{folder}/{str(i).zfill(9)}.png'
+        im.save(filename)
     return im
 
 

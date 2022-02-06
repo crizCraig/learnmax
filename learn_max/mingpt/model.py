@@ -103,7 +103,8 @@ class GPT(nn.Module):
 
     def __init__(self,
                  # model definition args
-                 vocab_size: int,  # size of the vocabulary (number of possible tokens)
+                 output_size: int,  # size of the output vocabulary
+                 num_input_embeddings: int,  # number of possible input tokens
                  block_size: int,  # length of the model's context window in time
                  n_layer: int,  # depth of the model; number of Transformer blocks in sequence
                  input_embedding_dim: int,  # the "width" of the input to the model
@@ -120,7 +121,7 @@ class GPT(nn.Module):
                  num_actions: int = 0,  # number of actions to use for action embedding
                  ):
         super().__init__()
-        self.vocab_size = vocab_size
+        self.output_size = output_size
 
         # save these for optimizer init later
         self.learning_rate = learning_rate
@@ -134,7 +135,7 @@ class GPT(nn.Module):
         embedding_dim = input_embedding_dim  # + action_embedding_dim
         # self.dvq_proj = nn.Linear(input_embedding_dim, embedding_dim)
         assert embedding_dim % n_head == 0, 'Embedding not evenly divisible by number of heads'
-        self.tok_emb = nn.Embedding(vocab_size, input_embedding_dim)
+        self.tok_emb = nn.Embedding(num_input_embeddings, input_embedding_dim)  # This should be num of z_q_emb,
         self.pos_emb = nn.Parameter(torch.zeros(1, block_size, embedding_dim))
         self.act_emb = nn.Embedding(num_actions, input_embedding_dim)
 
@@ -145,15 +146,15 @@ class GPT(nn.Module):
 
         # decoder: at the end one more layernorm and decode the answers
         self.ln_f = nn.LayerNorm(out_embedding_dim)
-        self.logit_p_head = nn.Linear(out_embedding_dim, vocab_size, bias=False) # no need for extra bias due to one in ln_f
+        self.logit_p_head = nn.Linear(out_embedding_dim, output_size, bias=False) # no need for extra bias due to one in ln_f
 
         # TODO: Remove or change to deviation over longer timescale - we want to know how the entropy of the
         #   probs changes over time so that, in the case of an aleotoric process like a slot machine, we see that
         #   while there may be patterns in recent data, the system over long stretches is random. The deviation head
         #   just predicts instantaneous changes to probability and so does not do this.
-        self.deviation_head = nn.Linear(out_embedding_dim, vocab_size, bias=False)   # mean deviation
+        self.deviation_head = nn.Linear(out_embedding_dim, output_size, bias=False)   # mean deviation
 
-        self.target_idx = torch.arange(vocab_size)
+        self.target_idx = torch.arange(output_size)
 
         self.block_size = block_size
         self.apply(self._init_weights)
@@ -270,7 +271,7 @@ class GPT(nn.Module):
             print('trajectories: ', len(self.trajectory_counts))
             print('max_trajectory_count: ', self.max_trajectory_count)
 
-    def forward(self, embed, action_state_idx, actions):
+    def forward(self, embed, idx, actions):
         # if self.should_input_embed:
         #     b, t, embed = idx_or_embed.size()
         # else:
@@ -280,7 +281,7 @@ class GPT(nn.Module):
         assert t <= self.block_size, "Cannot forward, model block size is exhausted."
 
         # forward the GPT model
-        token_embed = self.tok_emb(action_state_idx)  # each index maps to a (learnable) vector
+        token_embed = self.tok_emb(idx)  # each input token index maps to a (learnable) vector
         position_embed = self.pos_emb[:, :t, :]  # each position maps to a (learnable) vector
         action_embed = self.act_emb(actions)  # each action maps to a (learnable) vector
         # token_embed = torch.cat((token_embed, action_embeddings), dim=2)
@@ -314,12 +315,12 @@ class GPT(nn.Module):
             assert embed.size()[1] == self.block_size, \
                 'Not filling block size in train will result in untrained latter positions.'
 
-        target_idx = self.s_i_to_as_i(next_idx, a)
+        target_idx = self.s_i_to_as_i(next_idx, a_next)
         logits, expected_deviation = self.forward(embed, idx, a)
 
         # Calculate mean deviation loss for uncertainty ----------------------
         # Turn targets into one hot B x block_size x vocab_size with 1 in vocab
-        one_hot = F.one_hot(target_idx, num_classes=self.vocab_size).squeeze()
+        one_hot = F.one_hot(target_idx, num_classes=self.output_size).squeeze()
         probs = F.softmax(logits, dim=-1)
 
         entropy = -torch.sum(probs * torch.log(probs), dim=-1)  # Entropy across action-states
@@ -328,7 +329,7 @@ class GPT(nn.Module):
 
         acc = self.accuracy(logits, target_idx)
         if batch_idx % ACC_LOG_PERIOD == 0:
-            print('Top x prediction accuracy ', acc)
+            print('Top x prediction accuracy', acc)
         p_diff = (one_hot - probs).abs()  # actual deviation
         d_diff = p_diff - expected_deviation
         d_loss = d_diff.square().sum() / d_diff.numel()
@@ -393,7 +394,7 @@ class GPT(nn.Module):
 
         # TODO: State based accuracy (currently action-state)
 
-        top_acc_lvls = (self.vocab_size // 10, self.vocab_size // 100, 3, 1, self.num_actions)
+        top_acc_lvls = (self.output_size // 10, self.output_size // 100, 3, 1, self.num_actions)
 
         # rearrange combines batch and window dimensions into batch dimension
         acc = accuracy(logits=rearrange(logits, 'd0 d1 d2 -> (d0 d1) d2'),

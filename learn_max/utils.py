@@ -241,7 +241,10 @@ def get_batch_vars(batch, use_next=False, return_agent_state=False, populate_gpt
         # print(f'{dvq_loss=}')
         # print(f'dvq_loss_avg={sum([a["dvq_loss"].mean() for a in agent_state]) / len(agent_state)}')
         a_x, a_y, gpt_x, z_q_ind_x, z_q_ind_y = sa2as(z_q_flat, z_q_ind, a)
-        return gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y, s
+        ret = [gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y, s]
+        if return_agent_state:
+            ret.append(agent_state)
+        return ret
         # idx_or_embed = idx_or_embed.view(int(idx_or_embed.shape[0] / self.block_size) - 1, self.block_size,
         #                                  idx_or_embed.shape[1])
 

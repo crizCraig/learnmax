@@ -108,7 +108,7 @@ def get_frame(cluster_img_paths, frame_paths, traj_paths, horz_scroll_index):
             _traj_i = int(traj_img_path.split('/')[-1].split('.')[0])
             assert _traj_i == z_q_ind
             traj_img = get_np_surface(traj_img_path, IMG_SCALING)
-            txt_img = get_np_txt(traj_img)
+            txt_img = get_np_txt_caption(traj_img)
             traj_imgs.append(traj_img)
             # traj_imgs.append(np.concatenate((traj_img, txt_img), axis=1))
 
@@ -126,14 +126,29 @@ def get_frame(cluster_img_paths, frame_paths, traj_paths, horz_scroll_index):
     return win_frame_img
 
 
-def get_np_txt(traj_img):
+def get_action_text(env, action_num):
+    return env.unwrapped._action_set[action_num].name
+
+def get_np_txt_caption(traj_img, text):
     image = Image.new('RGBA', (traj_img.shape[0] * 4, traj_img.shape[0]), (255, 255, 255))
     draw = ImageDraw.Draw(image)
     # Search for your system's own truetype font if this doesn't work, sorry!
     font = ImageFont.truetype(font='/usr/share/fonts/truetype/ubuntu/Ubuntu-M.ttf', size=120)
-    draw.text((10, 0), "yoyoyo", (0, 0, 0), font=font)
+    draw.text((10, 0), text, (0, 0, 0), font=font)
     img_resized = image.resize((traj_img.shape[0], traj_img.shape[0] // 4), Image.ANTIALIAS)
-    np_txt = np.array(img_resized)[:, :, :3].transpose(1, 0, 2)
+    np_txt = np.array(img_resized)[:, :, :3].transpose(1, 0, 2).T
+    return np_txt
+
+
+def get_np_txt_caption2(traj_img, text, size=70):
+    from PIL import Image, ImageDraw, ImageFont
+    image = Image.new('RGBA', (traj_img.shape[0] * 4, traj_img.shape[0]), (50, 50, 50))
+    draw = ImageDraw.Draw(image)
+    # Search for your system's own truetype font if this doesn't work, sorry!
+    font = ImageFont.truetype(font='/usr/share/fonts/truetype/ubuntu/Ubuntu-M.ttf', size=size)
+    draw.text((10, 0), text, (200, 200, 200), font=font)
+    img_resized = image.resize((traj_img.shape[0], traj_img.shape[0] // 5), Image.ANTIALIAS)
+    np_txt = np.array(img_resized)[:, :, :3].transpose(0, 1, 2)
     return np_txt
 
 
