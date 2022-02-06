@@ -1,5 +1,6 @@
 import os
 from datetime import datetime
+from functools import wraps
 from typing import List
 
 import torch
@@ -73,7 +74,9 @@ def topk_interesting(entropy, k, rand_half=False):
 
     action_i = torch.stack((action_bi, action_ai)).T  # combine/zip up batch and action indexes
 
-    # TODO: We want to pick random values from the top half / perhaps normally distributed towards the middle
+    # TODO: We perhaps want to re-weight entropy so that p75 is max interestingness as interestingness is not necessarily
+    #   maximum entropy, but some tradeoff between novelty and predictability so that new information can be
+    #   efficiently integrated with the current model (forming a natural curriculum),
     #   and with some option to anneal towards middle over time if the model capacity is reached in order
     #   to reduce forgetting. Also, this can be "fooled" into aleatoric traps like slot machines as they
     #   will always have high entropy. 
@@ -347,6 +350,22 @@ def accuracy(logits: torch.Tensor, target: torch.Tensor, topk=(1,)) -> List[torc
             topk_acc = tot_correct_topk / batch_size  # topk accuracy for entire batch
             list_topk_accs.append(topk_acc)
         return list_topk_accs  # list of topk accuracies for entire batch [topk1, topk2, ... etc]
+
+
+def no_train(f):
+    """
+    Decorator for model ops that don't require grads and should be done in eval mode for things like Dropout
+    """
+    @wraps(f)
+    def wrapper(self, *args, **kwds):
+        with torch.no_grad():
+            was_training = self.training
+            self.eval()
+            ret = f(self, *args, **kwds)
+            if was_training:
+                self.train()
+        return ret
+    return wrapper
 
 
 if __name__ == '__main__':

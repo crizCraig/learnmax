@@ -18,6 +18,7 @@ from einops import rearrange
 from loguru import logger as log
 from torch.nn import functional as F
 
+from learn_max.constants import ACC_LOG_PERIOD
 from learn_max.utils import accuracy, wandb_try_log
 
 
@@ -269,7 +270,7 @@ class GPT(nn.Module):
             print('trajectories: ', len(self.trajectory_counts))
             print('max_trajectory_count: ', self.max_trajectory_count)
 
-    def forward(self, embed, idx, actions):
+    def forward(self, embed, action_state_idx, actions):
         # if self.should_input_embed:
         #     b, t, embed = idx_or_embed.size()
         # else:
@@ -279,7 +280,7 @@ class GPT(nn.Module):
         assert t <= self.block_size, "Cannot forward, model block size is exhausted."
 
         # forward the GPT model
-        token_embed = self.tok_emb(idx)  # each index maps to a (learnable) vector
+        token_embed = self.tok_emb(action_state_idx)  # each index maps to a (learnable) vector
         position_embed = self.pos_emb[:, :t, :]  # each position maps to a (learnable) vector
         action_embed = self.act_emb(actions)  # each action maps to a (learnable) vector
         # token_embed = torch.cat((token_embed, action_embeddings), dim=2)
@@ -325,7 +326,9 @@ class GPT(nn.Module):
         wandb_try_log({'entropy/action-state': entropy.mean()}, self.global_step)
         wandb_try_log({'probs_std': probs.std()}, self.global_step)
 
-        self.accuracy(logits, target_idx)
+        acc = self.accuracy(logits, target_idx)
+        if batch_idx % ACC_LOG_PERIOD == 0:
+            print('Top x prediction accuracy ', acc)
         p_diff = (one_hot - probs).abs()  # actual deviation
         d_diff = p_diff - expected_deviation
         d_loss = d_diff.square().sum() / d_diff.numel()
@@ -340,7 +343,7 @@ class GPT(nn.Module):
 
     def s_i_to_as_i(self, state_idx, actions):
         """
-        Expand state indexes into action-state indexes
+        Expand state indexes into action-state indexes with dimension ordering S,A
         ----------------------------------------------
         Say we have a sequence of target state ints like
 
@@ -375,9 +378,16 @@ class GPT(nn.Module):
     def as_i_to_s_i(self, action_state_idx):
         """
         Action-state index to state index
-        inverse of get_action_state_idx_from_state_idx
+        States are higher order dimension with all actions for each state stored sequentially
         """
         return action_state_idx // self.num_actions
+
+    def split_as_i(self, action_state_idx):
+        """
+        Like as_i_to_s_i, but returns the action and state (z_q) index
+        """
+        z_q_ind, action_i = divmod(action_state_idx, self.num_actions)
+        return action_i, z_q_ind
 
     def accuracy(self, logits, target_idx):
 
@@ -391,6 +401,7 @@ class GPT(nn.Module):
                        topk=top_acc_lvls)
         for lvl_i, lvl in enumerate(top_acc_lvls):
             wandb_try_log({f'train/acc/top{lvl}': acc[lvl_i]}, self.global_step)
+        return sorted(list(zip(top_acc_lvls, (float(x) for x in acc))))
 
     def training_step(self, *args, **kwargs):
         return self.step_('train', *args, **kwargs)

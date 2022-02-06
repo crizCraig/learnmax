@@ -2,3 +2,7 @@
 __pycache__/
 .lightning/
 learn_max/wandb/
+images/
+ROMS/
+HC ROMS/
+learn_max/learnmax-learn_max/

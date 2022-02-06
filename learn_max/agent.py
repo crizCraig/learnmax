@@ -29,7 +29,7 @@ class LearnMaxAgent:
         This object conforms with pytorch lightning bolts conventions on agents in RL setups.
         It's really just a dynamics function right now which maps from external states to internal states and actions.
     """
-
+    # TODO: Move this all to model.py and delete the agent class.
     def __init__(self, model,
                  num_actions: int,  # Number of discrete actions available
                  num_environments: int = 1,
@@ -37,12 +37,11 @@ class LearnMaxAgent:
                  ):
         self.model = model
         self.num_actions = num_actions
-        self.num_search_steps = num_search_steps
-        self.s_buff = deque(maxlen=model.gpt_block_size)  # History of states
-        self.a_buff = deque(maxlen=model.gpt_block_size)  # History of actions
+        # self.s_buff = deque(maxlen=model.gpt_block_size)  # History of states
+        # self.a_buff = deque(maxlen=model.gpt_block_size)  # History of actions
         # Start with noop:
         #  https://github.com/mgbellemare/Arcade-Learning-Environment/blob/master/docs/manual/manual.pdf
-        self.a_buff.append([0] * num_environments)
+        # self.a_buff.append([0] * num_environments)
 
         self.num_environments = num_environments
 
@@ -78,7 +77,8 @@ class LearnMaxAgent:
         # - DVQ reconstruction loss - if the image hasn't been seen before, we will do a really bad job at reconstructing,
         #   esp. if it's a new level in zuma for example
         dvq_x = agent_state.dvq_x
-        if not self.model.training_gpt:
+        if not self.model.should_train_gpt:
+            raise NotImplementedError('Need to revive this code')
             # TODO: We have already forwarded these through the model, so there's no reason to re-forward. We just
             #   need to compute the average loss and run the manual backward.
             # TODO: Move self.dvq_ready setting to LearnMax model
@@ -94,7 +94,12 @@ class LearnMaxAgent:
             ret, predicted_trajectory = self.get_random_action(len(dvq_x)), None
         else:
             # Search through tree of predicted a,z to find most interesting future
+            # TODO: Use @no_train for below when moving to LearnMax
+            was_training = self.model.training
+            self.model.eval()
             ret, predicted_trajectory = self.model.tree_search()
+            if was_training:
+                self.model.train()
 
         # # get the logits and pass through softmax for probability distribution
         # probabilities = F.softmax(self.net(states)).squeeze(dim=-1)
@@ -104,7 +109,7 @@ class LearnMaxAgent:
         # actions = [np.random.choice(len(prob), p=prob) for prob in prob_np]
 
         # return actions
-        self.a_buff.append(ret)
+        # self.a_buff.append(ret)
 
         return ret, predicted_trajectory
 

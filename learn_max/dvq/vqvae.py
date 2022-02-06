@@ -107,19 +107,21 @@ class VQVAE(dvq_module):
     def decode(self, z_q_emb):
         return self.decoder(z_q_emb)
 
-    def decode_flat(self, z_q_emb, output_proj):
-        in_dims = z_q_emb.size()
-        # (1, 21, 21, 10)
+    def decode_flat(self, z_q_emb_flat, output_proj):
+        """
+        Takes flat embedding and decodes it into an image
+        """
+        in_dims = z_q_emb_flat.size()  # e.g. (1, 21, 21, 10)
 
         width = int(np.sqrt(in_dims[-1] // output_proj))
-        z_q_emb = z_q_emb.reshape((np.prod(in_dims[:-1]), width, width, output_proj))
+        z_q_emb_flat = z_q_emb_flat.reshape((np.prod(in_dims[:-1]), width, width, output_proj))
 
-        s = len(z_q_emb.size())
-        z_q_emb = z_q_emb.permute(*list(range(s-3)), s-1, s-3, s-2)
+        s = len(z_q_emb_flat.size())
+        z_q_emb_flat = z_q_emb_flat.permute(*list(range(s - 3)), s - 1, s - 3, s - 2)
         # P = self.quantizer.output_proj
         # W = int(np.sqrt(in_dims[-1]/P))
         # z_q_emb = z_q_emb.reshape(-1, P, W, W)
-        decoded = self.decode(z_q_emb)
+        decoded = self.decode(z_q_emb_flat)
 
         # Match high order input dims before image dims
         out_dims = in_dims[:-1] + decoded.size()[-3:]

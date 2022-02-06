@@ -36,7 +36,7 @@ from learn_max import dvq
 from learn_max.agent import LearnMaxAgent, AgentState
 from learn_max.dvq.model.deepmind_enc_dec import ResBlock
 from learn_max.utils import topk_interesting, _init_weights, get_batch_vars, get_date_str, get_action_states, \
-    wandb_try_log
+    wandb_try_log, no_train
 from learn_max.constants import SAVE_DIR, SEED, DEBUGGING, DATE_STR, ROOT_DIR, RUN_ID, WANDB_LOG_PERIOD
 from learn_max.dvq.vqvae import VQVAE, DecayLR, DecayTemperature, RampBeta
 from learn_max.mingpt.lr_decay import GptWarmupCosineLearningRateDecay
@@ -46,13 +46,14 @@ from learn_max.mingpt.model import GPT
 class LearnMax(pl.LightningModule):
     def __init__(
             self,
-            # dvq_embedding_dim: int = 4410,  # length of embedding vectors output by dvq to transformers
+            checkpoint: str = None,  # Model checkpoint
 
             embedding_dim: int = None,
             num_embeddings: int = None,  # Number of possible discrete states shared between dvq and gpt
 
             # dvq args - dvq = deep vector quantization
             dvq_n_hid: int = 64,  # number of channels controlling the size of the model
+            # dvq_embedding_dim: int = 4410,  # now embedding_dim but may separate from GPT embedding dim) length of embedding vectors output by dvq to transformers
             # dvq_num_embeddings: int = 512,   # now num_embeddings,  vocabulary size; number of possible discrete states
             dvq_loss_flavor: str = 'l2',  # `l2` or `logit_laplace`
             dvq_input_channels: int = 3,  # 3 for RGB
@@ -76,8 +77,8 @@ class LearnMax(pl.LightningModule):
             gpt_batch_size: int = 16,  # with such large embeddings (4410) needs to be small now to fit on rtx 2080
 
             # mingpt model optimization args
-            training_gpt: bool = None,  # whether to train gpt
-            gpt_learning_rate: float = 3e-4,  # the base learning rate of the model
+            should_train_gpt: bool = False,  # whether to train gpt
+            gpt_learning_rate: float = 3e-4,  # the base learning rate of the model (overwritten by GptWarmupCosineLearningRateDecay)
             gpt_weight_decay: float = 0.1,  # amount of regularizing L2 weight decay on MatMul ops
             gpt_betas: Tuple[float, float] = (0.9, 0.95),  # momentum terms (betas) for the Adam optimizer
             gpt_embd_pdrop: float = 0.1,  # \in [0,1]: amount of dropout on input embeddings
@@ -103,13 +104,19 @@ class LearnMax(pl.LightningModule):
             warm_start_size: int = 10_000,  # how many samples do we use to fill our buffer at the start of training
             batches_per_epoch: int = 10_000,  # number of batches per pseudo (RL) epoch
 
+            # Tree search
+            beam_width: int = 4,  # How many trajectories to predict in tree search
+            num_search_levels: int = 10,  # How many steps to predict out in each trajectory
+
             # Standard stuff
             num_workers: int = 0,  # data loader workers - pycharm has issues debugging these. also gen batch requires NN for action so can't use > 0 at runtime either yet
             data_dir: str = SAVE_DIR,  # place to save tfboard logs and checkpoints
             batch_size: int = 32,  # do we have a batch size? or are gpt and dvq batch sizes adequate?
             # checkpoint: str = None, # Checkpoint to restore from
 
-            single_token2: bool = False,
+            single_token2: bool = True,
+
+            should_viz_predict_trajectory: bool = False,
     ):
         """
         Maximizing learning by predicting interesting actions
@@ -149,10 +156,10 @@ class LearnMax(pl.LightningModule):
         self.dvq_vq_flavor = dvq_vq_flavor
         self.dvq_checkpoint = dvq_checkpoint
         self.dvq_ready = False  #  Whether the dvq has enough data to train a batch
-        if training_gpt is None:
-            self.training_gpt = True if self.dvq_checkpoint is not None else False
-        else:
-            self.training_gpt = training_gpt
+
+        if not should_train_gpt:
+            raise NotImplementedError('Revise dvq training or set should_train_gpt')
+        self.should_train_gpt = should_train_gpt
 
         # the "width" of the model (embedding_dim), number of channels in each Transformer
         self.gpt_input_embedding_dim = embedding_dim
@@ -180,7 +187,14 @@ class LearnMax(pl.LightningModule):
         self.num_workers = num_workers
         self.data_dir = data_dir
 
-        self.batch_size = gpt_batch_size if self.training_gpt else batch_size
+        self.beam_width = beam_width
+        self.num_search_levels = num_search_levels
+
+        # TODO: Set a separate DVQ batch size
+        self.batch_size = gpt_batch_size if self.should_train_gpt else batch_size
+
+        # Visualization
+        self.should_viz_predict_trajectory = should_viz_predict_trajectory
 
         self.total_steps = 0
         self.total_rewards = []
@@ -447,7 +461,7 @@ class LearnMax(pl.LightningModule):
             self.reset_after_death()
             episode_steps = 0
             episode_reward = 0
-        if self.training_gpt:
+        if self.should_train_gpt:
             # Sample sequentially from replay buffer
             # If training GPT, we need to return the dvq state indexes as well to be used in on_train_batch_end
             #   in lr_decay _, y = batch
@@ -519,8 +533,10 @@ class LearnMax(pl.LightningModule):
 
         # Sample 2 extra as we shift actions back 1 for action-states and targets forward 1 see sa2as()
         num_extra_win_indices = 2
-        start_range = len(self.buffer) - self.gpt_block_size + 1 - num_extra_win_indices
+        start_range = np.arange(len(self.buffer) - self.gpt_block_size + 1 - num_extra_win_indices)
         start_indices = np.random.choice(start_range, self.gpt_batch_size, replace=False)
+        if 'ALWAYS_SAMPLE_LATEST' in os.environ:
+            start_indices[0] = start_range[-1]
         ret_states = []
         ret_agent_states = []
         ret_actions = []
@@ -576,30 +592,44 @@ class LearnMax(pl.LightningModule):
         #   The target network was needed because the loss was dependent on it. Here it's the input that's dependent
         #   on the other network. We'll just have to see what works.
 
-        if self.training_gpt:
+        if self.should_train_gpt:
             self.dvq.set_do_kmeans(False)
             gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y, s = get_batch_vars(batch, return_agent_state=True, populate_gpt=True)
             # print('gptx', gpt_x[0][0])
             # Train gpt on dvq tokens shifted for prediction
 
+            if self.gpt_learning_rate == 0 or 'ZERO_LR' in os.environ:
+                # For testing that train step and visualize methods produce same output, basically disable dropout
+                self.eval()
             gpt_ret = self.gpt.training_step(batch=(gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y), batch_idx=batch_idx)
             self.gpt.global_step = self.global_step
 
+            # Visualization steps
+            if 'ZERO_LR' in os.environ:
+                test_logits, _ = self.gpt.forward(gpt_x, z_q_ind_x, a_x)
+                test_target = self.gpt.s_i_to_as_i(z_q_ind_y, a_x)
+                self.viz_gpt(test_logits, test_target, state=s, batch_idx=6969696)
+                self.viz_simple_predict_trajectory(gpt_x, z_q_ind_x, a_x, batch_idx)
+
+            if batch_idx % self.replay_size == 0:
+                # One action per batch, so there's replay_size new frames
+                self.viz_gpt(gpt_ret['logits'], gpt_ret['target_idx'], state=s, batch_idx=batch_idx)
+                self.viz_movie(batch_idx)
             if self.global_step == 0:
                 # TODO: Make sure to call again if we update clusters as visualizing predicted trajectories
                 #   uses the cluster images
                 self.viz_dvq_clusters(batch_idx)
-
-            if batch_idx % self.replay_size == 0:
-                # One action per batch, so there's replay_size new frames
-                self.viz_gpt(gpt_ret, state=s, batch_idx=batch_idx)
-                self.viz_movie(batch_idx)
-
+            if (
+                    self.should_viz_predict_trajectory and
+                    len(self.buffer) >= self.gpt_block_size and
+                    batch_idx % self.replay_size == 0
+            ):
+                self.viz_simple_predict_trajectory(gpt_x, z_q_ind_x, a_x, batch_idx)
             if (
                     ('DEBUG_TRAJ_BUFF' in os.environ or (batch_idx % self.replay_size == 0)) and
                     len(self.predicted_trajectory_buffer) == self.predicted_trajectory_buffer.maxlen
             ):
-                self.save_predicted_trajectories(batch_idx)
+                self.save_predicted_trajectories(batch_idx)  # View this with viz_predicted_trajectories.py
 
             # We use multiple optimizers so need to manually backward each one separately
             self.gpt_optimizer.zero_grad()
@@ -635,11 +665,13 @@ class LearnMax(pl.LightningModule):
         #     "avg_reward": self.avg_rewards,
         # })
 
+    @no_train
     def viz_dvq_clusters(self, batch_idx):
         self._viz_dvq_clusters(
             f'{ROOT_DIR}/images/viz_clusters/{get_date_str()}_r_{RUN_ID}_e_{self.current_epoch}_b_{batch_idx}'
         )
 
+    @no_train
     def viz_all_dvq_clusters_standalone(self):
         self.cuda()
         wandb.init(entity='crizcraig', mode='disabled')
@@ -677,6 +709,7 @@ class LearnMax(pl.LightningModule):
         # im.show()
         im.save(f'{ROOT_DIR}/images/all_dvq_clusters_{DATE_STR}.png')
 
+    @no_train
     def viz_dvq_standalone(self, num_cols=20):
         """
         Visualize num_cols images and their reconstructions
@@ -707,60 +740,59 @@ class LearnMax(pl.LightningModule):
 
         plt.show()
 
-    def viz_gpt(self, gpt_ret, state, batch_idx):
-        batches_to_visualize = 1
-        for b_i in range(batches_to_visualize):
-            num_imgs_to_viz = 10
-            top_n = 3
-            imgs = state[b_i][:num_imgs_to_viz]  # Check start of sequence
+    @no_train
+    def viz_gpt(self, logits, target_idx, state, batch_idx):
+        batch_index = -1  # Viz last batch to compare with simple predict trajectory
+        num_imgs_to_viz = 10
+        top_n = 3
+        imgs = state[batch_index][:num_imgs_to_viz]  # Check start of sequence
 
-            logits = gpt_ret['logits'].detach().cpu().numpy()[b_i][:num_imgs_to_viz]
+        logits = logits.detach().cpu().numpy()[batch_index][:num_imgs_to_viz]
 
-            # dvq states are action agnostic, so get base state by dividing by num_actions
-            target_idx = self.gpt.as_i_to_s_i(gpt_ret['target_idx'][b_i][:num_imgs_to_viz])
+        # dvq states are action agnostic, so get base state by dividing by num_actions
+        target_idx = self.gpt.as_i_to_s_i(target_idx[batch_index][:num_imgs_to_viz])
 
-            emb = self.dvq.quantizer.embed_code(target_idx)
-            imgs_target = self.dvq.decode_flat(emb, output_proj=self.dvq.quantizer.output_proj)
+        emb = self.dvq.quantizer.embed_code(target_idx)
+        imgs_target = self.dvq.decode_flat(emb, output_proj=self.dvq.quantizer.output_proj)
 
-            # top n predicted next embedding indexes for each img - TODO: Use torch.topk here which is already sorted
-            top_n_idxs = np.argpartition(logits, -top_n)[:, -top_n:]  # top n idxs unsorted
-            top_n_idxs_idxs_sorted = np.argsort(np.take_along_axis(-logits, top_n_idxs, axis=1))  # -logits => sort desc
-            top_n_idxs = np.take_along_axis(top_n_idxs, top_n_idxs_idxs_sorted, axis=1)  # top n idxs sorted desc
-            top_n_idxs = torch.Tensor(top_n_idxs).int()
+        # top n predicted next embedding indexes for each img - TODO: Use torch.topk here which is already sorted
+        top_n_idxs = np.argpartition(logits, -top_n)[:, -top_n:]  # top n idxs unsorted
+        top_n_idxs_idxs_sorted = np.argsort(np.take_along_axis(-logits, top_n_idxs, axis=1))  # -logits => sort desc
+        top_n_idxs = np.take_along_axis(top_n_idxs, top_n_idxs_idxs_sorted, axis=1)  # top n idxs sorted desc
+        top_n_idxs = torch.Tensor(top_n_idxs).int()
 
-            # get dvq embeddings from indexes
-            target_idx_state = self.gpt.as_i_to_s_i(top_n_idxs.to(target_idx.device))
+        # get dvq embeddings from indexes
+        idx_hat_state = self.gpt.as_i_to_s_i(top_n_idxs.to(target_idx.device))
+        emb_hat = self.dvq.quantizer.embed_code(idx_hat_state)
 
-            emb_hat = self.dvq.quantizer.embed_code(target_idx_state)
+        # decode predictions into images
+        imgs_hat = self.dvq.decode_flat(emb_hat, output_proj=self.dvq.quantizer.output_proj)
+        dim_len = len(imgs_hat.size())
+        imgs_hat = imgs_hat.permute(*list(range(dim_len-3)), dim_len-2, dim_len-1, dim_len-3).clamp(0, 1)
+        imgs_display = []
+        for img_i, img in enumerate(imgs):
+            img = img.permute(1, 2, 0).cpu().numpy()
+            img_target = imgs_target[img_i].permute(1, 2, 0).clamp(0, 1).detach().cpu().numpy()
+            blank = 0 * np.zeros_like(img)
+            img_hat_row = []
+            for ti in range(top_n):
+                img_hat = imgs_hat[img_i][ti].clamp(0, 1)
+                img_hat_row.append(img_hat.detach().cpu().numpy())
+            left_img = np.concatenate([blank, img, blank])
+            mid_img = np.concatenate(img_hat_row)
+            right_img = np.concatenate([blank, img_target, blank])
+            imgs_display.append(np.concatenate([left_img, mid_img, right_img], axis=1))
+            imgs_display.append(0.5 * np.ones((5, *imgs_display[-1].shape[1:])))  # border
 
-            # decode predictions into images
-            imgs_hat = self.dvq.decode_flat(emb_hat, output_proj=self.dvq.quantizer.output_proj)
-            sn = len(imgs_hat.size())
-            imgs_hat = imgs_hat.permute(*list(range(sn-3)), sn-2, sn-1, sn-3).clamp(0, 1)
-            imgs_display = []
-            for img_i, img in enumerate(imgs):
-                img = img.permute(1, 2, 0).cpu().numpy()
-                img_target = imgs_target[img_i].permute(1, 2, 0).clamp(0, 1).detach().cpu().numpy()
-                blank = 0 * np.zeros_like(img)
-                img_hat_row = []
-                for ti in range(top_n):
-                    img_hat = imgs_hat[img_i][ti].clamp(0, 1)
-                    img_hat_row.append(img_hat.detach().cpu().numpy())
-                left_img = np.concatenate([blank, img, blank])
-                mid_img = np.concatenate(img_hat_row)
-                right_img = np.concatenate([blank, img_target, blank])
-                imgs_display.append(np.concatenate([left_img, mid_img, right_img], axis=1))
-                imgs_display.append(0.5 * np.ones((5, *imgs_display[-1].shape[1:])))  # border
-
-            imgs_display = np.concatenate(imgs_display)
-            im = Image.fromarray(np.uint8(imgs_display * 255))
-            # im.show()
-            folder = f'{ROOT_DIR}/images/viz_gpt/{DATE_STR}r_{RUN_ID}_{get_date_str()}'
-            os.makedirs(folder)
-            filename = f'{folder}/e_{self.current_epoch}_b_{batch_idx}.png'
-            log.info(f'Saving gpt viz to {filename}')
-            im.save(filename)
-            wandb_try_log({'train/gpt-viz': [wandb.Image(im)]}, self.global_step)
+        imgs_display = np.concatenate(imgs_display)
+        im = Image.fromarray(np.uint8(imgs_display * 255))
+        # im.show()
+        folder = f'{ROOT_DIR}/images/viz_gpt/{DATE_STR}r_{RUN_ID}_{get_date_str()}'
+        os.makedirs(folder)
+        filename = f'{folder}/e_{self.current_epoch}_b_{batch_idx}.png'
+        log.info(f'Saving gpt viz to {filename}')
+        im.save(filename)
+        wandb_try_log({'train/gpt-viz': [wandb.Image(im)]}, self.global_step)
 
             # fig1 = plt.figure(figsize=(num_imgs_per_row, 1))
             # ax1 = fig1.add_subplot(111)
@@ -776,7 +808,7 @@ class LearnMax(pl.LightningModule):
         os.makedirs(folder, exist_ok=True)
 
         for i, x in enumerate(self.buffer):
-            im = self.save_state_to_image(x.state.state, folder, i)
+            im = save_state_to_image(x.state.state, folder, i)
             # # im.show()
             filename = f'{folder}/{str(i).zfill(9)}.png'
             im.save(filename)
@@ -784,12 +816,56 @@ class LearnMax(pl.LightningModule):
         # TODO: ffmpeg
         log.info(f'Saved movie to {folder}')
 
-    def save_state_to_image(self, state, folder, i):
-        state = state.squeeze(0).permute(1, 2, 0).cpu()
-        im = Image.fromarray(np.uint8(state * 255))
-        filename = f'{folder}/{str(i).zfill(9)}.png'
-        im.save(filename)
-        return im
+    @no_train
+    def viz_simple_predict_trajectory(self, gpt_x, z_q_ind_x, a_x, batch_idx):
+        # TODO: Delete/disable as viz_predicted_trajectories is better than this (created for debugging specific issue)
+        parent_folder = f'{ROOT_DIR}/images/viz_simple_predict_trajectory'
+        os.makedirs(parent_folder, exist_ok=True)
+        folder = f'{parent_folder}/{get_date_str()}_r_{RUN_ID}_e_{self.current_epoch}_b_{batch_idx}'
+        os.makedirs(folder, exist_ok=True)
+
+        # Seed with recent actions, new_states from buffer
+        action_branches, just_died, look_back, z_q_embed_branches, z_q_ind_branches = self.get_recent_experience()
+        truncate = self.gpt_block_size  # Reduce to make sure we've seen these before
+        # TODO: Check logit/prob KL divergence from train step to the forward here and visualize it as a histogram
+        action_branches = action_branches[:, :truncate]
+        z_q_embed_branches = z_q_embed_branches[:, :truncate]
+        z_q_ind_branches = z_q_ind_branches[:, :truncate]
+        num_predict = self.num_search_levels
+        for _ in range(num_predict):
+            as_ind = self.gpt.s_i_to_as_i(z_q_ind_branches, action_branches)
+            logits, expected_deviation = self.gpt.forward(
+                embed=z_q_embed_branches[:, -truncate:],
+                action_state_idx=as_ind[:, -truncate:],
+                # No need to shift actions as we use new_state from buffer, also see: sa2as()
+                actions=action_branches[:, -truncate:]
+            )
+            B, W, ASE = logits.size()
+            assert B == 1 and W <= truncate
+            logits_last_step = logits[0][-1]
+            probs = F.softmax(logits_last_step, dim=-1)
+            # TODO: Get most likely state given some action
+            action_state = torch.argmax(logits_last_step)  # Get most likely action-state
+            action, z_q_ind = self.gpt.split_as_i(int(action_state))  # Extract action and state from action_state
+            z_q_flat = self.dvq.quantizer.embed_code(torch.tensor(z_q_ind).to(self.device))  # Get embedding from index
+
+            # Autoregress: Add predictions to end of gpt input
+            z_q_embed_branches = torch.cat((z_q_embed_branches, z_q_flat.reshape(1, 1, -1)), dim=1)
+            action_branches = torch.cat((action_branches, torch.tensor(action).to(self.device).reshape(1, 1)), dim=1)
+            z_q_ind_branches = torch.cat((z_q_ind_branches, torch.tensor(z_q_ind).to(self.device).reshape(1, 1)), dim=1)
+
+        imgs = self.dvq.decode_flat(z_q_embed_branches, output_proj=self.dvq.quantizer.output_proj)
+        imgs = imgs.permute(0, 1, 3, 4, 2)  # CHW => HWC
+        num_actual = 5
+        imgs = imgs[:, -(num_predict + num_actual):]  # Show 5 actual frames followed by num_search_levels predicted
+        sz = imgs.size()
+        assert sz[0] == 1
+        imgs = imgs.reshape(sz[1], sz[2], *sz[3:])
+        imgs = np.uint8(imgs.clamp(0, 1).detach().cpu().numpy() * 255)
+        imgs = np.concatenate([img for img in imgs], axis=1)  # Align side by side
+        im = Image.fromarray(imgs)
+        # im.show()
+        im.save(f'{folder}/viz_simple_predict_trajectory_num_actual_{num_actual}_num_predict_{num_predict}.png')
 
     def save_predicted_trajectories(self, batch_idx):
         os.makedirs(f'{ROOT_DIR}/images/viz_traj', exist_ok=True)
@@ -810,7 +886,7 @@ class LearnMax(pl.LightningModule):
             traj = {k: v.cpu().numpy().tolist() for (k, v) in traj.items()}
             str_i = str(i).zfill(9)
             json.dump(traj, open(f'{folder}/traj_{str_i}.json', 'w'))
-            self.save_state_to_image(state.state, folder, i)  # TODO: We save this for movie too, reuse?
+            save_state_to_image(state.state, folder, i)  # TODO: We save this for movie too, reuse?
             # im.show()
 
     def _train_step_dvq(self, batch, batch_idx):
@@ -856,7 +932,7 @@ class LearnMax(pl.LightningModule):
     def _dataloader(self) -> DataLoader:
         """Initialize the Replay Buffer dataset used for retrieving experiences"""
         # Also, need to disable kmeans in an object variable and avoid backpropping elsewhere
-        if self.training_gpt:
+        if self.should_train_gpt:
             for prop_name in dir(self.dvq):
                 prop = getattr(self.dvq, prop_name)
                 if isinstance(prop, nn.Module):
@@ -911,14 +987,17 @@ class LearnMax(pl.LightningModule):
     def add_model_specific_args(arg_parser: argparse.ArgumentParser, ) -> argparse.ArgumentParser:
         arg_parser.add_argument("--dvq_quantize_proj", type=int, default=None)
         arg_parser.add_argument("--num_gpus", type=int, default=1)
-        arg_parser.add_argument("--single_token2", action='store_true', default=False)
+        arg_parser.add_argument("--single_token2", action='store_true', default=True)
         arg_parser.add_argument('--num_workers', type=int, default=None, help="number of workers for dataloading")
-        arg_parser.add_argument('--viz_dvq', type=str, help="visualize dvq images", default=None)
-        arg_parser.add_argument('--viz_all_dvq_clusters', type=str, help="visualize all dvq clusters", default=None)
-        arg_parser.add_argument('--dvq_checkpoint', type=str, help="Checkpoint to restore", default=None)
+        arg_parser.add_argument('--viz_dvq', action='store_true', help="visualize dvq images", default=False)
+        arg_parser.add_argument('--viz_all_dvq_clusters', action='store_true', help="visualize all dvq clusters", default=False)
+        arg_parser.add_argument('--viz_predict_trajectory', action='store_true', help="visualize all dvq clusters", default=False)
+        arg_parser.add_argument('--dvq_checkpoint', type=str, help="DVQ checkpoint to restore", default=None)
+        arg_parser.add_argument('--checkpoint', type=str, help="Full (DVQ+GPT) checkpoint to restore", default=None)
+        arg_parser.add_argument('--should_train_gpt', action='store_true', help="Whether to train GPT", default=False)
+        arg_parser.add_argument('--gpt_learning_rate', type=float, help="GPT batch size", default=6e-4)
         arg_parser.add_argument('--gpt_batch_size', type=int, help="GPT batch size", default=8)
-        arg_parser.add_argument('--gpt_block_size', type=int, default=40,
-                            help="block size for the model (length of window of context)")
+        arg_parser.add_argument('--gpt_block_size', type=int, help="block size for the model (length of window of context)", default=40)
         return arg_parser
 
     @staticmethod
@@ -958,9 +1037,9 @@ class LearnMax(pl.LightningModule):
 
         return arg_parser
 
-    def tree_search(self, beam_width=4, num_levels=10):
+    def tree_search(self):
         """
-        Need to keep track of action taken at start of search path, total uncertainty, and path nodes.
+        Search through tree of possible actions and resulting latent states with GPT-based dynamics
 
         Avoiding discount factor for now as this already happens due to limited prediction horizon. Also unclear if
             discount factor is fundamentally good: https://stats.stackexchange.com/questions/221402/
@@ -1065,6 +1144,16 @@ class LearnMax(pl.LightningModule):
         state to the training data at two levels: one where the salient state is the context,
         and one where the salient state is the level above and we are predicting salient states.
 
+        ### Action selection per saliency level
+        I'm hoping there's a natural tendency to prefer more salient action exploration due to the requirement
+        entropy is low before stacking new (higher) salience levels. If all the sudden, however, entropy appears at a lower level,
+        there perhaps should be some preference towards higher salience if the two salience levels have
+        equal entropy otherwise. This shows up in humans in language learning, where at a young age we
+        are more attuned to the more granular sounds while we learn the phonemes of our language. Then as we graduate
+        to higher levels of abstraction in phrases, sentences, etc... we are more interested and attuned to this space
+        than phonemes which is good for exploring longer term problems. A downside of this is that
+        we have a harder time learning new languages.
+
         ----------------------
         Design
 
@@ -1139,6 +1228,8 @@ class LearnMax(pl.LightningModule):
 
         """
 
+        beam_width = self.beam_width
+        num_levels = self.num_search_levels
         # TODO:
         #   - If search finds termination, trim from tree. But what if all branches terminate - should not be possible
         #       really need to confirm though.
@@ -1148,34 +1239,12 @@ class LearnMax(pl.LightningModule):
         #  1. optimize gpt forward
         #  2. do 3 to 5 step look ahead and rely on saliency for long term planning
         #  3. increase beam width for better quality look ahead (mostly parallel so is fast)
-        z_q_embed_branches = []
-        z_q_ind_branches = []
-        action_branches = []
+        action_branches, just_died, look_back, z_q_embed_branches, z_q_ind_branches = self.get_recent_experience()
 
-        look_back = min(len(self.buffer), self.gpt_block_size)
-        buffer = self.buffer
-        # Populate gpt window with recent experience
-        for i in reversed(range(look_back)):
-            exp = buffer[-(i+1)]
-            if exp.done is True:
-                # Don't sample across resets - important for valuing life, AGI safety
-                z_q_embed_branches.clear()
-                z_q_ind_branches.clear()
-                action_branches.clear()
-                look_back = i
-            else:
-                # Use new state as our tokens are action-states, i.e. the agent took an action and ended up in state
-                z_q_embed_branches.append(exp.new_state.dvq_z_q_flat)
-                z_q_ind_branches.append(exp.new_state.dvq_z_q_ind)
-                action_branches.append(exp.action)
-        if look_back == 0:
-            # Just died
+        if just_died:
             return None, None
 
-        # Unsqueeze so we have batch, window, embed dims, where batch=1, e.g. 1, 80, 4410
-        z_q_embed_branches = torch.cat(z_q_embed_branches).unsqueeze(0)
-        z_q_ind_branches = torch.cat(z_q_ind_branches).unsqueeze(0)
-        action_branches = torch.tensor(action_branches).unsqueeze(0).to(self.device)
+        # Unsqueeze so we have batch, window, embed dims, where batch=1
         entropy_branches = torch.tensor([0]).unsqueeze(0).to(self.device)  # Total entropy of branch
 
         assert z_q_embed_branches.size()[0] == 1, 'We should only start with one trunk'
@@ -1185,9 +1254,10 @@ class LearnMax(pl.LightningModule):
             should_log_wandb = (lvl == num_levels - 1) and self.global_step % WANDB_LOG_PERIOD == 0
 
             # Forward predict one step in the search tree
+            as_ind = self.gpt.s_i_to_as_i(z_q_ind_branches, action_branches)  # action, state => action_state
             logits, expected_deviation = self.gpt.forward(
                 embed=z_q_embed_branches[:, -self.gpt_block_size:],
-                idx=z_q_ind_branches[:, -self.gpt_block_size:],
+                action_state_idx=as_ind[:, -self.gpt_block_size:],
                 # No need to shift actions as we use new_state from buffer, also see: sa2as()
                 actions=action_branches[:, -self.gpt_block_size:]
             )
@@ -1289,6 +1359,37 @@ class LearnMax(pl.LightningModule):
         next_action = action_branches[most_interesting_i][look_back+1]
         return [int(next_action)], predicted_traj
 
+    def get_recent_experience(self):
+        """Return recent embeddings, embedding indexes, and actions in action-state order"""
+        z_q_embed_branches = []
+        z_q_ind_branches = []
+        action_branches = []
+        look_back = min(len(self.buffer), self.gpt_block_size)
+        just_died = False
+        buffer = self.buffer
+        # Populate gpt window with recent experience
+        for i in reversed(range(look_back)):
+            exp = buffer[-(i + 1)]
+            if exp.done is True:
+                # Don't sample across resets - important for valuing life, AGI safety
+                z_q_embed_branches.clear()
+                z_q_ind_branches.clear()
+                action_branches.clear()
+                look_back = i
+            else:
+                # Use new state as our tokens are action-states, i.e. the agent took an action and ended up in state
+                z_q_embed_branches.append(exp.new_state.dvq_z_q_flat)
+                z_q_ind_branches.append(exp.new_state.dvq_z_q_ind)
+                action_branches.append(exp.action)
+        if look_back == 0:
+            just_died = True
+
+        # Unsqueeze so we have batch, window, embed dims, where batch=1, e.g. 1, 80, 4410
+        z_q_embed_branches = torch.cat(z_q_embed_branches).unsqueeze(0)
+        z_q_ind_branches = torch.cat(z_q_ind_branches).unsqueeze(0)
+        action_branches = torch.tensor(action_branches).unsqueeze(0).to(self.device)
+        return action_branches, just_died, look_back, z_q_embed_branches, z_q_ind_branches
+
     def log_p_a_given_rs(self, logits):
         """
         Takes B,W,S,A logits and logs probability of action across states
@@ -1313,12 +1414,13 @@ class LearnMax(pl.LightningModule):
     #             gradient_clip_algorithm=gradient_clip_algorithm
     #         )
     #     # else:
-            # implement your own custom logic to clip gradients for generator (optimizer_idx=0)
+    #       # implement your own custom logic to clip gradients for generator (optimizer_idx=0)
 
 LOAD_LAYER_TYPES = (nn.ConvTranspose2d, ResBlock, nn.ReLU, nn.Conv2d)
 
 
 def set_net_weights(source, target):
+    # TODO: Delete as this is handled by load_state_dict
     for i, layer in enumerate(source):
         if hasattr(layer, 'weight'):
             target[i].weight = layer.weight
@@ -1372,11 +1474,18 @@ def cli_main():
     del learn_max_args['num_gpus']  # This is for trainer later
     del learn_max_args['viz_dvq']  # Not for model
     del learn_max_args['viz_all_dvq_clusters']  # Not for model
+    if learn_max_args['viz_predict_trajectory']:
+        learn_max_args['should_viz_predict_trajectory'] = learn_max_args['viz_predict_trajectory']
+        del learn_max_args['viz_predict_trajectory']  # Changed the name for class
     model = LearnMax(**learn_max_args)
+    if args.checkpoint:
+        assert not args.dvq_checkpoint, ('dvq_checkpoint and checkpoint are mutually exclusive, ' +
+                                         'set dvq_checkpoint if you want to train gpt from scratch')
+        load_pretrained_dvq_and_gpt(args, model)
     if args.dvq_checkpoint:
         load_pretrained_dvq(args, model)
 
-    if args.viz_dvq is not None:
+    if args.viz_dvq:
         return model.viz_dvq_standalone()
     elif args.viz_all_dvq_clusters:
         return model.viz_all_dvq_clusters_standalone()
@@ -1405,19 +1514,17 @@ def cli_main():
 
     seed_everything(SEED)  # env is seeded later tho
 
-    if not args.dvq_checkpoint:
+    if not args.should_train_gpt:
+        raise NotImplementedError('Need to revive DVQ training')
         train_dvq(args, model, wandb_logger, fast_dev_run)
 
-    # return # TODO: GPT stuff below
-
-    # -------------------- Standard mingpt training
+    # Train GPT
     log.info("preparing the learning rate schedule")
     # number of tokens backpropped in one iteration, need to reduce for zuma vs char as tokens are 10x larger
     iter_tokens = args.gpt_batch_size * args.gpt_block_size
     epoch_tokens = math.ceil(args.batches_per_epoch * iter_tokens)
-    lr_decay = GptWarmupCosineLearningRateDecay(learning_rate=6e-4,
+    lr_decay = GptWarmupCosineLearningRateDecay(learning_rate=args.gpt_learning_rate,
                                                 warmup_tokens=512 * 20,  # epoch_tokens // 2,
-
                                                 final_tokens=args.num_epochs * epoch_tokens)
     t0 = time.time()
     log.info(f'training for {args.num_epochs} epochs...')
@@ -1458,29 +1565,33 @@ def cli_main():
     # end standard mingpt training
 
 
+def load_pretrained_dvq_and_gpt(args, model):
+    map_location = None
+    if not os.getenv('CUDA_VISIBLE_DEVICES'):
+        map_location = torch.device('cpu')
+    _model = torch.load(args.checkpoint, map_location=map_location)
+    _load_pretrained_dvq(_model, model)
+    _load_pretrained_gpt(_model, model)
+
+
 def load_pretrained_dvq(args, model):
     map_location = None
     if not os.getenv('CUDA_VISIBLE_DEVICES'):
         map_location = torch.device('cpu')
     _model = torch.load(args.dvq_checkpoint, map_location=map_location)
-    state_dict = {k:v for k,v in _model['state_dict'].items() if k.startswith('dvq')}
-    state_dict = {k[4:]:v for k,v in state_dict.items()}  # Remove `dvq.` as we're loading a submodule
+    _load_pretrained_dvq(_model, model)
+
+
+def _load_pretrained_dvq(_model, model):
+    state_dict = {k: v for k, v in _model['state_dict'].items() if k.startswith('dvq')}
+    state_dict = {k[4:]: v for k, v in state_dict.items()}  # Remove `dvq.` as we're loading a submodule
     model.dvq.load_state_dict(state_dict)
-    # _model = LearnMax.load_from_checkpoint(args.dvq_checkpoint)
-    # set_net_weights(_model.dvq.encoder.net, model.dvq.encoder.net)
-    # set_net_weights(_model.dvq.decoder.net, model.dvq.decoder.net)
-    # assert len(list(model.dvq.decoder.net.parameters())) == 14, 'Did you add a new layer, if so copy the weights'
-    # assert _model.dvq.quantizer.embed.embedding_dim == model.dvq.quantizer.embed.embedding_dim
-    # assert _model.dvq.quantizer.embed.num_embeddings == model.dvq.quantizer.embed.num_embeddings
-    # assert _model.dvq.quantizer.output_proj == model.dvq.quantizer.output_proj
-    # assert _model.dvq.quantizer.patch_width == model.dvq.quantizer.patch_width
-    # assert _model.dvq.is_single_token2 == model.dvq.is_single_token2
-    # model.dvq.quantizer.embed.weight = _model.dvq.quantizer.embed.weight
-    # model.dvq.quantizer.proj.weight = _model.dvq.quantizer.proj.weight
-    # model.dvq.quantizer.proj.bias = _model.dvq.quantizer.proj.bias
-    for attr in dir(model.dvq):
-        if hasattr(getattr(model.dvq, attr), 'weight') and attr not in ('embed', 'proj'):
-            raise ValueError('Unexpected params, add support for new layers here')
+
+
+def _load_pretrained_gpt(_model, model):
+    state_dict = {k: v for k, v in _model['state_dict'].items() if k.startswith('gpt')}
+    state_dict = {k[4:]: v for k, v in state_dict.items()}  # Remove `gpt.` as we're loading a submodule
+    model.gpt.load_state_dict(state_dict)
 
 
 def train_dvq(args, model, wandb_logger, fast_dev_run):
@@ -1544,6 +1655,14 @@ def get_default_embeddings(is_single_token2=False):
         default_embedding_dim = 64
         default_num_embeddings = 512
     return default_num_embeddings, default_embedding_dim
+
+
+def save_state_to_image(state, folder, i):
+    state = state.squeeze(0).permute(1, 2, 0).cpu()
+    im = Image.fromarray(np.uint8(state * 255))
+    filename = f'{folder}/{str(i).zfill(9)}.png'
+    im.save(filename)
+    return im
 
 
 if __name__ == '__main__':

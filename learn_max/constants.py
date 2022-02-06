@@ -15,4 +15,5 @@ SEED = 1_414_213
 DEBUGGING = sys.gettrace() is not None
 RUN_ID = ''.join(random.choice(string.ascii_uppercase + string.digits) for _ in range(6))
 WANDB_LOG_PERIOD = 10
+ACC_LOG_PERIOD = 100
 

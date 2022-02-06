@@ -1,4 +1,5 @@
 import math
+import os
 
 import pytorch_lightning as pl
 
@@ -22,7 +23,6 @@ class GptWarmupCosineLearningRateDecay(pl.Callback):
         self.tokens = 0
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx=None):
-        # y needs to be target indexes which is currently not passed by train_batch, do so when training_gpt as we have them! Also, need to emulate -100 thing when stars align
         gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y, s = get_batch_vars(batch, return_agent_state=True, populate_gpt=True)
         # _, y = batch
         self.tokens += (z_q_ind_y >= 0).sum()  # y == -100 is "ignore", so don't count these
@@ -35,6 +35,9 @@ class GptWarmupCosineLearningRateDecay(pl.Callback):
                 max(1, self.final_tokens - self.warmup_tokens))
             lr_mult = 0.1 + 0.5 * (1.0 + math.cos(math.pi * progress))
         lr = self.learning_rate * lr_mult
+        if batch_idx > float(os.getenv('ZERO_LR_AFTER', math.inf)):
+            os.environ['ZERO_LR'] = 'true'
+            lr = 0
         for optimizer in trainer.optimizers:
             for param_group in optimizer.param_groups:
                 param_group['lr'] = lr
