@@ -1285,7 +1285,7 @@ class LearnMax(pl.LightningModule):
         as well. The problem with 2) is that we need to maintain a stable prediction with all possible low level
         states as context which seems like it would greatly reduce sample efficiency.
 
-        A solution to this is for the higher and lower level context tokens should be special input tokens added to the
+        To solve this, append higher and lower level context tokens as special input tokens to the
         front of the window, rather than summing them with the current tokens like position, action, etc... This as
         it allows all heads to see it without prior connections to other token positions needing to change when the
         context changes / is learned. Initially zeros should be passed for context when salient states have not yet
@@ -1363,7 +1363,12 @@ class LearnMax(pl.LightningModule):
             goals doesn't necessarily mean our high level goals need to change, but we'll need some way of knowing
             whether we are off-track wrt our high level goals by realizing goal states are no longer high probability
             outcomes of the current context - at which point we will need to replan up through all saliency levels.
+
+        TODO:
+            The entropy search should use probability weighting to score the branches total entropy where the probability
+            is that of taking the action-states in the branch.
         """
+
 
         beam_width = self.beam_width
         num_steps = self.num_search_steps

@@ -276,15 +276,18 @@ def test_replay_buffers_sanity():
     assert len(blocks) == 1
     assert replay_buffers.train_buf.lru.end.prev.key.endswith('000000000002.pt')
 
+    replay_buffers.train_buf.get(0, 100)
+    exps, _ = replay_buffers.train_buf.get(9, 100)
+    assert len(exps) == 1
+
     caught_exception = False
     try:
-        replay_buffers.train_buf.get(0, 100)
+        replay_buffers.train_buf.get(12, 100)
     except IndexError as e:
         assert 'Experience index too large' in str(e)
         caught_exception = True
     assert caught_exception
 
-    replay_buffers.train_buf.get(100, 1)
     log.info('Done testing replay buffers')
 
 
