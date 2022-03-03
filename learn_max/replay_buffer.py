@@ -1,6 +1,6 @@
 import glob
 import os
-from collections import deque
+from collections import deque, OrderedDict
 from dataclasses import dataclass
 from pl_bolts.datamodules.experience_source import Experience
 
@@ -175,62 +175,21 @@ class ReplayBuffer:
 class LRU:
     def __init__(self, max_size=1000):
         self.max_size = max_size
-        self.beg = LRUNode()
-        self.end = LRUNode()
-        self.beg.next = self.end
-        self.end.prev = self.beg
-        self.mp = {}  # Could just used OrderedMap move_to_end() / popitem()
+        self.mp = OrderedDict()  # Could just used OrderedMap move_to_end() / popitem()
 
     def add(self, key, val):
         if key not in self.mp:
             if len(self.mp) == self.max_size:
-                del self.mp[self.beg.next.key]
-                self._remove_from_linked_list(self.beg.next)  # Remove least recently used
-            node = LRUNode()
-            node.val = val
-            node.key = key
-            self._add_to_end_of_linked_list(node)
-            self.mp[key] = node
+                self.mp.popitem(last=False)  # Remove least recently used
+            self.mp[key] = val  # Insert at end
         else:
             self.get(key)  # Make node recently used
 
     def get(self, key):
         if key not in self.mp:
             return None
-        node = self.mp[key]
-        if node.next is not self.end:
-            self._remove_from_linked_list(node)
-            self._add_to_end_of_linked_list(node)
-        return node.val
-
-    def _remove_from_linked_list(self, node):
-        assert node is not self.end
-        assert node is not self.beg
-        old_prev = node.prev
-        old_next = node.next
-        old_prev.next = old_next
-        old_next.prev = old_prev
-
-    def _add_to_end_of_linked_list(self, node):
-        assert node is not self.end
-        assert node is not self.beg
-        old_last = self.end.prev
-        self.end.prev = node
-        node.prev = old_last
-        old_last.next = node
-        node.next = self.end
-        assert old_last is not self.end.prev
-        assert node is self.end.prev
-        assert self.end.next is None
-        assert self.beg.prev is None
-
-
-@dataclass
-class LRUNode:
-    prev = None
-    next = None
-    key = None
-    val = None
+        self.mp.move_to_end(key)
+        return self.mp[key]
 
 
 def test_replay_buffers_sanity():
@@ -274,7 +233,7 @@ def test_replay_buffers_sanity():
     exps, blocks = replay_buffers.train_buf.get(0, 1)
     assert len(exps) == 1
     assert len(blocks) == 1
-    assert replay_buffers.train_buf.lru.end.prev.key.endswith('000000000002.pt')
+    assert list(replay_buffers.train_buf.lru.mp.items())[-1][0].endswith('000000000002.pt')
 
     replay_buffers.train_buf.get(0, 100)
     exps, _ = replay_buffers.train_buf.get(9, 100)
