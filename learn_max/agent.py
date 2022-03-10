@@ -1,3 +1,4 @@
+import dataclasses
 import os
 from collections import deque
 from dataclasses import dataclass
@@ -10,6 +11,7 @@ from torch import nn
 
 @dataclass
 class AgentState:
+    # TODO: Perhaps this should be a PyTorch module as it just holds a bunch of tensors
     state: torch.Tensor = None  # sensor state returned by env TODO(OOM): Don't populate this when only training GPT as it's not needed
     dvq_x: torch.Tensor = None  # state preprocessed for dvq
     dvq_x_hat: torch.Tensor = None
@@ -24,6 +26,12 @@ class AgentState:
 
     def dict(self):
         return self.__dict__
+
+    def to(self, device):
+        for field in dataclasses.fields(self):
+            val = getattr(self, field.name)
+            if torch.is_tensor(val):
+                setattr(self, field.name, val.to(device))
 
 
 class LearnMaxAgent:
