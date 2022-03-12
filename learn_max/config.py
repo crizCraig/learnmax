@@ -50,7 +50,7 @@ def get_train_args_from_cli():
     parser.add_argument("--num_gpus", type=int, default=1)  # TODO: Use lightning's num_modes arg here?
     parser = add_shared_model_train_args(parser)
     parser = pl.Trainer.add_argparse_args(parser)
-    args = parser.parse_args()
+    args, unknown = parser.parse_known_args()
     return args
 
 
@@ -99,7 +99,7 @@ def add_model_specific_args(arg_parser: argparse.ArgumentParser, ) -> argparse.A
     arg_parser.add_argument('--gpt_learning_rate', type=float, help="GPT batch size", default=6e-4)
     arg_parser.add_argument('--gpt_batch_size', type=int, help="GPT batch size", default=8)
     arg_parser.add_argument('--gpt_block_size', type=int, help="block size for the model (length of window of context)", default=40)
-    arg_parser.add_argument('--actions_per_batch', type=int, help="avoids overfitting with more data generated between updates", default=10)
+    arg_parser.add_argument('--actions_per_batch', type=int, help="avoids overfitting with more data generated between updates", default=1)
     return arg_parser
 
 

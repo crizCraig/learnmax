@@ -315,11 +315,7 @@ class GPT(nn.Module):
             assert embed.size()[1] == self.block_size, \
                 'Not filling block size in train will result in untrained latter positions.'
 
-        # target_idx = self.s_i_to_as_i(next_idx, a_next)
-
-        log.warning('You are training the identity action!!!! Use a_next')
-        target_idx = self.s_i_to_as_i(next_idx, a)
-
+        target_idx = self.s_i_to_as_i(next_idx, a_next)
         logits, expected_deviation = self.forward(embed, idx, a)
 
         # Calculate mean deviation loss for uncertainty ----------------------

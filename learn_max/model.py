@@ -107,7 +107,7 @@ class LearnMax(pl.LightningModule):
             env_id: str = 'MontezumaRevenge-v0',  # gym environment tag
             warm_start_size: int = 10_000,  # how many samples do we use to fill our buffer at the start of training
             batches_per_epoch: int = 10_000,  # number of batches per pseudo (RL) epoch
-            actions_per_batch: int = 10,  # adds more samples per action to prevent overfitting
+            actions_per_batch: int = 1,  # adds more samples per action to prevent overfitting
 
             # Tree search
             beam_width: int = 4,  # How many trajectories to predict in tree search
@@ -1587,7 +1587,6 @@ def cli_main(get_model_args_fn=get_model_args_from_cli, get_train_args_fn=get_tr
     torch.multiprocessing.set_start_method('spawn')
     args = get_model_args_fn()
     viz_dvq = args.viz_dvq or args.viz_all_dvq_clusters
-
 
     if viz_dvq:
         args.training_gpt = False
