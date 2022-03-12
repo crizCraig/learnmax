@@ -1258,6 +1258,15 @@ class LearnMax(pl.LightningModule):
         to output a max number of low level states we expect to see before a given next state, after which the state
         should no longer be considered a valid goal state. Hopefully the low level context confers this though.
 
+        To simplify the above, let's remove the low level context in the form of logits delivered to the higher level.
+        All we should need is the expected number of low level steps required to reach the next salient state in the
+        plan output by tree search. Then we should replan at that salient level with a probability based on how
+        far past the expected number of states we've reached. E.g. if we expect to reach the next salient state
+        in 10 steps, but have not seen *any* salient step by 20 steps, then the probability of replanning is
+        1 = max(0, (actual_steps - expected_steps) / expected_steps )
+        If at any time we see a state (i.e action-state) that is a known salient state at that level, then we
+        also replan at that level as we've encountered a different sequence.
+
         Compression (does not apply to possibility-based saliency):
             If the next salient state is reached and it's no longer surprising, i.e. it's by far the most probable state
             and it has small reconstruction error, then we can train the level above to just skip this state as the
@@ -1332,6 +1341,14 @@ class LearnMax(pl.LightningModule):
             entropy states or even sample high probability actions until we find some threshold level of uncertainty
             in our plan. Then we should take actions that allow us to get to that frontier of knowledge and take
             actions there which resolve the uncertainty and allow us to reach one step further in the future.
+            This will be done with salient states.
+
+        TODO:
+            The entropy score of a plan should be weighted by the joint action-state probabilities that
+            make up the path multiplied by the entropy at the end of the path. We could also continue to sum
+            the entropy along the path and multiply by that. When we are using salient states though, entropy along
+            the path will be low until we get to the frontier of knowledge, so most entropy should come from
+            the end anyway.
 
         """
 
