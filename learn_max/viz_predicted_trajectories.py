@@ -108,7 +108,7 @@ def get_frame(cluster_img_paths, frame_paths, traj_paths, horz_scroll_index):
             _traj_i = int(traj_img_path.split('/')[-1].split('.')[0])
             assert _traj_i == z_q_ind
             traj_img = get_np_surface(traj_img_path, IMG_SCALING)
-            txt_img = get_np_txt_caption(traj_img)
+            # txt_img = get_np_txt_caption(traj_img)
             traj_imgs.append(traj_img)
             # traj_imgs.append(np.concatenate((traj_img, txt_img), axis=1))
 

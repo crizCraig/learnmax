@@ -37,8 +37,8 @@ from learn_max.agent import LearnMaxAgent, AgentState
 from learn_max.dvq.model.deepmind_enc_dec import ResBlock
 from learn_max.replay_buffer import ReplayBuffers
 from learn_max.utils import topk_interesting, _init_weights, get_batch_vars, get_date_str, get_action_states, \
-    wandb_try_log, no_train
-from learn_max.constants import SAVE_DIR, SEED, DEBUGGING, DATE_STR, ROOT_DIR, RUN_ID, WANDB_LOG_PERIOD, ACC_LOG_PERIOD
+    wandb_log, no_train, wandb_check_flush, best_effort
+from learn_max.constants import SAVE_DIR, SEED, DEBUGGING, DATE_STR, ROOT_DIR, RUN_ID, WANDB_MAX_LOG_PERIOD, ACC_LOG_PERIOD
 from learn_max.dvq.vqvae import VQVAE, DecayLR, DecayTemperature, RampBeta
 from learn_max.mingpt.lr_decay import GptWarmupCosineLearningRateDecay
 from learn_max.mingpt.model import GPT
@@ -101,7 +101,6 @@ class LearnMax(pl.LightningModule):
 
             # RL/sensorimotor type stuff
             avg_reward_len: int = 100,  # how many episodes to take into account when calculating the avg reward
-            epoch_len: int = 1000,  # how many batches before pseudo epoch
             gamma: float = 1,  # discount factor - only used for evaluation metrics right now
             n_steps: int = 1,  # number of steps to return from each environment at once
             env_id: str = 'MontezumaRevenge-v0',  # gym environment tag
@@ -123,7 +122,7 @@ class LearnMax(pl.LightningModule):
 
             should_viz_predict_trajectory: bool = False,
             should_overfit_gpt: bool = False,  # Whether to overfit on a small batch of recent experience
-
+            train_to_test_collection_ratio: float = 10,  # Number of train to test files to collect in replay buffer
             # Dataloader
             pin_memory: bool = False,
     ):
@@ -183,7 +182,6 @@ class LearnMax(pl.LightningModule):
         self.gpt_attn_pdrop = gpt_attn_pdrop
 
         self.avg_reward_len = avg_reward_len
-        self.epoch_len = epoch_len
         self.gamma = gamma
         self.n_steps = n_steps
         self.env_id = env_id
@@ -312,7 +310,10 @@ class LearnMax(pl.LightningModule):
         # Replay buffers (test and train)
         short_term_mem_length = 1000 if self.should_overfit_gpt else self.gpt_block_size * 2
         self.buffers = ReplayBuffers(env_id=self.env_id, short_term_mem_length=short_term_mem_length,
-                                     overfit_to_short_term=should_overfit_gpt)
+                                     overfit_to_short_term=should_overfit_gpt,
+                                     train_to_test_collection_ratio=train_to_test_collection_ratio,
+                                     # Get a full val batch when training starts
+                                     frames_per_file=self.gpt_block_size * self.gpt_batch_size)
         self.train_buf = self.buffers.train_buf
         self.test_buf = self.buffers.test_buf
         self.recent_experience = self.buffers.short_term_mem
@@ -425,13 +426,18 @@ class LearnMax(pl.LightningModule):
         output = self.net(x)
         return output
 
-    def train_batch(self, ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def gen_train_batch(self, ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Contains the logic for generating a new batch of data to be passed to the DataLoader
 
         Returns:
             yields tuple containing  state, action, reward, done, next_state, and agent_state dict.
         """
+
+        # TODO: Train DVQ here as well
+        if not self.should_train_gpt:
+            raise NotImplementedError('DVQ training was done in VQVAE.py, needs to be moved here')
+
         episode_reward = 0
         episode_steps = 0
 
@@ -457,7 +463,7 @@ class LearnMax(pl.LightningModule):
                 continue
             for idx, _ in enumerate(dones):
                 # Lightning wants tensors, numpy arrays, numbers, dicts or lists in batch
-                agent_state = self.ensure_basic_type(agent_states[idx])
+                agent_state = self.agent_states_to_dict(agent_states[idx])
                 yield states[idx], actions[idx], rewards[idx], dones[idx], new_states[idx], agent_state
 
             self.total_steps += 1
@@ -471,7 +477,33 @@ class LearnMax(pl.LightningModule):
             if self.total_steps % self.batches_per_epoch == 0:
                 break
 
-    def ensure_basic_type(self, thing):
+    def gen_validation_batch(self, ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if len(self.buffers.test_buf) == 0:
+            yield from self._yield_empty_validation_batch()
+        else:
+            # TODO: Move this tuple into a @dataclass
+            start_indices = np.arange(start=0,
+                                      stop=len(self.test_buf) - self.gpt_block_size + 1,
+                                      step=self.gpt_block_size)
+            if len(start_indices) == 0:
+                yield from self._yield_empty_validation_batch()
+            else:
+                states, actions, rewards, dones, new_states, agent_states, next_agent_states = self.sample_sequential(
+                    buffer=self.test_buf,
+                    start_indices=start_indices,
+                )
+                for idx, _ in enumerate(dones):
+                    # Lightning wants tensors, numpy arrays, numbers, dicts or lists in batch
+                    agent_state = self.agent_states_to_dict(agent_states[idx])
+                    yield states[idx], actions[idx], rewards[idx], dones[idx], new_states[idx], agent_state
+
+    @staticmethod
+    def _yield_empty_validation_batch():
+        log.warning('Generating empty validation data! Val stats will be wrong. '
+                    'Make sure you fill test_buf with at least one gpt block before calling')
+        yield torch.tensor(0), torch.tensor(0), torch.tensor(0), torch.tensor(0), torch.tensor(0)
+
+    def agent_states_to_dict(self, thing):
         if isinstance(thing[0], AgentState):
             # agents_states only has a batch dimension, not window size
             return [_.dict() for _ in thing]
@@ -489,10 +521,23 @@ class LearnMax(pl.LightningModule):
                 episode_steps = 0
                 episode_reward = 0
         if self.should_train_gpt:
+            if len(self.train_buf) < (self.gpt_block_size * self.gpt_batch_size):
+                log.info('Train buff not full enough to run a batch yet, skipping')
+                return None, None, None, [], None, None, None
             # Sample sequentially from replay buffer
             # If training GPT, we need to return the dvq state indexes as well to be used in on_train_batch_end
             #   in lr_decay _, y = batch
-            states, actions, rewards, dones, new_states, agent_states, next_agent_states = self.sample_sequential()
+            # Sample 2 extra as we shift actions back 1 for action-states and targets forward 1 see sa2as()
+            num_extra_block_indices = 2
+            start_range = np.arange(len(self.train_buf) - self.gpt_block_size + 1 - num_extra_block_indices)
+            start_indices = np.random.choice(start_range, self.gpt_batch_size, replace=False)
+            if 'ALWAYS_SAMPLE_LATEST' in os.environ:
+                start_indices[0] = start_range[-1]
+            states, actions, rewards, dones, new_states, agent_states, next_agent_states = self.sample_sequential(
+                buffer=self.train_buf,
+                start_indices=start_indices,
+                num_extra_block_indices=num_extra_block_indices,
+            )
         else:
             # Sample randomly from replay buffer
             # TODO: Copy sample() from MultiStepBuffer.sample as we moved to a plain deque
@@ -555,15 +600,8 @@ class LearnMax(pl.LightningModule):
         log.info('Done profiling torch objects')
         log.info('-----------------------')
 
-    def sample_sequential(self, start_indices=None):
+    def sample_sequential(self, buffer, start_indices, num_extra_block_indices=0):
         """Get batch size X gpt_block_size windows for GPT"""
-        # Sample 2 extra as we shift actions back 1 for action-states and targets forward 1 see sa2as()
-        num_extra_win_indices = 2
-        start_range = np.arange(len(self.train_buf) - self.gpt_block_size + 1 - num_extra_win_indices)
-        if start_indices is None:
-            start_indices = np.random.choice(start_range, self.gpt_batch_size, replace=False)
-        if 'ALWAYS_SAMPLE_LATEST' in os.environ:
-            start_indices[0] = start_range[-1]
         ret_states = []
         ret_agent_states = []
         ret_actions = []
@@ -571,10 +609,10 @@ class LearnMax(pl.LightningModule):
         ret_dones = []
         ret_next_states = []
         ret_next_agent_states = []
-        block_len = self.gpt_block_size + num_extra_win_indices
+        block_len = self.gpt_block_size + num_extra_block_indices
         for start in start_indices:
             # TODO: pad with -100 when last index? We just avoid by making sure we sample early enough in the buffer
-            exps = self.train_buf.get(start, block_len, device=self.device)
+            exps = buffer.get(start, block_len, device=self.device)
             agent_states, actions, rewards, dones, next_agent_states = zip(*exps)
             ret_states.append([ags.state.to(self.device) for ags in agent_states])
             ret_agent_states.append(agent_states)
@@ -683,23 +721,40 @@ class LearnMax(pl.LightningModule):
         else:
             latent_loss, dvq_loss, recon_loss = self._train_step_dvq(batch, batch_idx)
             loss = dvq_loss
-            self.log_dict({
-                "dvq_recon_loss": recon_loss,
-                "dvq_latent_loss": latent_loss, })
+            # self.log_dict({
+            #     "dvq_recon_loss": recon_loss,
+            #     "dvq_latent_loss": latent_loss, })
 
         self.log_dict({
-            "total_reward": float(self.total_rewards[-1]) if self.total_rewards else 0,
-            "avg_reward": self.avg_rewards,
-            "train_loss": loss,
-            "episodes": self.done_episodes,
-            "episode_steps": self.total_episode_steps[-1] if self.total_episode_steps else 0,
+            'lightning/total_reward': float(self.total_rewards[-1]) if self.total_rewards else 0,
+            'lightning/avg_reward': self.avg_rewards,
+            'lightning/train_loss': loss,
+            'lightning/episodes': self.done_episodes,
+            'lightning/episode_steps': self.total_episode_steps[-1] if self.total_episode_steps else 0,
         })
+
+        wandb_log({'loss/train': loss}, self.global_step)
+
+        wandb_check_flush(batch_idx)
 
         # return loss
         # return OrderedDict({
         #     "loss": loss,
         #     "avg_reward": self.avg_rewards,
         # })
+
+    def validation_step(self, batch, batch_idx):
+        if self.should_train_gpt:
+            gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y, s, agent_state = get_batch_vars(batch,
+                                                                                   return_agent_state=True,
+                                                                                   populate_gpt=True)
+            gpt_ret = self.gpt.test_step(batch=(gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y), batch_idx=batch_idx)
+            loss = gpt_ret['loss']
+            wandb_log({'loss/test': loss}, self.global_step)
+            log.info(f'Validation loss {loss}, batch length {len(batch)}')
+            self.log_dict({'lightning/val_loss': loss})
+        else:
+            raise NotImplementedError('Need to call dvq validation')
 
     @no_train
     def viz_dvq_clusters(self, batch_idx):
@@ -777,7 +832,7 @@ class LearnMax(pl.LightningModule):
         self.cuda()
         wandb.init(entity='crizcraig', mode='disabled')
 
-        test_loader = self.test_dataloader()
+        test_loader = self.validation_dataloader()
         xl = next(iter(test_loader))[0].cuda()
         x = xl.cuda().reshape(-1, 3, 84, 84)
         # TODO: List => Tensor
@@ -801,6 +856,7 @@ class LearnMax(pl.LightningModule):
         plt.show()
 
     @no_train
+    @best_effort
     def viz_gpt(self, logits, target_idx, state, batch_idx, postfix=None):
         postfix = postfix or ''
         batch_index = 0  # Viz first batch (set ALWAYS_SAMPLE_LATEST) to compare with simple predict trajectory
@@ -853,7 +909,7 @@ class LearnMax(pl.LightningModule):
         filename = f'{folder}/viz_gpt_e_{self.current_epoch}_b_{batch_idx}{postfix}.png'
         log.info(f'Saving gpt viz to {filename}')
         im.save(filename)
-        wandb_try_log({'train/gpt-viz': [wandb.Image(im)]}, self.global_step)
+        # wandb_log({'train/gpt-viz': [wandb.Image(im)]}, self.global_step)  # Just save locally
 
             # fig1 = plt.figure(figsize=(num_imgs_per_row, 1))
             # ax1 = fig1.add_subplot(111)
@@ -863,6 +919,7 @@ class LearnMax(pl.LightningModule):
             #   Make sure you're extracting the logits correctly for the image
             #   Look at disappear and teleport images bad clustering cases.
 
+    @best_effort
     def viz_movie(self, batch_idx):
         os.makedirs(f'{ROOT_DIR}/images/viz_movie', exist_ok=True)
         folder = f'{ROOT_DIR}/images/viz_movie/{get_date_str()}_r_{RUN_ID}_e_{self.current_epoch}_b_{batch_idx}'
@@ -882,6 +939,7 @@ class LearnMax(pl.LightningModule):
         log.info(f'Saved movie to {folder}')
 
     @no_train
+    @best_effort
     def viz_simple_predict_trajectory(self, gpt_x, z_q_ind_x, a_x, gpt_ret, batch_idx):
         # TODO: Delete/disable as viz_predicted_trajectories is better than this (created for debugging specific issue)
         parent_folder = f'{ROOT_DIR}/images/viz_simple_predict_trajectory'
@@ -889,7 +947,6 @@ class LearnMax(pl.LightningModule):
         folder = f'{parent_folder}/{get_date_str()}_r_{RUN_ID}_e_{self.current_epoch}_b_{batch_idx}'
         os.makedirs(folder, exist_ok=True)
 
-        num_viz = 10
         num_predict = self.num_search_steps
         sync_to_latest_batch = True
         if 'VIZ_OLD_TRAJECTORY' in os.environ:
@@ -900,8 +957,9 @@ class LearnMax(pl.LightningModule):
             start_delay = 3
         else:
             start_delay = 0
-        if start_delay < 0 or (len(self.recent_experience) - start_delay) < num_predict * (num_viz - 1):
-            print('Not enough buffer to predict')
+        num_viz = (len(self.recent_experience) - start_delay) // num_predict
+        if num_viz < 1:
+            log.warning('Not enough buffer to predict')
             return
         for i in range(num_viz):
             self._viz_simple_predict_trajectory(
@@ -972,6 +1030,8 @@ class LearnMax(pl.LightningModule):
         for i in range(num_out):
             frame_im = imgs[:, width * i: width * (i+1)]
             txt_im = get_np_txt_caption2(frame_im, get_action_text(self.env, actions[i]), size=42)
+            if i == num_actual - 1:
+                txt_im[:,-10:] = np.zeros((len(txt_im), 10, 3))
             frame_im = np.concatenate((frame_im, txt_im), axis=0)
             # concat img along height dim
             frames.append(frame_im)
@@ -1059,7 +1119,7 @@ class LearnMax(pl.LightningModule):
                     prop.zero_grad()
             batch_size = self.gpt_batch_size
             self.dvq.set_do_kmeans(False)
-            warm_start_size = self.gpt_batch_size * self.gpt_block_size
+            warm_start_size = 2 * self.gpt_batch_size * self.gpt_block_size  # One val and one train batch
             log.info(f'Not training dvq so setting warm start size to batch size * gpt_block_size. '
                      f'Was {self.warm_start_size}, now  is {warm_start_size}')
             self.warm_start_size = warm_start_size
@@ -1071,7 +1131,7 @@ class LearnMax(pl.LightningModule):
         log.info(f'...finished populating replay buffer')
 
         # train_batch calls the model to get the next action, so each worker has a copy of the model!
-        self.dataset = ExperienceSourceDataset(self.train_batch)
+        self.dataset = ExperienceSourceDataset(self.gen_train_batch)
 
         if not self.pin_memory:
             log.warning('Pin memory is off, data loading will be slow. Turn on when using disk backed replay buffer')
@@ -1082,9 +1142,22 @@ class LearnMax(pl.LightningModule):
         """Get train loader"""
         return self._dataloader()
 
-    def test_dataloader(self) -> DataLoader:
-        """Get test loader"""
-        return self._dataloader()
+    def val_dataloader(self) -> DataLoader:
+        """Get validation loader"""
+
+        validation_dataset = ExperienceSourceDataset(self.gen_validation_batch)
+
+        if not self.pin_memory:
+            log.warning('Pin memory is off, data loading will be slow. Turn on when using disk backed replay buffer')
+
+        if self.should_train_gpt:
+            batch_size = self.gpt_batch_size
+        else:
+            batch_size = self.batch_size  # Already set in __init__ but in case we toggle training gpt, set here too
+
+        # Images on GPU already so pin_memory raises exception
+        return DataLoader(dataset=validation_dataset, batch_size=batch_size, num_workers=self.num_workers,
+                          drop_last=True, pin_memory=self.pin_memory)
 
     @staticmethod
     def make_environment(env_name: str, seed: Optional[int] = None) -> Env:
@@ -1376,7 +1449,7 @@ class LearnMax(pl.LightningModule):
         action_entropy_path = None  # Declare for output
         num_steps -= 1  # first step already populated
         for step in range(num_steps):
-            should_log_wandb = (step == num_steps - 1) and self.global_step % WANDB_LOG_PERIOD == 0
+            should_log_wandb = (step == num_steps - 1) and self.global_step % WANDB_MAX_LOG_PERIOD == 0
 
             # Forward predict one step in the search tree
             # as_ind = self.gpt.s_i_to_as_i(z_q_ind_branches, action_branches)  # action, state => action_state
@@ -1403,9 +1476,9 @@ class LearnMax(pl.LightningModule):
             if should_log_wandb:
                 # Log p(s|a)
                 max_p_s_given_a = probs.max(dim=-1)
-                wandb_try_log({f'max p(s|a)/max_a': max_p_s_given_a.values.max()}, self.global_step)
-                wandb_try_log({f'max p(s|a)/mean_a': max_p_s_given_a.values.mean()}, self.global_step)
-                wandb_try_log({f'max p(s|a)/min_a': max_p_s_given_a.values.min()}, self.global_step)
+                wandb_log({f'max p(s|a)/max_a': max_p_s_given_a.values.max()}, self.global_step)
+                wandb_log({f'max p(s|a)/mean_a': max_p_s_given_a.values.mean()}, self.global_step)
+                wandb_log({f'max p(s|a)/min_a': max_p_s_given_a.values.min()}, self.global_step)
 
             # TODO: Use bayes to verify logit normalization across states = actions
 
@@ -1413,9 +1486,9 @@ class LearnMax(pl.LightningModule):
             entropy = -torch.sum(probs * torch.log(probs), dim=-1)
 
             if should_log_wandb:
-                wandb_try_log({f'entropy/action min': entropy.min()}, self.global_step)
-                wandb_try_log({f'entropy/action mean': entropy.mean()}, self.global_step)
-                wandb_try_log({f'entropy/action max': entropy.max()}, self.global_step)
+                wandb_log({f'entropy/action min': entropy.min()}, self.global_step)
+                wandb_log({f'entropy/action mean': entropy.mean()}, self.global_step)
+                wandb_log({f'entropy/action max': entropy.max()}, self.global_step)
 
             # Add entropy gathered thus far in branches to path entropy of most recent action
             entropy_total = entropy_branches[:, -1]  # Summed along the way so last index has total
@@ -1435,9 +1508,9 @@ class LearnMax(pl.LightningModule):
             actions, action_entropy_path, actions_flat = topk_interesting(entropy_total, k=beam_width,
                                                                           rand_half='RAND_HALF' in os.environ)
             if should_log_wandb:
-                wandb_try_log({f'entropy/traj min': action_entropy_path.min()}, self.global_step)
-                wandb_try_log({f'entropy/traj mean': action_entropy_path.mean()}, self.global_step)
-                wandb_try_log({f'entropy/traj max': action_entropy_path.max()}, self.global_step)
+                wandb_log({f'entropy/traj min': action_entropy_path.min()}, self.global_step)
+                wandb_log({f'entropy/traj mean': action_entropy_path.mean()}, self.global_step)
+                wandb_log({f'entropy/traj max': action_entropy_path.max()}, self.global_step)
             action_states = get_action_states(logits, actions_flat)
 
             # Branch out by copying beginning of path for each new action state and appending new action state to end
@@ -1548,9 +1621,9 @@ class LearnMax(pl.LightningModule):
         """
         probs = F.softmax(logits, dim=-1)  # Probability of action given resulting state
         max_p_a_given_rs = probs.max(dim=-1)  # Max prob action for each state
-        wandb_try_log({f'max p(a|rs)/max_rs': max_p_a_given_rs.values.max()}, self.global_step)
-        wandb_try_log({f'max p(a|rs)/mean_rs': max_p_a_given_rs.values.mean()}, self.global_step)
-        wandb_try_log({f'max p(a|rs)/min_rs': max_p_a_given_rs.values.min()}, self.global_step)
+        wandb_log({f'max p(a|rs)/max_rs': max_p_a_given_rs.values.max()}, self.global_step)
+        wandb_log({f'max p(a|rs)/mean_rs': max_p_a_given_rs.values.mean()}, self.global_step)
+        wandb_log({f'max p(a|rs)/min_rs': max_p_a_given_rs.values.min()}, self.global_step)
 
     # Perform gradient clipping on gradients associated with gpt (optimizer_idx=1)
     # def configure_gradient_clipping(self, optimizer, optimizer_idx, gradient_clip_val, gradient_clip_algorithm):
@@ -1670,7 +1743,8 @@ def cli_main(get_model_args_fn=get_model_args_from_cli, get_train_args_fn=get_tr
                                                 final_tokens=args.num_epochs * epoch_tokens)
     t0 = time.time()
     log.info(f'training for {args.num_epochs} epochs...')
-    checkpoint_callback = ModelCheckpoint(monitor='train_loss', mode='min', every_n_train_steps=1000, save_top_k=3,
+    checkpoint_callback = ModelCheckpoint(monitor='lightning/val_loss', mode='min', every_n_train_steps=1,
+                                          save_top_k=3,
                                           verbose=True)
 
     if os.getenv('CUDA_VISIBLE_DEVICES') == '':
@@ -1682,10 +1756,13 @@ def cli_main(get_model_args_fn=get_model_args_from_cli, get_train_args_fn=get_tr
                          callbacks=[lr_decay, checkpoint_callback],
                          precision=args.precision,
                          default_root_dir=args.default_root_dir,
-                         logger=wandb_logger,
+                         # logger=wandb_logger,  # Don't do this as we have special throttling for wandb
                          deterministic=True,  # Turn off deterministic to speed up
                          # overfit_batches=1,
-                         fast_dev_run=fast_dev_run)
+                         fast_dev_run=fast_dev_run,
+                         num_sanity_val_steps=0,
+                         val_check_interval=args.train_to_test_collection_ratio * 2,  # Ensure we have data before validating
+                         )
 
     # checkpoint_callback = ModelCheckpoint(save_top_k=1, monitor="max_interesting", mode="max", period=1, verbose=True)
 

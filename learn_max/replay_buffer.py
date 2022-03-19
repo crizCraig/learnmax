@@ -19,10 +19,11 @@ class ReplayBuffers:
                  env_id,
                  short_term_mem_length,
                  data_dir=None,
-                 frames_per_file=1000,
-                 train_to_test_ratio=10,
-                 max_lru_size=1000,
-                 overfit_to_short_term=False):
+                 frames_per_file=200,
+                 train_to_test_collection_ratio=10,
+                 max_lru_size=100,
+                 overfit_to_short_term=False,
+                 verbose=True, ):
         """
         Disk backed (through torch.save()) replay buffer that moves experiences off-GPU to increase size
          and get better catastrophic forgetting avoidance with
@@ -31,7 +32,7 @@ class ReplayBuffers:
         - train and test buffer
 
         @param short_term_mem_length: Number of recent frames to keep in memory
-        @param train_to_test_ratio: Number of train to test files/blocks to store
+        @param train_to_test_collection_ratio: Number of train to test files/blocks to store
         @param max_lru_size: Number of files to keep in LRU memory
         """
         # TODO:
@@ -49,12 +50,15 @@ class ReplayBuffers:
         self.env_id = env_id
         self.frames_per_file = frames_per_file
         self.overfit_to_short_term = overfit_to_short_term
+        self.verbose = verbose
+        if verbose and overfit_to_short_term:
+            log.warning('Overfitting to short term mem')
 
         self.buffer = []  # recent in-memory experience flushes to disk when reaching frames_per_file
         self.short_term_mem_length = short_term_mem_length
         self.short_term_mem = deque(maxlen=short_term_mem_length)
         self.episode_i = 0  # Index of episode
-        self.train_to_test_ratio = train_to_test_ratio  # Episodes to train vs test on
+        self.train_to_test_collection_ratio = train_to_test_collection_ratio  # Episodes to train vs test on
         self.flush_i = 0  # Number of all replay buffers' flushes to disk
         self.total_length = 0  # Count of experiences in all buffers
         root_data_dir = ROOT_DIR + '/data'
@@ -70,7 +74,7 @@ class ReplayBuffers:
         self.train_dir = data_dir + '/train'
         self.test_buf = ReplayBuffer('test', self, self.test_dir, max_lru_size=max_lru_size)
         self.train_buf = ReplayBuffer('train', self, self.train_dir, max_lru_size=max_lru_size)
-        self.curr_buf = self.train_buf
+        self.curr_buf = self.test_buf  # Fill test buff first
 
     def append(self, exp):
         self.short_term_mem.append(exp)
@@ -81,7 +85,16 @@ class ReplayBuffers:
             self.episode_i += 1
         if self.curr_buf.just_flushed:
             self.flush_i += 1
-            if (self.flush_i % (self.train_to_test_ratio+1)) == self.train_to_test_ratio:
+            # We fill the test_buff to start, so that we have some data, which makes the pattern weird at first.
+            # Say you have 3 exp's per file and train to test is 2, then the pattern for the first 9 exp's would be
+            # as below since the test buff gets the first 3 exp's that would typically have gone in train buff in
+            # cadence that it will during the rest of training. Pipes below delineate files
+            # buf   exp_i's                                       # buf   exp_i's
+            # test  0,1,2|6,7,8     vs rest of training pattern   # test  6,7,8|
+            # train 3,4,5|9,10,11                                 # train 0,1,2|3,4,5|9,10,11
+            # So they are the same except for 0,1,2.
+
+            if (self.flush_i % (self.train_to_test_collection_ratio + 1)) == self.train_to_test_collection_ratio:
                 self.curr_buf = self.test_buf
             else:
                 self.curr_buf = self.train_buf
@@ -233,9 +246,10 @@ class LRU:
 
 def test_replay_buffers_sanity():
     log.info('Testing disk-backed replay buffers')
-    replay_buffers = ReplayBuffers(env_id='my_env', short_term_mem_length=5, frames_per_file=3, train_to_test_ratio=2,
-                                   max_lru_size=2)
-    for i in range(replay_buffers.frames_per_file * replay_buffers.train_to_test_ratio):
+    replay_buffers = ReplayBuffers(env_id='my_test_env', short_term_mem_length=5, frames_per_file=3,
+                                   train_to_test_collection_ratio=2,
+                                   max_lru_size=2, verbose=False)
+    for i in range(replay_buffers.frames_per_file * replay_buffers.train_to_test_collection_ratio):
         replay_buffers.append(Experience(
             state=AgentState(state=torch.tensor(0).cuda()),
             action=replay_buffers.total_length,
@@ -244,10 +258,10 @@ def test_replay_buffers_sanity():
             new_state=AgentState()))
 
     assert replay_buffers.curr_buf.is_test()
-    assert replay_buffers.train_buf.length == 6
-    assert replay_buffers.test_buf.length == 0
+    assert replay_buffers.train_buf.length == 3
+    assert replay_buffers.test_buf.length == 3
     assert replay_buffers.flush_i == 2
-    assert len(replay_buffers.train_buf.files) == 2
+    assert len(replay_buffers.train_buf.files) == 1
 
     replay_buffers.append(Experience(
         state=AgentState(state=torch.tensor(0).cuda()),
@@ -258,15 +272,16 @@ def test_replay_buffers_sanity():
 
     assert replay_buffers.episode_i == 1
     assert replay_buffers.curr_buf.is_test()
-    assert replay_buffers.test_buf.length == 1
-    assert replay_buffers.curr_buf.length == 1
-    assert len(replay_buffers.train_buf.files) == 2
+    assert replay_buffers.test_buf.length == 4
+    assert replay_buffers.train_buf.length == 3
+    assert replay_buffers.curr_buf.length == 4
+    assert len(replay_buffers.train_buf.files) == 1
 
     assert list(replay_buffers.train_buf.lru.mp.keys()) == []  # Don't want to add on flush/save
     replay_buffers.train_buf.get(0, 100)  # loads LRU
     first_train_lru_file = list(replay_buffers.train_buf.lru.mp.keys())[0]
 
-    for i in range(replay_buffers.frames_per_file * replay_buffers.train_to_test_ratio):
+    for i in range(replay_buffers.frames_per_file * replay_buffers.train_to_test_collection_ratio):
         replay_buffers.append(Experience(
             state=AgentState(state=torch.tensor(0).cuda()),
             action=replay_buffers.total_length,
@@ -282,10 +297,10 @@ def test_replay_buffers_sanity():
 
     exps = replay_buffers.train_buf.get(0, 5)
     assert len(exps) == 5  # Second file has no experiences
-    assert [e.action for e in exps] == [0, 1, 2, 3, 4]
-    assert len(replay_buffers.train_buf.files) == 3
-    assert len(replay_buffers.test_buf.files) == 1
-    assert [f[-5:-3] for f in replay_buffers.train_buf.files] == ['02', '05', '08']
+    assert [e.action for e in exps] == [3, 4, 5, 9, 10]
+    assert len(replay_buffers.train_buf.files) == 2
+    assert len(replay_buffers.test_buf.files) == 2
+    assert [f[-5:-3] for f in replay_buffers.train_buf.files] == ['02', '05']
 
     exps = replay_buffers.train_buf.get(0, 1)
     assert len(exps) == 1
@@ -293,13 +308,13 @@ def test_replay_buffers_sanity():
 
     exps = replay_buffers.train_buf.get(0, 100)
     assert len(exps) == len(replay_buffers.train_buf)
-    assert [e.action for e in exps] == [0, 1, 2, 3, 4, 5, 9, 10, 11, 12]
+    assert [e.action for e in exps] == [3, 4, 5, 9, 10, 11, 12]
 
-    exps = replay_buffers.train_buf.get(9, 100)
+    exps = replay_buffers.train_buf.get(6, 100)
     assert len(exps) == 1
     assert exps[0].action == 12
 
-    exps = replay_buffers.train_buf.get(8, 1)
+    exps = replay_buffers.train_buf.get(5, 1)
     assert len(exps) == 1
     assert exps[0].action == 11
 
@@ -311,7 +326,7 @@ def test_replay_buffers_sanity():
     exps = replay_buffers.train_buf.get(-1)
     assert exps[0].action == 12
 
-    for i in range(replay_buffers.frames_per_file * replay_buffers.train_to_test_ratio):
+    for i in range(replay_buffers.frames_per_file * replay_buffers.train_to_test_collection_ratio):
         replay_buffers.append(Experience(
             state=AgentState(state=torch.tensor(0).cuda()),
             action=replay_buffers.total_length,
@@ -319,6 +334,7 @@ def test_replay_buffers_sanity():
             done=False,
             new_state=AgentState()))
 
+    exps = replay_buffers.train_buf.get(-2)  # Load last file into LRU
     lru_keys = list(replay_buffers.train_buf.lru.mp.keys())
     assert lru_keys[0] != first_train_lru_file, 'LRU should overflow'
     assert len(lru_keys) != replay_buffers.train_buf.files
@@ -329,12 +345,13 @@ def test_replay_buffers_sanity():
 
 def test_replay_buffers_overfit():
     log.info('Testing replay buffer overfit')
-    replay_buffers = ReplayBuffers(env_id='my_env_overfit',
+    replay_buffers = ReplayBuffers(env_id='my_test_env_overfit',
                                    short_term_mem_length=5,
                                    frames_per_file=3,
-                                   train_to_test_ratio=2,
+                                   train_to_test_collection_ratio=2,
                                    max_lru_size=2,
-                                   overfit_to_short_term=True)
+                                   overfit_to_short_term=True,
+                                   verbose=False, )
 
     for i in range(replay_buffers.short_term_mem_length):
         replay_buffers.append(Experience(

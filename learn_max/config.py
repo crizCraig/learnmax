@@ -107,6 +107,7 @@ def add_shared_model_train_args(arg_parser: argparse.ArgumentParser, ) -> argpar
     # TODO: Use pin_memory in dataloader when using disk-backed replay buffer
     log.warning('Not pinning memory, do this once testing overfitting!')
     arg_parser.add_argument('-p', '--pin_memory', type=bool, default=False, help="pin memory on dataloaders?")
+    arg_parser.add_argument('--train_to_test_collection_ratio', type=float, help="num train to test examples to collect in replay buffer", default=10)
     return arg_parser
 
 

@@ -19,7 +19,7 @@ from loguru import logger as log
 from torch.nn import functional as F
 
 from learn_max.constants import ACC_LOG_PERIOD
-from learn_max.utils import accuracy, wandb_try_log
+from learn_max.utils import accuracy, wandb_log
 
 
 class CausalSelfAttention(nn.Module):
@@ -305,7 +305,7 @@ class GPT(nn.Module):
         # wandb.log({'train/expected_deviation_max': expected_deviation.max()})
         # wandb.log({'train/expected_deviation_min': expected_deviation.min()})
 
-        wandb_try_log({'train/logits_std': logits.std()}, self.global_step)
+        wandb_log({'train/logits_std': logits.std()}, self.global_step)
 
         return logits, expected_deviation
 
@@ -324,12 +324,12 @@ class GPT(nn.Module):
         probs = F.softmax(logits, dim=-1)
 
         entropy = -torch.sum(probs * torch.log(probs), dim=-1)  # Entropy across action-states
-        wandb_try_log({'entropy/action-state': entropy.mean()}, self.global_step)
-        wandb_try_log({'probs_std': probs.std()}, self.global_step)
+        wandb_log({'entropy/action-state': entropy.mean()}, self.global_step)
+        wandb_log({'probs_std': probs.std()}, self.global_step)
 
-        acc = self.accuracy(logits, target_idx)
+        acc = self.accuracy(logits, target_idx, split)
         if batch_idx % ACC_LOG_PERIOD == 0:
-            print('Top x prediction accuracy', acc)
+            log.info(f'Top x {split} prediction accuracy {acc}')
         p_diff = (one_hot - probs).abs()  # actual deviation
         d_diff = p_diff - expected_deviation
         d_loss = d_diff.square().sum() / d_diff.numel()
@@ -390,7 +390,7 @@ class GPT(nn.Module):
         z_q_ind, action_i = divmod(action_state_idx, self.num_actions)
         return action_i, z_q_ind
 
-    def accuracy(self, logits, target_idx):
+    def accuracy(self, logits, target_idx, split):
 
         # TODO: State based accuracy (currently action-state)
 
@@ -401,7 +401,7 @@ class GPT(nn.Module):
                        target=rearrange(target_idx, 'd0 d1 -> (d0 d1)'),
                        topk=top_acc_lvls)
         for lvl_i, lvl in enumerate(top_acc_lvls):
-            wandb_try_log({f'train/acc/top{lvl}': acc[lvl_i]}, self.global_step)
+            wandb_log({f'acc/{split}/top{lvl}': acc[lvl_i]}, self.global_step)
         return sorted(list(zip(top_acc_lvls, (float(x) for x in acc))))
 
     def training_step(self, *args, **kwargs):

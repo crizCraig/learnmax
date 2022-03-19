@@ -1,16 +1,19 @@
+import collections
 import os
+import traceback
 from datetime import datetime
 from functools import wraps
 from typing import List
 
+from loguru import logger as log
 import torch
-
 import numpy as np
 import wandb
 from numpy import array
 from torch import nn
 
-from learn_max.constants import DATE_FMT, WANDB_LOG_PERIOD
+
+from learn_max.constants import DATE_FMT, WANDB_MAX_LOG_PERIOD
 
 
 def topk_interesting(entropy, k, rand_half=False):
@@ -201,12 +204,45 @@ def _init_weights(module):
         module.weight.data.fill_(1.0)
 
 
-def wandb_try_log(msg_dict, global_step):
-    if global_step % WANDB_LOG_PERIOD == 0:
+def _wandb_log_closure():
+    """
+    From: https://docs.wandb.ai/guides/track/log/logging-faqs
+    We recommend that you try to log less than 10,000 points per metric. If you log more than 1 million points in a
+    line, it will take us while to load the page. For more on strategies for reducing logging footprint without
+    sacrificing accuracy, check out this Colab[1]. If you have more than 500 columns of config and summary metrics,
+    we'll only show 500 in the table.
+
+    [1] https://colab.research.google.com/github/wandb/examples/blob/master/colabs/wandb-log/Logging_Strategies_for_High_Frequency_Data.ipynb#scrollTo=vDhYdZDR-7Er
+    """
+    accum = collections.defaultdict(list)
+
+    # Start at 1 and increase to stay under 10k points per metric,
+    # allows quickly seeing initial fast-changing metrics in wandb
+    freq = 1
+
+    def append(msg_dict, global_step):
+        nonlocal accum
+        for k in msg_dict:
+            accum[k].append(msg_dict[k])
+
+    def check_flush(batch_idx):
+        nonlocal accum, freq
+        if batch_idx % freq != 0:
+            return
+        freq = min(int(freq + 0.1), WANDB_MAX_LOG_PERIOD)  # 10@1hz, 10@1/2hz, 10@1/3hz... 1/WANDB_MAX_LOG_PERIOD
+        log_dict = {k: sum(accum[k]) / len(accum[k]) for k in accum}
+        log_dict['batch_idx'] = batch_idx
         try:
-            wandb.log(msg_dict)
-        except:
-            pass
+            wandb.log(log_dict, step=batch_idx)
+            accum.clear()
+            return True
+        except Exception as e:
+            log.error(f'Error logging to wandb {e}')
+        return False
+    return append, check_flush
+
+
+wandb_log, wandb_check_flush = _wandb_log_closure()
 
 
 def get_batch_vars(batch, use_next=False, return_agent_state=False, populate_gpt=False):
@@ -368,6 +404,19 @@ def no_train(f):
             if was_training:
                 self.train()
         return ret
+    return wrapper
+
+
+def best_effort(f):
+    """
+    Decorator for model ops that don't require grads and should be done in eval mode for things like Dropout
+    """
+    @wraps(f)
+    def wrapper(self, *args, **kwds):
+        try:
+            return f(self, *args, **kwds)
+        except:
+            print(traceback.format_exc())
     return wrapper
 
 
