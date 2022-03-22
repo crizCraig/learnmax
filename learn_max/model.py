@@ -198,7 +198,7 @@ class LearnMax(pl.LightningModule):
         self.num_search_steps = num_search_steps
 
         # TODO: Set a separate DVQ batch size
-        self.batch_size = gpt_batch_size if self.should_train_gpt else batch_size
+        self.dvq_batch_size = gpt_batch_size if self.should_train_gpt else batch_size
 
         # Visualization
         self.should_viz_predict_trajectory = should_viz_predict_trajectory
@@ -309,14 +309,14 @@ class LearnMax(pl.LightningModule):
 
         # Replay buffers (test and train)
         short_term_mem_length = 1000 if self.should_overfit_gpt else self.gpt_block_size * 2
-        self.buffers = ReplayBuffers(env_id=self.env_id, short_term_mem_length=short_term_mem_length,
-                                     overfit_to_short_term=should_overfit_gpt,
-                                     train_to_test_collection_ratio=train_to_test_collection_ratio,
-                                     # Get a full val batch when training starts
-                                     frames_per_file=self.gpt_block_size * self.gpt_batch_size)
-        self.train_buf = self.buffers.train_buf
-        self.test_buf = self.buffers.test_buf
-        self.recent_experience = self.buffers.short_term_mem
+        self.replay_buffers = ReplayBuffers(env_id=self.env_id, short_term_mem_length=short_term_mem_length,
+                                            overfit_to_short_term=should_overfit_gpt,
+                                            train_to_test_collection_ratio=train_to_test_collection_ratio,
+                                            # Get a full val batch when training starts
+                                            frames_per_file=self.gpt_block_size * self.gpt_batch_size)
+        self.train_buf = self.replay_buffers.train_buf
+        self.test_buf = self.replay_buffers.test_buf
+        self.recent_experience = self.replay_buffers.short_term_mem
         self.predicted_trajectories_size = self.recent_experience.maxlen
 
         # Trajectory visualization data
@@ -404,7 +404,7 @@ class LearnMax(pl.LightningModule):
                 next_agent_state = self.get_agent_state(next_state)
                 exp = Experience(state=self.agent_state, action=action[0], reward=reward, done=done,
                                  new_state=next_agent_state)
-                self.buffers.append(exp)
+                self.replay_buffers.append(exp)
 
                 # Creates new AgentState so append_i is correct
                 self.agent_state = self.get_agent_state(next_state)
@@ -433,10 +433,6 @@ class LearnMax(pl.LightningModule):
         Returns:
             yields tuple containing  state, action, reward, done, next_state, and agent_state dict.
         """
-
-        # TODO: Train DVQ here as well
-        if not self.should_train_gpt:
-            raise NotImplementedError('DVQ training was done in VQVAE.py, needs to be moved here')
 
         episode_reward = 0
         episode_steps = 0
@@ -478,7 +474,7 @@ class LearnMax(pl.LightningModule):
                 break
 
     def gen_validation_batch(self, ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        if len(self.buffers.test_buf) == 0:
+        if len(self.replay_buffers.test_buf) == 0:
             yield from self._yield_empty_validation_batch()
         else:
             # TODO: Move this tuple into a @dataclass
@@ -539,10 +535,31 @@ class LearnMax(pl.LightningModule):
                 num_extra_block_indices=num_extra_block_indices,
             )
         else:
-            # Sample randomly from replay buffer
-            # TODO: Copy sample() from MultiStepBuffer.sample as we moved to a plain deque
-            agent_states, actions, rewards, dones, new_agent_states = self.buffer.sample(
-                self.batch_size)  # TODO: Change to dvq_batch_size?
+            # Sample single states randomly from replay buffer
+            # agent_states, actions, rewards, dones, new_agent_states = self.buffer.sample(
+            #     self.dvq_batch_size)
+
+            indices = np.random.choice(len(self.train_buf), self.dvq_batch_size, replace=False)
+            states, actions, rewards, dones, next_states = zip(*(self.train_buf[idx] for idx in indices))
+
+            ret = (
+                torch.stack([torch.cat(rs) for rs in ret_states]),
+                np.array(ret_actions),
+                np.array(ret_rewards, dtype=np.float32),
+                np.array(ret_dones, dtype=bool),
+                torch.stack([torch.cat(rs) for rs in ret_next_states]),
+                ret_agent_states,
+                ret_next_agent_states,
+            )
+
+            return (
+                np.array(states),
+                np.array(actions),
+                np.array(rewards, dtype=np.float32),
+                np.array(dones, dtype=np.bool),
+                np.array(next_states),
+            )
+
             raise NotImplementedError('Get DVQ training to work with new agent_state protocol, old code below')
             states = np.array([x for x in states[:, 0]])
             new_states, agent_states = new_states[:, 0], new_states[:, 1]
@@ -561,7 +578,7 @@ class LearnMax(pl.LightningModule):
         # If in tree search and just died, then is_done=True, return early, no need to search
         dead_state = self.agent_state
         spawn_state = self.reset()
-        self.buffers.append(Experience(
+        self.replay_buffers.append(Experience(
             state=dead_state,
             # Reset action is noop - refer to self.env.unwrapped._action_set
             # to ensure this is true for your env. Montezuma=Yes
@@ -581,7 +598,7 @@ class LearnMax(pl.LightningModule):
         # If is_done, we need to append an experience with last_state, reset_state, action=None
         # The replay buffer should know reset boundaries so that we can avoid sampling across resets
         # If in tree search and just died, then is_done=True, return early, no need to search
-        self.buffers.append(exp)
+        self.replay_buffers.append(exp)
         self.predicted_trajectory_buffer.append(predicted_trajectory)
         self.agent_state = self.get_agent_state(next_state)  # Create new AgentState so append_i is correct
         return episode_reward, episode_steps, is_done
@@ -958,6 +975,7 @@ class LearnMax(pl.LightningModule):
         else:
             start_delay = 0
         num_viz = (len(self.recent_experience) - start_delay) // num_predict
+        num_viz = min(num_viz, 10)
         if num_viz < 1:
             log.warning('Not enough buffer to predict')
             return
@@ -1124,7 +1142,7 @@ class LearnMax(pl.LightningModule):
                      f'Was {self.warm_start_size}, now  is {warm_start_size}')
             self.warm_start_size = warm_start_size
         else:
-            batch_size = self.batch_size  # Already set in __init__ but in case we toggle training gpt, set here too
+            batch_size = self.dvq_batch_size  # Already set in __init__ but in case we toggle training gpt, set here too
 
         log.info(f'Populating replay buffer with {self.warm_start_size} experiences...')
         self.populate(self.warm_start_size)
@@ -1153,7 +1171,7 @@ class LearnMax(pl.LightningModule):
         if self.should_train_gpt:
             batch_size = self.gpt_batch_size
         else:
-            batch_size = self.batch_size  # Already set in __init__ but in case we toggle training gpt, set here too
+            batch_size = self.dvq_batch_size  # Already set in __init__ but in case we toggle training gpt, set here too
 
         # Images on GPU already so pin_memory raises exception
         return DataLoader(dataset=validation_dataset, batch_size=batch_size, num_workers=self.num_workers,
@@ -1576,7 +1594,7 @@ class LearnMax(pl.LightningModule):
         z_q_ind_branches = []
         action_branches = []
         max_size = max_size or self.gpt_block_size
-        recent_exp = self.buffers.short_term_mem
+        recent_exp = self.replay_buffers.short_term_mem
         look_back = min(len(recent_exp), max_size)
         just_died = False
         all_branches = [z_q_embed_branches, z_q_ind_branches, action_branches]

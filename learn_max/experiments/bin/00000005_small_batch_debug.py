@@ -14,6 +14,7 @@ def get_model_args():
     args.should_train_gpt = True
     args.dvq_checkpoint = '/home/a/src/learnmax/epoch=3-step=30999.ckpt'
 
+    # Overfit args
     args.should_overfit_gpt = False
     args.actions_per_batch = 2
 
