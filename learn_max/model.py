@@ -552,19 +552,19 @@ class LearnMax(pl.LightningModule):
                 ret_next_agent_states,
             )
 
-            return (
-                np.array(states),
-                np.array(actions),
-                np.array(rewards, dtype=np.float32),
-                np.array(dones, dtype=np.bool),
-                np.array(next_states),
-            )
+            # return (
+            #     np.array(states),
+            #     np.array(actions),
+            #     np.array(rewards, dtype=np.float32),
+            #     np.array(dones, dtype=np.bool),
+            #     np.array(next_states),
+            # )
 
-            raise NotImplementedError('Get DVQ training to work with new agent_state protocol, old code below')
-            states = np.array([x for x in states[:, 0]])
-            new_states, agent_states = new_states[:, 0], new_states[:, 1]
-            new_states = np.array([x for x in new_states])
-        return states, actions, rewards, dones, new_states, agent_states, next_agent_states
+        #     raise NotImplementedError('Get DVQ training to work with new agent_state protocol, old code below')
+        #     states = np.array([x for x in states[:, 0]])
+        #     new_states, agent_states = new_states[:, 0], new_states[:, 1]
+        #     new_states = np.array([x for x in new_states])
+        # return states, actions, rewards, dones, new_states, agent_states, next_agent_states
 
     def reset_after_death(self):
         # TODO: The replay buffer should know reset boundaries so that we can avoid sampling across resets.
@@ -1321,10 +1321,11 @@ class LearnMax(pl.LightningModule):
         that we can pass zeroes to them when we don't have context and reuse the learning that takes place without
         context.
 
-        The salient states are just dvq outputs, i.e. z states at each saliency level, which allows the same transformer to be
-        reused for each saliency level. The difference is that, the context token will dictate skipping lower level states
-        directly to the next salient state at that level. The distance between salient states is variable, e.g.
-        "first i'll climb this mountain (for 1 hour), then I'll take a picture (2 minutes), and eat lunch (20 minutes)."
+        The salient states are just dvq outputs, i.e. z states at each saliency level, which allows the same
+        transformer to be reused for each saliency level. The difference is that, the context token will dictate
+        skipping lower level states directly to the next salient state at that level. The distance between salient
+        states is variable, e.g. "first i'll climb this mountain (for 1 hour), then I'll take a picture (2 minutes),
+        and eat lunch (20 minutes)."
 
         We need to stop adding levels when we run out of memory. cf visual cortex levels => prefrontal cortex
 
@@ -1356,7 +1357,11 @@ class LearnMax(pl.LightningModule):
         in 10 steps, but have not seen *any* salient step by 20 steps, then the probability of replanning is
         1 = max(0, (actual_steps - expected_steps) / expected_steps )
         If at any time we see a state (i.e action-state) that is a known salient state at that level, then we
-        also replan at that level as we've encountered a different sequence.
+        also replan at that level as we've encountered a different sequence. The downside to this is that we don't
+        have an up to date idea of whether the planned next salient is still likely given low level context,
+        so actually we could simplify by removing the expected count and just use the logit context from below.
+
+
 
         Compression (does not apply to possibility-based saliency):
             If the next salient state is reached and it's no longer surprising, i.e. it's by far the most probable state
@@ -1426,13 +1431,18 @@ class LearnMax(pl.LightningModule):
             outcomes of the current context - at which point we will need to replan up through all saliency levels.
 
         TODO:
-            Really what we want is to follow high probability paths until some level of uncertainty is encountered.
+            Really what we want is to follow high probability / high saliency
+            paths until some level of uncertainty is encountered.
             Right now we just greedily take uncertain actions. This is fine if entropy is high, but if entropy is low
-            for the initial action, most learning will occur later on. So we should sample randomly from low
-            entropy states or even sample high probability actions until we find some threshold level of uncertainty
-            in our plan. Then we should take actions that allow us to get to that frontier of knowledge and take
-            actions there which resolve the uncertainty and allow us to reach one step further in the future.
-            This will be done with salient states.
+            for the initial action, most learning will occur later on.
+            We want to sample such that possibilities are expanded. To do this we'll follow
+            the highest known high (high probability) salient states trajectories which should be low entropy.
+            Then when we reach the frontier of knowledge, we see high entropy and unknown possibilities.
+            We must therefore clarify the knowledge frontier (i.e. resolve uncertainty) to expand possibilities
+            at the knowledge frontier. Possibilities / opportunities at higher saliency levels, represent longer term
+            and wider reaching states that will encompass learning at all the levels below (e.g. humans on mars will
+            mean learning from the vastly different sensory experience on mars up through different day/night, month,
+            year, etc... patterns.)
 
         TODO:
             The entropy score of a plan should be weighted by the joint action-state probabilities that
