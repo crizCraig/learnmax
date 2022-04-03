@@ -7,6 +7,7 @@ import os
 import math
 from argparse import ArgumentParser
 
+from loguru import logger as log
 import numpy as np
 import torch
 import wandb
@@ -90,7 +91,7 @@ class VQVAE(dvq_module):
     def forward(self, x):
 
         z = self.encoder(x)
-        
+
         z_q_emb, z_q_flat, latent_loss, z_q_ind = self.quantizer.forward(z)  # zq 128, 64, 8, 8 vs 128, 1024
         self.quantizer.global_step = self.global_step
         if 'TRY_NON_QUANTIZED' in os.environ:

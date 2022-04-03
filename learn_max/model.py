@@ -57,6 +57,7 @@ class LearnMax(pl.LightningModule):
             num_embeddings: int = None,  # Number of possible discrete states shared between dvq and gpt
 
             # dvq args - dvq = deep vector quantization
+            dvq_batch_size: int = 32,  # DVQ batch size
             dvq_n_hid: int = 64,  # number of channels controlling the size of the model
             # dvq_embedding_dim: int = 4410,  # now embedding_dim but may separate from GPT embedding dim) length of embedding vectors output by dvq to transformers
             # dvq_num_embeddings: int = 512,   # now num_embeddings,  vocabulary size; number of possible discrete states
@@ -197,8 +198,7 @@ class LearnMax(pl.LightningModule):
         self.beam_width = beam_width
         self.num_search_steps = num_search_steps
 
-        # TODO: Set a separate DVQ batch size
-        self.dvq_batch_size = gpt_batch_size if self.should_train_gpt else batch_size
+        self.dvq_batch_size = dvq_batch_size
 
         # Visualization
         self.should_viz_predict_trajectory = should_viz_predict_trajectory
@@ -313,7 +313,8 @@ class LearnMax(pl.LightningModule):
                                             overfit_to_short_term=should_overfit_gpt,
                                             train_to_test_collection_ratio=train_to_test_collection_ratio,
                                             # Get a full val batch when training starts
-                                            frames_per_file=self.gpt_block_size * self.gpt_batch_size)
+                                            frames_per_file=max(self.dvq_batch_size,
+                                                                self.gpt_block_size * self.gpt_batch_size))
         self.train_buf = self.replay_buffers.train_buf
         self.test_buf = self.replay_buffers.test_buf
         self.recent_experience = self.replay_buffers.short_term_mem
@@ -355,17 +356,32 @@ class LearnMax(pl.LightningModule):
         if not isinstance(state, torch.Tensor):
             state = torch.tensor(np.array(state), device=self.device)  # causes issues when num_workers > 0
 
-        # TODO: Check if we should train DVQ and if not, put this in a no_train block
-        x, x_hat, z_q_emb, z_q_flat, latent_loss, recon_loss, dvq_loss, z_q_ind = self.dvq.forward(state)
-
+        if self.should_train_gpt:
+            dvq_loss, latent_loss, recon_loss, x, x_hat, z_q_emb, z_q_flat, z_q_ind = self.get_dvq_vars(state)
+        else:
+            dvq_loss, latent_loss, recon_loss, x, x_hat, z_q_emb, z_q_flat, z_q_ind = (
+                None, None, None, None, None, None, None, None
+            )
         # Allow GPT to forward and store intermediate activations used for backprop
         # TODO: Check if we need to do requires_grad_() - I think it's already being done for us
-        z_q_flat.detach_()
+        # z_q_flat.detach_()
 
-        agent_state = AgentState(state=state, dvq_x=x, dvq_x_hat=x_hat, dvq_z_q_emb=z_q_emb, dvq_z_q_flat=z_q_flat,
-                                 dvq_latent_loss=latent_loss, dvq_recon_loss=recon_loss, dvq_loss=dvq_loss,
+        agent_state = AgentState(state=state,
+                                 dvq_x=x,
+                                 dvq_x_hat=x_hat,
+                                 dvq_z_q_emb=z_q_emb,
+                                 dvq_z_q_flat=z_q_flat,
+                                 dvq_latent_loss=latent_loss,
+                                 dvq_recon_loss=recon_loss,
+                                 dvq_loss=dvq_loss,
                                  dvq_z_q_ind=z_q_ind)
         return agent_state
+
+    @no_train
+    def get_dvq_vars(self, state):
+        # TODO: Check if we should train DVQ and if not, put this in a no_train block
+        x, x_hat, z_q_emb, z_q_flat, latent_loss, recon_loss, dvq_loss, z_q_ind = self.dvq.forward(state)
+        return dvq_loss, latent_loss, recon_loss, x, x_hat, z_q_emb, z_q_flat, z_q_ind
 
     # def run_n_episodes(self, env, n_epsiodes: int = 1, epsilon: float = 1.0) -> List[int]:
     #     """
@@ -394,12 +410,13 @@ class LearnMax(pl.LightningModule):
     #
     #     return total_rewards
 
+    @no_train
     def populate(self, warm_start: int) -> None:
         """Populates the buffer with initial experience"""
         if warm_start > 0:
-            agent_state = self.reset()
-            for _ in range(warm_start):
-                action, predicted_trajectory = self.agent.get_action(agent_state, self.device)
+            self.reset()
+            while len(self.train_buf) < warm_start:
+                action, predicted_trajectory = self.agent.get_action(self.agent_state, self.device)
                 next_state, reward, done, info = self.env.step(action[0])
                 next_agent_state = self.get_agent_state(next_state)
                 exp = Experience(state=self.agent_state, action=action[0], reward=reward, done=done,
@@ -426,7 +443,7 @@ class LearnMax(pl.LightningModule):
         output = self.net(x)
         return output
 
-    def gen_train_batch(self, ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def training_batch_gen(self, ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Contains the logic for generating a new batch of data to be passed to the DataLoader
 
@@ -500,6 +517,8 @@ class LearnMax(pl.LightningModule):
         yield torch.tensor(0), torch.tensor(0), torch.tensor(0), torch.tensor(0), torch.tensor(0)
 
     def agent_states_to_dict(self, thing):
+        if isinstance(thing, AgentState):
+            return thing.dict()
         if isinstance(thing[0], AgentState):
             # agents_states only has a batch dimension, not window size
             return [_.dict() for _ in thing]
@@ -540,31 +559,20 @@ class LearnMax(pl.LightningModule):
             #     self.dvq_batch_size)
 
             indices = np.random.choice(len(self.train_buf), self.dvq_batch_size, replace=False)
-            states, actions, rewards, dones, next_states = zip(*(self.train_buf[idx] for idx in indices))
-
-            ret = (
-                torch.stack([torch.cat(rs) for rs in ret_states]),
-                np.array(ret_actions),
-                np.array(ret_rewards, dtype=np.float32),
-                np.array(ret_dones, dtype=bool),
-                torch.stack([torch.cat(rs) for rs in ret_next_states]),
-                ret_agent_states,
-                ret_next_agent_states,
+            exps = tuple(self.train_buf.get(idx)[0] for idx in indices)
+            states, actions, rewards, dones, new_states, agent_states, next_agent_states = (
+                torch.cat([exp.state.state for exp in exps]),
+                np.array([exp.action for exp in exps]),
+                np.array([exp.reward for exp in exps], dtype=np.float32),
+                np.array([exp.done for exp in exps], dtype=bool),
+                torch.cat([exp.new_state.state for exp in exps]),
+                [exp.state for exp in exps],
+                [exp.new_state for exp in exps],
             )
-
-            # return (
-            #     np.array(states),
-            #     np.array(actions),
-            #     np.array(rewards, dtype=np.float32),
-            #     np.array(dones, dtype=np.bool),
-            #     np.array(next_states),
-            # )
-
-        #     raise NotImplementedError('Get DVQ training to work with new agent_state protocol, old code below')
         #     states = np.array([x for x in states[:, 0]])
         #     new_states, agent_states = new_states[:, 0], new_states[:, 1]
         #     new_states = np.array([x for x in new_states])
-        # return states, actions, rewards, dones, new_states, agent_states, next_agent_states
+        return states, actions, rewards, dones, new_states, agent_states, next_agent_states
 
     def reset_after_death(self):
         # TODO: The replay buffer should know reset boundaries so that we can avoid sampling across resets.
@@ -736,7 +744,7 @@ class LearnMax(pl.LightningModule):
             # if self.trainer.use_dp or self.trainer.use_ddp2:
             #     loss = loss.unsqueeze(0)
         else:
-            latent_loss, dvq_loss, recon_loss = self._train_step_dvq(batch, batch_idx)
+            latent_loss, dvq_loss, recon_loss = self.training_step_dvq(batch, batch_idx)
             loss = dvq_loss
             # self.log_dict({
             #     "dvq_recon_loss": recon_loss,
@@ -1087,25 +1095,25 @@ class LearnMax(pl.LightningModule):
             get_image_from_state(state.state, folder, i)  # TODO: We save this for movie too, reuse data?
             # im.show()
 
-    def _train_step_dvq(self, batch, batch_idx):
+    def training_step_dvq(self, batch, batch_idx):
         self.dvq.set_do_kmeans(True)
 
         _, agent_state = get_batch_vars(batch, return_agent_state=True)
 
         # TODO: No need to call training_step again, just need to get the average loss from the batch.
-        dvq_loss = torch.mean(torch.Tensor([a["dvq_loss"].mean() for a in agent_state]))
-        recon_loss = torch.mean(torch.Tensor([a["recon_loss"].mean() for a in agent_state]))
-        latent_loss = torch.mean(torch.Tensor([a["latent_loss"].mean() for a in agent_state]))
+        # dvq_loss = agent_state["dvq_loss"].mean()
+        # recon_loss = agent_state["dvq_recon_loss"].mean()
+        # latent_loss = agent_state["dvq_latent_loss"].mean()
 
-        # dvq_loss, recon_loss, latent_loss, x_hat = self.dvq.training_step(batch, batch_idx)
+        dvq_loss, recon_loss, latent_loss, x_hat = self.dvq.training_step(batch, batch_idx)
 
         # We use multiple optimizers so need to manually backward each one separately
         self.dvq_optimizer.zero_grad()
         self.manual_backward(dvq_loss)
         self.dvq_optimizer.step()
         loss = dvq_loss
-        if self.trainer.use_dp or self.trainer.use_ddp2:
-            loss = loss.unsqueeze(0)
+        # if self.trainer.use_dp or self.trainer.use_ddp2:
+        #     loss = loss.unsqueeze(0)
         self.dvq.global_step = self.global_step
         return latent_loss, loss, recon_loss
 
@@ -1137,11 +1145,9 @@ class LearnMax(pl.LightningModule):
                     prop.zero_grad()
             batch_size = self.gpt_batch_size
             self.dvq.set_do_kmeans(False)
-            warm_start_size = 2 * self.gpt_batch_size * self.gpt_block_size  # One val and one train batch
-            log.info(f'Not training dvq so setting warm start size to batch size * gpt_block_size. '
-                     f'Was {self.warm_start_size}, now  is {warm_start_size}')
-            self.warm_start_size = warm_start_size
+            self.warm_start_size = 2 * self.gpt_batch_size * self.gpt_block_size  # One val and one train batch
         else:
+            self.warm_start_size = self.dvq_batch_size
             batch_size = self.dvq_batch_size  # Already set in __init__ but in case we toggle training gpt, set here too
 
         log.info(f'Populating replay buffer with {self.warm_start_size} experiences...')
@@ -1149,7 +1155,7 @@ class LearnMax(pl.LightningModule):
         log.info(f'...finished populating replay buffer')
 
         # train_batch calls the model to get the next action, so each worker has a copy of the model!
-        self.dataset = ExperienceSourceDataset(self.gen_train_batch)
+        self.dataset = ExperienceSourceDataset(self.training_batch_gen)
 
         if not self.pin_memory:
             log.warning('Pin memory is off, data loading will be slow. Turn on when using disk backed replay buffer')
@@ -1758,7 +1764,6 @@ def cli_main(get_model_args_fn=get_model_args_from_cli, get_train_args_fn=get_tr
     seed_everything(SEED)  # env is seeded later tho
 
     if not model.should_train_gpt:
-        raise NotImplementedError('Need to revive DVQ training')
         train_dvq(args, model, wandb_logger, fast_dev_run)
 
     # Train GPT
@@ -1778,6 +1783,9 @@ def cli_main(get_model_args_fn=get_model_args_from_cli, get_train_args_fn=get_tr
     if os.getenv('CUDA_VISIBLE_DEVICES') == '':
         args.num_gpus = 0
 
+    deterministic = True
+    if deterministic:
+        log.warning('Deterministic is on, turn off to speed up')
     trainer = pl.Trainer(gpus=args.num_gpus,
                          max_epochs=args.num_epochs,
                          # gradient_clip_val=1.0, # lightning does not support with manual optimization which we need due to two optimizers
@@ -1785,7 +1793,7 @@ def cli_main(get_model_args_fn=get_model_args_from_cli, get_train_args_fn=get_tr
                          precision=args.precision,
                          default_root_dir=args.default_root_dir,
                          # logger=wandb_logger,  # Don't do this as we have special throttling for wandb
-                         deterministic=True,  # Turn off deterministic to speed up
+                         deterministic=deterministic,  # Turn off deterministic to speed up
                          # overfit_batches=1,
                          fast_dev_run=fast_dev_run,
                          num_sanity_val_steps=0,
@@ -1854,8 +1862,10 @@ def train_dvq(args, model, wandb_logger, fast_dev_run):
     # Do k-means throughout training, not just once: works great! went from 10/20 to 19.5/20 correct images
     # Output image, we can count images that are obviously wrong
     # 10 points per cluster seemed to work better than 20, try 15, etc...: 15 works pretty well vs 20 and 10
-    trainer = pl.Trainer.from_argparse_args(args, callbacks=callbacks, max_steps=int(1.2e6), logger=wandb_logger,
-                                            gpus=args.num_gpus, fast_dev_run=fast_dev_run)  # Max steps can be like 5k I think.
+
+    # Max steps can be like 5k I think.
+    trainer = pl.Trainer.from_argparse_args(args, callbacks=callbacks, max_steps=int(1.2e6),
+                                            logger=wandb_logger, gpus=args.num_gpus, fast_dev_run=fast_dev_run)
     trainer.fit(model)
 
 

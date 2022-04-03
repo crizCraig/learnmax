@@ -1,4 +1,5 @@
 import copy
+import gc
 import glob
 import itertools
 import os
@@ -54,7 +55,6 @@ class ReplayBuffers:
         if verbose and overfit_to_short_term:
             log.warning('Overfitting to short term mem')
 
-        self.buffer = []  # recent in-memory experience flushes to disk when reaching frames_per_file
         self.short_term_mem_length = short_term_mem_length
         self.short_term_mem = deque(maxlen=short_term_mem_length)
         self.episode_i = 0  # Index of episode
@@ -195,6 +195,8 @@ class ReplayBuffer:
         )
         self._save(block)
         self._flush_buf.clear()
+        torch.cuda.empty_cache()
+        gc.collect()
 
     def _save(self, block):
         filename = self._get_filename(self.length, self.split)
@@ -338,6 +340,8 @@ def test_replay_buffers_sanity():
     lru_keys = list(replay_buffers.train_buf.lru.mp.keys())
     assert lru_keys[0] != first_train_lru_file, 'LRU should overflow'
     assert len(lru_keys) != replay_buffers.train_buf.files
+
+    # TODO: Ensure GPU mem released
 
     replay_buffers.delete()  # TODO: Put in tear down fn
     log.info('Done testing disk-backed replay buffers')

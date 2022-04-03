@@ -25,7 +25,13 @@ class AgentState:
     split: torch.tensor = 0  # 0 for train 1 for test
 
     def dict(self):
-        return self.__dict__
+        d = self.__dict__
+        ret = {}
+        for k in d:
+            if d[k] is not None:
+                # Lightning doesn't want these
+                ret[k] = d[k]
+        return ret
 
     def to(self, device):
         for field in dataclasses.fields(self):
@@ -86,22 +92,23 @@ class LearnMaxAgent:
         #   be used to check the above heuristics. Also psuedo-count methods cf Marc G Bellmare
         # - DVQ reconstruction loss - if the image hasn't been seen before, we will do a really bad job at reconstructing,
         #   esp. if it's a new level in zuma for example
-        dvq_x = agent_state.dvq_x
-        if not self.model.should_train_gpt:
-            raise NotImplementedError('Need to revive this code')
-            # TODO: We have already forwarded these through the model, so there's no reason to re-forward. We just
-            #   need to compute the average loss and run the manual backward.
-            # TODO: Move self.dvq_ready setting to LearnMax model
-            self.s_buff.append(dvq_x)
-            dvq_batch_ready = self.model.training and len(self.s_buff) == self.s_buff.maxlen
-            if dvq_batch_ready:
-                dvq_x = torch.cat(tuple(self.s_buff))  # Stack states in 0th (batch) dimension
-                self.s_buff.clear()
-                self.dvq_ready = True  # dvq outputs are now based on some training
+        # if not self.model.should_train_gpt:
+        #     raise NotImplementedError('Need to revive this code')
+        #     # TODO: We have already forwarded these through the model, so there's no reason to re-forward. We just
+        #     #   need to compute the average loss and run the manual backward.
+        #     # TODO: Move self.dvq_ready setting to LearnMax model
+        #     self.s_buff.append(dvq_x)
+        #     dvq_batch_ready = self.model.training and len(self.s_buff) == self.s_buff.maxlen
+        #     if dvq_batch_ready:
+        #         dvq_x = torch.cat(tuple(self.s_buff))  # Stack states in 0th (batch) dimension
+        #         self.s_buff.clear()
+        #         self.dvq_ready = True  # dvq outputs are now based on some training
 
         # Return a random action if we haven't filled buffer of z states.
-        if len(self.model.train_buf) < self.model.gpt_block_size:  # TODO: Use self.dvq_ready to do dvq training again
-            ret = self.get_random_action(len(dvq_x))
+        if not self.model.should_train_gpt or len(self.model.train_buf) < self.model.gpt_block_size:  # TODO: Use self.dvq_ready to do dvq training again
+            ret = self.get_random_action(len(agent_state.state))
+            if len(agent_state.state) != 1:
+                raise Exception('Should we be getting multiple actions like this?')
             predicted_trajectory = None
         else:
             # Search through tree of predicted a,z to find most interesting future

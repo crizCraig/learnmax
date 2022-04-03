@@ -3,12 +3,12 @@ import os
 from learn_max.config import get_blank_model_args, get_blank_train_args
 from learn_max.model import cli_main
 
-train_to_test_collection_ratio = 1
+train_to_test_collection_ratio = 10
 
 
 def get_model_args():
     args = get_blank_model_args()
-    args.gpt_batch_size = 2
+    args.dvq_batch_size = 32
     args.should_train_gpt = False
 
     # Model + train args
