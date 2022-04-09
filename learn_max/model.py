@@ -746,9 +746,10 @@ class LearnMax(pl.LightningModule):
         else:
             latent_loss, dvq_loss, recon_loss = self.training_step_dvq(batch, batch_idx)
             loss = dvq_loss
-            # self.log_dict({
-            #     "dvq_recon_loss": recon_loss,
-            #     "dvq_latent_loss": latent_loss, })
+            self.log_dict({
+                'lightning/dvq_recon_loss': recon_loss,
+                'lightning/dvq_latent_loss': latent_loss,
+            })
 
         self.log_dict({
             'lightning/total_reward': float(self.total_rewards[-1]) if self.total_rewards else 0,
@@ -779,7 +780,7 @@ class LearnMax(pl.LightningModule):
             log.info(f'Validation loss {loss}, batch length {len(batch)}')
             self.log_dict({'lightning/val_loss': loss})
         else:
-            raise NotImplementedError('Need to call dvq validation')
+            log.warning('Need to implement dvq validation')
 
     @no_train
     def viz_dvq_clusters(self, batch_idx):
@@ -857,8 +858,10 @@ class LearnMax(pl.LightningModule):
         self.cuda()
         wandb.init(entity='crizcraig', mode='disabled')
 
-        test_loader = self.validation_dataloader()
+        test_loader = self.train_dataloader()
         xl = next(iter(test_loader))[0].cuda()
+        xl = next(iter(test_loader))[0].cuda()
+        # xl = next(iter(test_loader))[0].cuda()
         x = xl.cuda().reshape(-1, 3, 84, 84)
         # TODO: List => Tensor
         # x = [t.cuda() for t in xl]
@@ -1696,7 +1699,7 @@ def cli_main(get_model_args_fn=get_model_args_from_cli, get_train_args_fn=get_tr
     viz_dvq = args.viz_dvq or args.viz_all_dvq_clusters
 
     if viz_dvq:
-        args.training_gpt = False
+        args.should_train_gpt = False
         args.dvq_enable_kmeans = False
         args.warm_start_size = 100
 
@@ -1763,9 +1766,36 @@ def cli_main(get_model_args_fn=get_model_args_from_cli, get_train_args_fn=get_tr
 
     seed_everything(SEED)  # env is seeded later tho
 
-    if not model.should_train_gpt:
+    if model.should_train_gpt:
+        train_gpt(args, fast_dev_run, model)
+    else:
         train_dvq(args, model, wandb_logger, fast_dev_run)
 
+
+def train_dvq(args, model, wandb_logger, fast_dev_run):
+    # -------------------- Standard dvq training
+    # annealing schedules for lots of constants
+    checkpoint_callback = ModelCheckpoint(monitor='lightning/dvq_recon_loss', mode='min', every_n_train_steps=1000,
+                                          save_top_k=1,
+                                          verbose=True)
+    callbacks = [checkpoint_callback,
+                 DecayLR()]
+    if False and args.dvq_vq_flavor == 'gumbel':  # Not used yet
+        callbacks.extend([DecayTemperature(), RampBeta()])
+    # Things to try
+    # More steps cos anneal goes to 1.2M! Not helping
+    # Fewer clusters, we're only using ~50 out of 4096: Resulted in blurry images
+    # Do k-means throughout training, not just once: works great! went from 10/20 to 19.5/20 correct images
+    # Output image, we can count images that are obviously wrong
+    # 10 points per cluster seemed to work better than 20, try 15, etc...: 15 works pretty well vs 20 and 10
+
+    # Max steps can be like 5k I think.
+    trainer = pl.Trainer.from_argparse_args(args, callbacks=callbacks, max_steps=int(1.2e6),
+                                            logger=wandb_logger, gpus=args.num_gpus, fast_dev_run=fast_dev_run)
+    trainer.fit(model)
+
+
+def train_gpt(args, fast_dev_run, model):
     # Train GPT
     log.info("preparing the learning rate schedule")
     # number of tokens backpropped in one iteration, need to reduce for zuma vs char as tokens are 10x larger
@@ -1779,10 +1809,8 @@ def cli_main(get_model_args_fn=get_model_args_from_cli, get_train_args_fn=get_tr
     checkpoint_callback = ModelCheckpoint(monitor='lightning/val_loss', mode='min', every_n_train_steps=1,
                                           save_top_k=3,
                                           verbose=True)
-
     if os.getenv('CUDA_VISIBLE_DEVICES') == '':
         args.num_gpus = 0
-
     deterministic = True
     if deterministic:
         log.warning('Deterministic is on, turn off to speed up')
@@ -1797,16 +1825,13 @@ def cli_main(get_model_args_fn=get_model_args_from_cli, get_train_args_fn=get_tr
                          # overfit_batches=1,
                          fast_dev_run=fast_dev_run,
                          num_sanity_val_steps=0,
-                         val_check_interval=args.train_to_test_collection_ratio * 2,  # Ensure we have data before validating
+                         val_check_interval=args.train_to_test_collection_ratio * 2,
+                         # Ensure we have data before validating
                          )
-
     # checkpoint_callback = ModelCheckpoint(save_top_k=1, monitor="max_interesting", mode="max", period=1, verbose=True)
-
     # trainer = pl.Trainer.from_argparse_args(args, callbacks=callbacks, max_steps=int(1.2e6), logger=wandb_logger,
     #                                         gpus=1)  # Max steps can be like 5k I think.
-
     trainer.fit(model)
-
     # train_dataset = CharDataset(open('train_shakespeare.txt', 'r').read(), args.block_size)  # one line of poem is roughly 50 characters
     # val_dataset = CharDataset(open('val_shakespeare.txt', 'r').read(), args.block_size)
     # test_dataset = CharDataset(open('test_shakespeare.txt', 'r').read(), args.block_size)
@@ -1814,7 +1839,6 @@ def cli_main(get_model_args_fn=get_model_args_from_cli, get_train_args_fn=get_tr
     # common = {'batch_size': args.batch_size, 'pin_memory': bool(args.pin_memory), 'num_workers': args.num_workers}
     # train_dataloader = DataLoader(train_dataset, shuffle=True, **common)
     # val_dataloader = DataLoader(val_dataset, shuffle=False, **common)
-
     t1 = time.time()
     log.info("%d epochs took %fs, or %fs/epoch" % (args.num_epochs, t1 - t0, (t1 - t0) / args.num_epochs))
     # end standard mingpt training
@@ -1847,26 +1871,6 @@ def _load_pretrained_gpt(_model, model):
     state_dict = {k: v for k, v in _model['state_dict'].items() if k.startswith('gpt')}
     state_dict = {k[4:]: v for k, v in state_dict.items()}  # Remove `gpt.` as we're loading a submodule
     model.gpt.load_state_dict(state_dict)
-
-
-def train_dvq(args, model, wandb_logger, fast_dev_run):
-    # -------------------- Standard dvq training
-    # annealing schedules for lots of constants
-    callbacks = [ModelCheckpoint(monitor='dvq_recon_loss', mode='min', every_n_train_steps=1000, save_top_k=3),
-                 DecayLR()]
-    if False and args.dvq_vq_flavor == 'gumbel':  # Not used yet
-        callbacks.extend([DecayTemperature(), RampBeta()])
-    # Things to try
-    # More steps cos anneal goes to 1.2M! Not helping
-    # Fewer clusters, we're only using ~50 out of 4096: Resulted in blurry images
-    # Do k-means throughout training, not just once: works great! went from 10/20 to 19.5/20 correct images
-    # Output image, we can count images that are obviously wrong
-    # 10 points per cluster seemed to work better than 20, try 15, etc...: 15 works pretty well vs 20 and 10
-
-    # Max steps can be like 5k I think.
-    trainer = pl.Trainer.from_argparse_args(args, callbacks=callbacks, max_steps=int(1.2e6),
-                                            logger=wandb_logger, gpus=args.num_gpus, fast_dev_run=fast_dev_run)
-    trainer.fit(model)
 
 
 class ProcessFrame84Color(ObservationWrapper):

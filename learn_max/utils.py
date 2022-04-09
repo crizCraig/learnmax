@@ -233,7 +233,7 @@ def _wandb_log_closure():
         log_dict = {k: sum(accum[k]) / len(accum[k]) for k in accum}
         log_dict['batch_idx'] = batch_idx
         try:
-            wandb.log(log_dict, step=batch_idx)
+            wandb.log(log_dict)
             accum.clear()
             return True
         except Exception as e:

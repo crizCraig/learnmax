@@ -199,34 +199,32 @@ class VQVAE(dvq_module):
     @staticmethod
     def add_model_specific_args(parent_parser):
         parser = ArgumentParser(parents=[parent_parser], add_help=False)
+
         # model type
         parser.add_argument("--vq_flavor", type=str, default='vqvae', choices=['vqvae', 'gumbel'])
         parser.add_argument("--enc_dec_flavor", type=str, default='deepmind', choices=['deepmind', 'openai'])
         parser.add_argument("--loss_flavor", type=str, default='l2', choices=['l2', 'logit_laplace'])
+
         # model size
-        if 'SINGLE_TOKEN' in os.environ:
-            default_embedding_dim = 1024
-            default_num_embeddings = 8192
-        elif 'SINGLE_TOKEN2' in os.environ:
-            default_embedding_dim = SINGLE_TOKEN2_EMBEDDING_DIM
-            default_num_embeddings = SINGLE_TOKEN2_NUM_EMBEDDINGS
-        else:
-            default_embedding_dim = 64
-            default_num_embeddings = 512
+
+        # CIFAR defaults
+        default_embedding_dim = 64
+        default_num_embeddings = 512
 
         parser.add_argument("--num_embeddings", type=int, default=default_num_embeddings, help="vocabulary size; number of possible discrete states")
         parser.add_argument("--embedding_dim", type=int, default=default_embedding_dim, help="size of the vector of the embedding of each discrete token")
         parser.add_argument("--n_hid", type=int, default=64, help="number of channels controlling the size of the model")
         parser.add_argument("--dvq_quantize_proj", type=int, default=10)
+
         return parser
 
 
 # -----------------------------------------------------------------------------
 def cos_anneal(e0, e1, t0, t1, e):
     """ ramp from (e0, t0) -> (e1, t1) through a cosine schedule based on e \in [e0, e1] """
-    alpha = max(0, min(1, (e - e0) / (e1 - e0))) # what fraction of the way through are we
-    alpha = 1.0 - math.cos(alpha * math.pi/2) # warp through cosine
-    t = alpha * t1 + (1 - alpha) * t0 # interpolate accordingly
+    alpha = max(0, min(1, (e - e0) / (e1 - e0)))  # what fraction of the way through are we
+    alpha = 1.0 - math.cos(alpha * math.pi/2)  # warp through cosine
+    t = alpha * t1 + (1 - alpha) * t0  # interpolate accordingly
     return t
 
 """
@@ -249,8 +247,8 @@ class RampBeta(pl.Callback):
 
 class DecayLR(pl.Callback):
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
-        # The step size is annealed from 1e10−4 to 1.25e10−6 over 1,200,000 updates. I use 3e-4
-        t = cos_anneal(0, 1200000, 3e-4, 1.25e-6, trainer.global_step)
+        # The step size is annealed from 1e−4 to 1.25e10−6 over 120,000 updates. I use 3e-4
+        t = cos_anneal(0, 120_000, 3e-4, 1.25e-6, trainer.global_step)
         for g in pl_module.dvq_optimizer.param_groups:
             g['lr'] = t
 

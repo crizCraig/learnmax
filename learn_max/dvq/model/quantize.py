@@ -102,7 +102,7 @@ class VQVAEQuantize(nn.Module):
             # sgd clustering + reconstruction,
             # OR it could be that the recency of the data in self.data_init_points skews clustering towards newer values.
             # Seems like the former, but would be good to rule out the latter.
-            print(f'kmeans batch {round(self.data_init_points/(self.n_embed * kmeans_points_per_cluster_init) * 100, 2)}%')
+            # print(f'kmeans batch {round(self.data_init_points/(self.n_embed * kmeans_points_per_cluster_init) * 100, 2)}%')
             if self.data_init_points < (self.n_embed * kmeans_points_per_cluster_init):  # Ensure enough points per cluster
                 self.data_init_buffer.append(flatten)
                 self.data_init_points += flatten.size(0)
@@ -129,11 +129,12 @@ class VQVAEQuantize(nn.Module):
             self.data_initialized.fill_(0)
 
         if self.initial_centroid_spread is not None:
-            self.wandb_try_log({'initial_centroid_spread': self.initial_centroid_spread}, self.global_step)
+            wandb_log({'initial_centroid_spread': self.initial_centroid_spread}, self.global_step)
 
         # Extract indexes from embedding and computes distance (similar to k-means here?)
         # this is the distance that's learned by the embedding table between each input token and each centroid
         # so (flatten - embed.weight)^2 = flatten^2 - 2 * flatten @ embed.weight + embed.weight^2
+        # embed.weight shape is (num_embeddings, embedding_dim)
         dist = (
             flatten.pow(2).sum(1, keepdim=True)
             - 2 * flatten @ self.embed.weight.t()
