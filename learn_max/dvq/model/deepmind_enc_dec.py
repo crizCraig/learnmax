@@ -39,7 +39,20 @@ class DeepMindEncoder(nn.Module):
         down_sample = np.prod(1/np.array(strides))
         out_width = int(input_width * down_sample)
 
-        if 'SINGLE_TOKEN' in os.environ:
+        if self.is_single_token2:
+            self.output_channels = n_hid  # Want to see what decoding the encoder vs quantized looks like
+            self.net = nn.Sequential(
+                nn.Conv2d(input_channels, n_hid, 4, stride=strides[0], padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(n_hid, 2 * n_hid, 4, stride=strides[1], padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(2 * n_hid, self.output_channels, 3, padding=1),
+                nn.ReLU(),
+                ResBlock(self.output_channels, 2 * n_hid // 4),
+                ResBlock(self.output_channels, 2 * n_hid // 4),  # 128, 8x8
+            )
+        else:
+            self.output_channels = 2 * n_hid
             self.net = nn.Sequential(
                 nn.Conv2d(input_channels, n_hid, 4, stride=strides[0], padding=1),
                 nn.ReLU(inplace=True),
@@ -49,35 +62,7 @@ class DeepMindEncoder(nn.Module):
                 nn.ReLU(),
                 ResBlock(2*n_hid, 2*n_hid//4),
                 ResBlock(2*n_hid, 2*n_hid//4),  # 128, 8x8
-                nn.Flatten(),
-                nn.Linear(2 * n_hid * out_width ** 2, embedding_dim),
-                # TODO: Add to n_embd as well to match expressivity of 8x8 patches in 512 vocab
             )
-        else:
-            if self.is_single_token2:
-                self.output_channels = n_hid  # Want to see what decoding the encoder vs quantized looks like
-                self.net = nn.Sequential(
-                    nn.Conv2d(input_channels, n_hid, 4, stride=strides[0], padding=1),
-                    nn.ReLU(inplace=True),
-                    nn.Conv2d(n_hid, 2 * n_hid, 4, stride=strides[1], padding=1),
-                    nn.ReLU(inplace=True),
-                    nn.Conv2d(2 * n_hid, self.output_channels, 3, padding=1),
-                    nn.ReLU(),
-                    ResBlock(self.output_channels, 2 * n_hid // 4),
-                    ResBlock(self.output_channels, 2 * n_hid // 4),  # 128, 8x8
-                )
-            else:
-                self.output_channels = 2 * n_hid
-                self.net = nn.Sequential(
-                    nn.Conv2d(input_channels, n_hid, 4, stride=strides[0], padding=1),
-                    nn.ReLU(inplace=True),
-                    nn.Conv2d(n_hid, 2*n_hid, 4, stride=strides[1], padding=1),
-                    nn.ReLU(inplace=True),
-                    nn.Conv2d(2*n_hid, 2*n_hid, 3, padding=1),
-                    nn.ReLU(),
-                    ResBlock(2*n_hid, 2*n_hid//4),
-                    ResBlock(2*n_hid, 2*n_hid//4),  # 128, 8x8
-                )
 
         self.out_width = out_width
         # self.output_stide = 4

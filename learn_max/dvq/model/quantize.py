@@ -116,8 +116,9 @@ class VQVAEQuantize(nn.Module):
                 self.embed.weight.data.copy_(torch.from_numpy(kd[0]))
                 self.initial_centroid_spread = self.get_centroid_spread()
                 log.info(f'initial_centroid_spread {self.initial_centroid_spread}')
-                self.initial_point_spread = None # reset so we get post-kmeans
-                self.data_init_buffer.clear()
+                self.initial_point_spread = None  # reset so we get post-kmeans
+
+                self.data_init_buffer.clear()  # TODO: Try keeping all points to get more accurate clusters
                 self.data_init_points = 0
                 self.data_initialized.fill_(1)
             # TODO: this won't work in multi-GPU setups

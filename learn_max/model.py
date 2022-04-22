@@ -4,7 +4,7 @@ import math
 import os
 import sys
 import time
-from collections import deque
+from collections import deque, defaultdict
 from copy import copy
 from typing import Tuple, List, Optional
 
@@ -792,15 +792,17 @@ class LearnMax(pl.LightningModule):
     def viz_dvq_clusters_knn_standalone(self):
         from sklearn.neighbors import NearestNeighbors
         emb = self.dvq.quantizer.embed_code(torch.tensor(list(range(self.dvq_num_embeddings))))
+        n_neighbors = 50
         nbrs = NearestNeighbors(n_neighbors=50, algorithm='auto').fit(emb)
         distances, indices = nbrs.kneighbors(emb)
         num_clusters_per_image = 100
         im = None
         clusters_in_im = 0
+        save_i = 0
         for cluster in indices:
             imz = self.dvq.decode_flat(emb[cluster], output_proj=self.dvq.quantizer.output_proj)
             imz = imz.squeeze().permute(2, 0, 3, 1).clamp(0, 1)
-            imz = imz.reshape(imz.shape[0], imz.shape[1] * imz.shape[2], -1)
+            imz = imz.reshape(imz.shape[0], imz.shape[1] * imz.shape[2], -1)  # align side by side
             imz = imz.detach().cpu().numpy()
             if clusters_in_im == 0:
                 im = imz
@@ -810,7 +812,85 @@ class LearnMax(pl.LightningModule):
             if clusters_in_im == num_clusters_per_image:
                 clusters_in_im = 0
                 ims = Image.fromarray(np.uint8(im * 255))
-                ims.show()
+                folder = f'{ROOT_DIR}/images/dvq_clusters_knn/{DATE_STR}'
+                os.makedirs(folder, exist_ok=True)
+                im_name = f'{folder}/dvq_clusters_knn_{n_neighbors}n_{save_i}.png'
+                ims.save(im_name)
+                log.info(f'Saved to {im_name}')
+                save_i += 1
+
+    @no_train
+    def compress_dvq_clusters(self):
+        """
+        emb -25 1169 /home/a/src/learnmax/images/compress_dvq_clusters_emb/2022_04_16_10_21_51_906093/compress_dvq_clusters_pref_-25_0.png
+        emb -40 758 /home/a/src/learnmax/images/compress_dvq_clusters_emb/2022_04_16_10_01_21_957291/compress_dvq_clusters_pref_-40_0.png
+
+
+        """
+        from sklearn.cluster import AffinityPropagation
+        emb = self.dvq.quantizer.embed_code(torch.tensor(list(range(self.dvq_num_embeddings))))
+        imgs = self.dvq.decode_flat(emb, output_proj=self.dvq.quantizer.output_proj)
+        W = imgs[0].shape[1]
+        assert W == imgs[0].shape[2], 'Assuming square images'
+        preference = -25  # -62 has 7 bad clusters (actually garbage), -50:12, -75:garbage, -25 great!
+        mode = 'emb'
+        log.info(f'Compressing clusters in {mode} mode at preference {preference}')
+        if mode == 'pixel':
+            af = AffinityPropagation(preference=preference, random_state=0).fit(imgs.reshape(imgs.shape[0], -1))
+        elif mode == 'emb':
+            af = AffinityPropagation(preference=preference, random_state=0).fit(emb)
+        else:
+            raise ValueError('no such mode')
+        cluster_centers_indices = af.cluster_centers_indices_
+        log.info(f'num clusters {len(cluster_centers_indices)}')
+        labels = af.labels_
+
+        clusters = defaultdict(list)
+        for i, label in enumerate(labels):
+            clusters[label].append(i)
+        clusters = {k: v for k, v in sorted(clusters.items(), key=lambda item: -len(item[1]))}  # Sort by longest first
+        longest = len(list(clusters.items())[0][1])
+        im = None
+        clusters_in_im = 0
+        save_i = 0
+        num_clusters_per_image = 100
+        # Save dvq checkpoint name, af.labels, af.cluster_centers
+        folder = f'{ROOT_DIR}/images/compress_dvq_clusters_{mode}/{DATE_STR}'
+        os.makedirs(folder, exist_ok=True)
+        json_name = f'{folder}/compress_dvq_clusters_pref_{preference}.json'
+        json.dump({'dvq_checkpoint': self.dvq_checkpoint,
+                   'labels': af.labels_,
+                   'cluster_centers': af.cluster_centers_indices_}, open(json_name, 'w'), )
+        log.info(f'Saved to {json_name}')
+        for cluster_i in clusters:
+            im_row = None
+            for img_i in clusters[cluster_i]:
+                img = imgs[img_i]
+                img = img.squeeze().permute(1, 2, 0).clamp(0, 1)
+                img = img.detach().cpu().numpy()
+                if im_row is None:
+                    im_row = img
+                else:
+                    im_row = np.concatenate((im_row, img), axis=1)
+
+            pad = longest - im_row.shape[1] // W
+            zeros = np.zeros((W, pad * W, 3))
+            im_row = np.concatenate((im_row, zeros), axis=1)
+            if im is None:
+                im = im_row
+            else:
+                im = np.concatenate((im, im_row), axis=0)
+
+            clusters_in_im += 1
+            if clusters_in_im == num_clusters_per_image:
+                clusters_in_im = 0
+                ims = Image.fromarray(np.uint8(im * 255))
+                im = None
+                im_name = f'{folder}/compress_dvq_clusters_pref_{preference}_{save_i}.png'
+                ims.save(im_name)
+                log.info(f'Saved to {im_name}')
+                save_i += 1
+
 
     @no_train
     def viz_all_dvq_clusters_standalone(self):
@@ -1411,8 +1491,8 @@ class LearnMax(pl.LightningModule):
 
         So we should only append to the branch that spawned the state.
 
-        IF we are searching greedily, then we just pursue the top k highest entropy actions. Saliency levels
-        will mitigate the shortsightedness of this approach.
+        We are searching greedily right now (top k every step) and just pursue the top k highest entropy actions.
+        Saliency levels will mitigate the shortsightedness of this approach.
 
         HOWEVER, we could also add some monte-carlo rollouts in order to find states with delayed learning.
 
@@ -1461,8 +1541,6 @@ class LearnMax(pl.LightningModule):
             the end anyway.
 
         """
-
-
         beam_width = self.beam_width
         num_steps = self.num_search_steps
         # TODO:
@@ -1696,7 +1774,7 @@ def cli_main(get_model_args_fn=get_model_args_from_cli, get_train_args_fn=get_tr
     torch.backends.cudnn.benchmark = True  # autotune kernels
     torch.multiprocessing.set_start_method('spawn')
     args = get_model_args_fn()
-    viz_dvq = args.viz_dvq or args.viz_all_dvq_clusters
+    viz_dvq = args.viz_dvq or args.viz_all_dvq_clusters or args.viz_dvq_clusters_knn or args.compress_dvq_clusters
 
     if viz_dvq:
         args.should_train_gpt = False
@@ -1720,6 +1798,7 @@ def cli_main(get_model_args_fn=get_model_args_from_cli, get_train_args_fn=get_tr
     del learn_max_args['viz_dvq']  # Not for model
     del learn_max_args['viz_all_dvq_clusters']  # Not for model
     del learn_max_args['viz_dvq_clusters_knn']  # Not for model
+    del learn_max_args['compress_dvq_clusters']  # Not for model
     del learn_max_args['checkpoint']  # Not a model property
     if 'viz_predict_trajectory' in learn_max_args:
         learn_max_args['should_viz_predict_trajectory'] = learn_max_args['viz_predict_trajectory']
@@ -1745,10 +1824,13 @@ def cli_main(get_model_args_fn=get_model_args_from_cli, get_train_args_fn=get_tr
         return model.viz_all_dvq_clusters_standalone()
     elif args.viz_dvq_clusters_knn:
         return model.viz_dvq_clusters_knn_standalone()
+    elif args.compress_dvq_clusters:
+        return model.compress_dvq_clusters()
     else:
         delattr(args, 'viz_dvq')
         delattr(args, 'viz_all_dvq_clusters')
         delattr(args, 'viz_dvq_clusters_knn')
+        delattr(args, 'compress_dvq_clusters')
 
     args = get_train_args_fn()
 
