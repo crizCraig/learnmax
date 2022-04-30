@@ -251,9 +251,11 @@ def test_replay_buffers_sanity():
     replay_buffers = ReplayBuffers(env_id='my_test_env', short_term_mem_length=5, frames_per_file=3,
                                    train_to_test_collection_ratio=2,
                                    max_lru_size=2, verbose=False)
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
     for i in range(replay_buffers.frames_per_file * replay_buffers.train_to_test_collection_ratio):
         replay_buffers.append(Experience(
-            state=AgentState(state=torch.tensor(0).cuda()),
+            state=AgentState(state=torch.tensor(0).to(device)),
             action=replay_buffers.total_length,
             reward=i,
             done=False,
@@ -266,7 +268,7 @@ def test_replay_buffers_sanity():
     assert len(replay_buffers.train_buf.files) == 1
 
     replay_buffers.append(Experience(
-        state=AgentState(state=torch.tensor(0).cuda()),
+        state=AgentState(state=torch.tensor(0).to(device)),
         action=replay_buffers.total_length,
         reward=1,
         done=True,
@@ -285,7 +287,7 @@ def test_replay_buffers_sanity():
 
     for i in range(replay_buffers.frames_per_file * replay_buffers.train_to_test_collection_ratio):
         replay_buffers.append(Experience(
-            state=AgentState(state=torch.tensor(0).cuda()),
+            state=AgentState(state=torch.tensor(0).to(device)),
             action=replay_buffers.total_length,
             reward=i,
             done=False,
@@ -330,7 +332,7 @@ def test_replay_buffers_sanity():
 
     for i in range(replay_buffers.frames_per_file * replay_buffers.train_to_test_collection_ratio):
         replay_buffers.append(Experience(
-            state=AgentState(state=torch.tensor(0).cuda()),
+            state=AgentState(state=torch.tensor(0).to(device)),
             action=replay_buffers.total_length,
             reward=i,
             done=False,
@@ -357,9 +359,10 @@ def test_replay_buffers_overfit():
                                    overfit_to_short_term=True,
                                    verbose=False, )
 
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
     for i in range(replay_buffers.short_term_mem_length):
         replay_buffers.append(Experience(
-            state=AgentState(state=torch.tensor(0).cuda()),
+            state=AgentState(state=torch.tensor(0).to(device)),
             action=replay_buffers.total_length,
             reward=i,
             done=False,

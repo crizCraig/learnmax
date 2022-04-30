@@ -92,6 +92,7 @@ def add_model_specific_args(arg_parser: argparse.ArgumentParser, ) -> argparse.A
     arg_parser.add_argument('--viz_dvq', action='store_true', help="visualize dvq images", default=False)
     arg_parser.add_argument('--viz_all_dvq_clusters', action='store_true', help="visualize all dvq clusters", default=False)
     arg_parser.add_argument('--viz_dvq_clusters_knn', action='store_true', help="visualize dvq clusters knn", default=False)
+    arg_parser.add_argument('--compress_dvq_clusters', action='store_true', help="compress dvq clusters", default=False)
     arg_parser.add_argument('--viz_predict_trajectory', action='store_true', help="visualize all dvq clusters", default=False)
     arg_parser.add_argument('--dvq_checkpoint', type=str, help="DVQ checkpoint to restore", default=None)
     arg_parser.add_argument('--checkpoint', type=str, help="Full (DVQ+GPT) checkpoint to restore", default=None)

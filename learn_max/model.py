@@ -428,21 +428,6 @@ class LearnMax(pl.LightningModule):
                 if done:
                     self.reset_after_death()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Passes in a state x through the network and gets the q_values of each action as an output
-
-        Args:
-            x: environment state
-
-        Returns:
-            q values
-        """
-
-        # Real forward is in agent currently.
-        output = self.net(x)
-        return output
-
     def training_batch_gen(self, ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Contains the logic for generating a new batch of data to be passed to the DataLoader
@@ -660,6 +645,15 @@ class LearnMax(pl.LightningModule):
         )
         return ret
 
+    def get_compressed_cluster(self, z_q_ind):
+        return self.compressed_dict[z_q_ind]
+
+    def get_state_index(self, z_q_ind):
+        if self.use_compressed_clusters:
+            return self.get_compressed_cluster(z_q_ind)
+        else:
+            return z_q_ind
+
     def training_step(self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx):
         """
         Calculates loss based on the minibatch received
@@ -859,8 +853,9 @@ class LearnMax(pl.LightningModule):
         os.makedirs(folder, exist_ok=True)
         json_name = f'{folder}/compress_dvq_clusters_pref_{preference}.json'
         json.dump({'dvq_checkpoint': self.dvq_checkpoint,
-                   'labels': af.labels_,
-                   'cluster_centers': af.cluster_centers_indices_}, open(json_name, 'w'), )
+                   'labels': [int(x) for x in af.labels_],
+                   'cluster_centers': [int(x) for x in af.cluster_centers_indices_]}, open(json_name, 'w'),
+                  indent=2)
         log.info(f'Saved to {json_name}')
         for cluster_i in clusters:
             im_row = None
@@ -2011,3 +2006,6 @@ def get_image_from_state(state, folder, i, should_save=True):
 
 if __name__ == '__main__':
     cli_main()
+
+
+

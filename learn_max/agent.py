@@ -64,6 +64,7 @@ class LearnMaxAgent:
     @torch.no_grad()
     def get_action(self, agent_state: torch.Tensor, device: str) -> Tuple[List[int], AgentState]:
         """
+        TODO: Move this to learnmax.get_action
         Takes in the current state and returns the action based on the agents policy
 
         Args:

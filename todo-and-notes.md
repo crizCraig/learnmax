@@ -23,9 +23,30 @@
 - Reduce the 8192 clusters with pixel distance
 - New clusters are not good enough to be used on their own. But I think adding a reduced (~700) cluster embedding to the cull 8192 cluster embedding will help the transformer a lot. Then we can try removing the z_q embedding which will allow us to change the embedding size. And more importantly let's try reducing the sequence window size and the action space size. The action space should maybe also be encoded as an addition of LEFT, RIGHT, FIRE (jump), UP (ladders), and DOWN where NOOP is zero or another embedding. The idea is to simplify things to the point where we can train zuma quickly and get to the salient event work. Then if that works, we can scale quantization to other tasks with a working baseline task.
 - Try small sequence window (1, 2, 3...)
-- Try resets after small number of actions (5 or so) enough to fall off platform and get to salient states
+- Try resets after small number of actions (5 or so) enough to fall off platform, still get good prediction accuracy, and get to salient states
 - Try states and actions in different heads - this means you don't have entropy associated with a given action over states in one forward pass. You need a batch that tries every action and looks at the state head to compare entropies across states. This means in tree_search you need to do a batch with all actions for each branch and tree search is already the bottleneck going just fast enough to act real-time. It also complicates things quite a bit and requires a lot of change. It does reduce the search space per forward pass by 20x for states and 1000x for actions and gets more predictive power out of the same network size. The sequence window would be more limited though as now you have action and state tokens.
-- Add a fully connected layer to the top of the encoder so that it learns the flatten transformation and passes 2D info through activations instead of implicitly by unflattening in the decoder
+- Add a fully connected layer to the top of the encoder so that it learns the flatten transformation and passes 2D info through activations instead of implicitly by unflattening in the decoder. According to Deepmind's flamingo paper, position info gets encoded into the channels and therefore also in the 1D flattening (pooling is mentioned in referenced paper but I think they are confounding that with flattening) - although from the code it looks like they use max pooling, so it may be worth trying if 2D position embeddings do help
+ > These visual features are obtained by first adding a learnt temporal position encoding to each spatial grid of features corresponding to a given frame of the video (an image being considered as a single-frame video). Note that we only use temporal encodings and no spatial grid position encodings; we did not observe improvements from the latter, potentially because CNNs implicitly encode space information channel-wise (Islam et al., 2021).
+- Thinking more about 
+- Action reduction for zuma
+    0 Action.NOOP
+    1 Action.FIRE - jump
+    2 Action.UP - move up ladder
+    3 Action.RIGHT 
+    4 Action.LEFT
+    5 Action.DOWN
+    6 Action.UPRIGHT - move up right ladder not needed
+    7 Action.UPLEFT - move up left ladder not needed
+    8 Action.DOWNRIGHT - move down right ladder not needed
+    9 Action.DOWNLEFT - move up left ladder not needed
+    10 Action.UPFIRE - jump up ladder not needed
+    11 Action.RIGHTFIRE - jump right ladder not needed
+    12 Action.LEFTFIRE - jump left ladder not needed
+    13 Action.DOWNFIRE - jump down ladder not needed
+    14 Action.UPRIGHTFIRE - jump up right ladder not needed
+    15 Action.UPLEFTFIRE - jump up left ladder not needed
+    16 Action.DOWNRIGHTFIRE - jump down right ladder not needed
+    17 Action.DOWNLEFTFIRE - jump down left ladder not needed
 Notes:
 #### Comparison with hierarchy of abstract machines (HAMs)
 These have discrete action, call, choice, and stop where execution is occurring at one level of abstraction at a time (i.e. sequentially). A big difference between this and learnmax is that learnmax can search within different levels of abstraction in parallel. Since high level plans don't change as often, most searching is done in the lower levels even when executing a high level plan to find some long term entropy. So your basically optimizing for entropy reduction per unit time. However since high level entropy possibly unlocks new vistas and worlds of low level entropy, we still should perhaps afford more weight to high level entropy just based on level alone. 

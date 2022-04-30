@@ -245,7 +245,7 @@ def _wandb_log_closure():
 wandb_log, wandb_check_flush = _wandb_log_closure()
 
 
-def get_batch_vars(batch, use_next=False, return_agent_state=False, populate_gpt=False):
+def get_batch_vars(batch, use_next=False, return_agent_state=False, populate_gpt=False, use_compressed_clusters=False):
     # TODO: Just put everything in agent_state, next_agent_state dicts
     agent_state = None
     if len(batch) == 5:
@@ -269,20 +269,17 @@ def get_batch_vars(batch, use_next=False, return_agent_state=False, populate_gpt
             dvq_batch = dvq_x, agent_state
         return dvq_batch
     else:
-        # dvq_loss = torch.mean(torch.Tensor([a['dvq_loss'].mean() for a in agent_state]))
-        # dvq_x_hat = torch.Tensor([a['dvq_x_hat'] for a in agent_state])
+        # Populate GPT
         z_q_ind = torch.stack([a['dvq_z_q_ind'] for a in agent_state])
         z_q_flat = torch.stack([a['dvq_z_q_flat'] for a in agent_state])
 
-        # print(f'{dvq_loss=}')
-        # print(f'dvq_loss_avg={sum([a["dvq_loss"].mean() for a in agent_state]) / len(agent_state)}')
+        # s_ind =
+
         a_x, a_y, gpt_x, z_q_ind_x, z_q_ind_y = sa2as(z_q_flat, z_q_ind, a)
         ret = [gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y, s]
         if return_agent_state:
             ret.append(agent_state)
         return ret
-        # idx_or_embed = idx_or_embed.view(int(idx_or_embed.shape[0] / self.block_size) - 1, self.block_size,
-        #                                  idx_or_embed.shape[1])
 
 
 def sa2as(z_q_flat, z_q_ind, a):

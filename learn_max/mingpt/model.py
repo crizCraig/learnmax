@@ -88,9 +88,9 @@ class Block(nn.Module):
             self.out_proj = None
 
     def forward(self, x):
-        log.debug('starting gpt attn')
+        # log.debug('starting gpt attn')
         x = x + self.attn(self.ln1(x))
-        log.debug('done with gpt attn')
+        # log.debug('done with gpt attn')
         x = x + self.mlp(self.ln2(x))
         if self.out_proj is not None:
             # We could do cross attention as in perceiver IO, but this seems simpler
