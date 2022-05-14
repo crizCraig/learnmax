@@ -220,7 +220,7 @@ def _wandb_log_closure():
     # allows quickly seeing initial fast-changing metrics in wandb
     freq = 1
 
-    def append(msg_dict, global_step):
+    def append(msg_dict, global_step=None):
         nonlocal accum
         for k in msg_dict:
             accum[k].append(msg_dict[k])
@@ -274,7 +274,9 @@ def get_batch_vars(batch, use_next=False, return_agent_state=False, populate_gpt
         z_q_flat = torch.stack([a['dvq_z_q_flat'] for a in agent_state])
 
         # s_ind =
-
+        # z_q_flat shape single_token2 = 42, 2,  1, 4410 => S, B, 1, emb_d
+        # z_q_flat shape patch based   = 42, 16, 1, 11, 11, 30 => S, B, 1, H, W, emb_d
+        # The above H, W should be folded into S, but with some delimiter between frames
         a_x, a_y, gpt_x, z_q_ind_x, z_q_ind_y = sa2as(z_q_flat, z_q_ind, a)
         ret = [gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y, s]
         if return_agent_state:

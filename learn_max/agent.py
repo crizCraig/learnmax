@@ -106,7 +106,11 @@ class LearnMaxAgent:
         #         self.dvq_ready = True  # dvq outputs are now based on some training
 
         # Return a random action if we haven't filled buffer of z states.
-        if not self.model.should_train_gpt or len(self.model.train_buf) < self.model.gpt_block_size:  # TODO: Use self.dvq_ready to do dvq training again
+        if (
+            'RAND_ACTION' in os.environ or
+            not self.model.should_train_gpt or
+            len(self.model.train_buf) < self.model.gpt_block_size
+        ):  # TODO: Use self.dvq_ready to do dvq training again
             ret = self.get_random_action(len(agent_state.state))
             if len(agent_state.state) != 1:
                 raise Exception('Should we be getting multiple actions like this?')

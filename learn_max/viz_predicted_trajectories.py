@@ -127,6 +127,7 @@ def get_frame(cluster_img_paths, frame_paths, traj_paths, horz_scroll_index):
 
 
 def get_action_text(env, action_num):
+    # TODO: Change to limited action space for zuma
     return env.unwrapped._action_set[action_num].name
 
 def get_np_txt_caption(traj_img, text):

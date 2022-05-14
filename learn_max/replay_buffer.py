@@ -56,6 +56,7 @@ class ReplayBuffers:
             log.warning('Overfitting to short term mem')
 
         self.short_term_mem_length = short_term_mem_length
+        self.overfit_length = short_term_mem_length
         self.short_term_mem = deque(maxlen=short_term_mem_length)
         self.episode_i = 0  # Index of episode
         self.train_to_test_collection_ratio = train_to_test_collection_ratio  # Episodes to train vs test on

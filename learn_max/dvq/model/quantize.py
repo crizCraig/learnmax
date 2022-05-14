@@ -43,17 +43,14 @@ class VQVAEQuantize(nn.Module):
         self.forward_iter = 0
         self.enable_kmeans = enable_kmeans
 
-        if 'SINGLE_TOKEN' in os.environ:
-            self.proj = nn.Linear(embedding_dim, embedding_dim)  # Perhaps could be removed
-        else:
-            if self.is_single_token2:
-                # TODO: We are projecting down quite a bit from w/o single token, from 64 to 10 channels, try more channels!
-                # self.output_proj = 16  #patch_width ** 2
-                if output_proj is not None:
-                    self.output_proj = output_proj
-                else:
-                    self.output_proj = embedding_dim // patch_width ** 2
-            self.proj = nn.Conv2d(num_hiddens, self.output_proj, 1)
+        if self.is_single_token2:
+            # TODO: We are projecting down quite a bit from w/o single token, from 64 to 10 channels, try more channels!
+            # self.output_proj = 16  #patch_width ** 2
+            if output_proj is not None:
+                self.output_proj = output_proj
+            else:
+                self.output_proj = embedding_dim // patch_width ** 2
+        self.proj = nn.Conv2d(num_hiddens, self.output_proj, 1)
         self.embed = nn.Embedding(n_embed, embedding_dim)
 
         self.register_buffer('data_initialized', torch.zeros(1))

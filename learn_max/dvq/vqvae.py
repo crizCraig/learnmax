@@ -52,23 +52,40 @@ class VQVAE(dvq_module):
 
         self.is_single_token2 = is_single_token2
         self.enable_kmeans = enable_kmeans
+        if is_single_token2:
+            strides = [2, 2]
+        else:
+            # TODO: Parameterize this
+            strides = [2, 4]
 
         # encoder/decoder module pair
-        Encoder, Decoder = {
-            'deepmind': (DeepMindEncoder, DeepMindDecoder),
-            'openai': (OpenAIEncoder, OpenAIDecoder),
-        }[enc_dec_flavor]
-        self.encoder = Encoder(input_channels=input_channels, n_hid=n_hid, input_width=32,
-                               embedding_dim=embedding_dim, is_single_token2=self.is_single_token2)
+        # Encoder, Decoder = {
+        #     'deepmind': (DeepMindEncoder, DeepMindDecoder),
+        #     'openai': (OpenAIEncoder, OpenAIDecoder),
+        # }[enc_dec_flavor]
+        self.encoder = DeepMindEncoder(
+            input_channels=input_channels,
+            n_hid=n_hid,
+            input_width=84,  # Atari is 84, CIFAR is 32
+            embedding_dim=embedding_dim,
+            is_single_token2=self.is_single_token2,
+            strides=strides,
+        )
 
         if is_single_token2:
             decoder_init = quantize_proj  # embedding_dim // self.encoder.out_width ** 2
         else:
             decoder_init = embedding_dim
 
-        self.decoder = Decoder(encoder=self.encoder, n_init=decoder_init, n_hid=n_hid,
-                               output_channels=input_channels, embedding_dim=embedding_dim,
-                               is_single_token2=self.is_single_token2)
+        self.decoder = DeepMindDecoder(
+            encoder=self.encoder,
+            n_init=decoder_init,
+            n_hid=n_hid,
+            output_channels=input_channels,
+            embedding_dim=embedding_dim,
+            is_single_token2=self.is_single_token2,
+            strides=strides,
+        )
 
         # the quantizer module sandwiched between them, +contributes a KL(posterior || prior) loss to ELBO
         QuantizerModule = {

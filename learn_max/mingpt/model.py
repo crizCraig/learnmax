@@ -134,7 +134,7 @@ class GPT(nn.Module):
         action_embedding_dim = 100
         embedding_dim = input_embedding_dim  # + action_embedding_dim
         # self.dvq_proj = nn.Linear(input_embedding_dim, embedding_dim)
-        assert embedding_dim % n_head == 0, 'Embedding not evenly divisible by number of heads'
+        assert embedding_dim % n_head == 0, f'Embedding len {embedding_dim} not evenly divisible by number of heads {n_head}'
         self.tok_emb = nn.Embedding(num_input_embeddings, input_embedding_dim)  # This should be num of z_q_emb,
         self.pos_emb = nn.Parameter(torch.zeros(1, block_size, embedding_dim))
         self.act_emb = nn.Embedding(num_actions, input_embedding_dim)
@@ -291,7 +291,7 @@ class GPT(nn.Module):
         # embed = self.dvq_proj(embed)  # this projection kills performance for some reason
 
         # x = self.drop(token_embed + position_embeddings + action_embeddings + dvq_proj)
-        x = self.drop(token_embed + position_embed + action_embed + embed)
+        x = self.drop(token_embed + position_embed + action_embed)  # + embed)
         x = self.blocks(x)
         x = self.ln_f(x)
         logits = self.logit_p_head(x)
@@ -327,7 +327,12 @@ class GPT(nn.Module):
         wandb_log({'entropy/action-state': entropy.mean()}, self.global_step)
         wandb_log({'probs_std': probs.std()}, self.global_step)
 
-        acc = self.accuracy(logits, target_idx, split)
+        # Use last position's logits as this is what we use for auto-regression / prediction (i.e. throwout
+        #   most of the window generated with causal mask)
+        #   Followup: Surprisingly makes little difference to accuracy
+        last_logits = logits[:, -1, :]
+        last_targets = target_idx[:, -1]
+        acc = self.accuracy(last_logits, last_targets, split)
         if batch_idx % ACC_LOG_PERIOD == 0:
             log.info(f'Top x {split} prediction accuracy {acc}')
         p_diff = (one_hot - probs).abs()  # actual deviation
@@ -383,6 +388,13 @@ class GPT(nn.Module):
         """
         return action_state_idx // self.num_actions
 
+    def as_i_to_a_i(self, action_state_idx):
+        """
+        Action-state index to action index
+        States are higher order dimension with all actions for each state stored sequentially
+        """
+        return action_state_idx % self.num_actions
+
     def split_as_i(self, action_state_idx):
         """
         Like as_i_to_s_i, but returns the action and state (z_q) index
@@ -391,18 +403,54 @@ class GPT(nn.Module):
         return action_i, z_q_ind
 
     def accuracy(self, logits, target_idx, split):
-
+        """logits (Batch, sequence Window, Action-State) """
         # TODO: State based accuracy (currently action-state)
+        if not self.single_token2:
+            raise NotImplementedError('Implement patch accuracy')
+        # Batch, State, Action dims
+        B, S, A = logits.shape[0], logits.shape[1]//self.num_actions, self.num_actions
+        assert self.output_size == A * S
+        top_acc_lvls_as = {
+            '1': 1,
+            '3': 3,
+            'a': A,
+            '1pct': self.output_size // 100,
+            '10pct': self.output_size // 10,
+        }
+        acc_as = self._get_acc(logits, split, target_idx, top_acc_lvls_as, 'acc_as')
 
-        top_acc_lvls = (self.output_size // 10, self.output_size // 100, 3, 1, self.num_actions)
+        # Get state based accuracy, i.e. how accurate are we in predicting the state
+        # that resulted from the chosen action
+        action_taken = self.as_i_to_a_i(target_idx)
+        target_states = self.as_i_to_s_i(target_idx)
+        broadcast_target = torch.ones((B, S))
+        target_actions = (broadcast_target.cuda() * action_taken.reshape(B, 1)).long()
 
-        # rearrange combines batch and window dimensions into batch dimension
-        acc = accuracy(logits=rearrange(logits, 'd0 d1 d2 -> (d0 d1) d2'),
-                       target=rearrange(target_idx, 'd0 d1 -> (d0 d1)'),
-                       topk=top_acc_lvls)
-        for lvl_i, lvl in enumerate(top_acc_lvls):
-            wandb_log({f'acc/{split}/top{lvl}': acc[lvl_i]}, self.global_step)
-        return sorted(list(zip(top_acc_lvls, (float(x) for x in acc))))
+        # Get logits of states for taken actions
+        logits = logits.reshape(B, S, A)
+        logits_states = logits.take_along_dim(target_actions.reshape(B, S, 1), dim=2).squeeze(-1)
+        assert bool(logits[0][0][action_taken[0]] == logits_states[0][0]), 'Action selected for each batch'
+        top_acc_lvls_s = {
+            '1': 1,
+            '3': 3,
+            'a': A,  # Should be irrelevant as actions are factored out, but want to compare with action-state acc
+            '1pct': S // 100,
+            '10pct': S // 10,
+        }
+        acc_s = self._get_acc(logits_states, split, target_states, top_acc_lvls_s, 'acc_s')
+        return sorted(list(zip(top_acc_lvls_s.values(), (float(x) for x in acc_s))))
+
+    def _get_acc(self, logits, split, target_idx, top_acc_lvls, name):
+        acc = accuracy(
+            # rearrange combines batch and window dimensions into batch dimension
+            # logits=rearrange(logits, 'd0 d1 d2 -> (d0 d1) d2'),
+            # target=rearrange(target_idx, 'd0 d1 -> (d0 d1)'),
+            logits=logits,
+            target=target_idx,
+            topk=top_acc_lvls.values(), )
+        for lvl_i, lvl_name in enumerate(top_acc_lvls):
+            wandb_log({f'{name}/{split}/top{lvl_name}': acc[lvl_i]}, self.global_step)
+        return acc
 
     def training_step(self, *args, **kwargs):
         return self.step_('train', *args, **kwargs)

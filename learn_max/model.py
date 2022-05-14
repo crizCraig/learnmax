@@ -110,7 +110,7 @@ class LearnMax(pl.LightningModule):
             actions_per_batch: int = 1,  # adds more samples per action to prevent overfitting
 
             # Tree search
-            beam_width: int = 4,  # How many trajectories to predict in tree search
+            beam_width: int = 3,  # How many trajectories to predict in tree search
             num_search_steps: int = 10,  # How many steps to predict out in each trajectory
 
             # Standard stuff
@@ -245,13 +245,48 @@ class LearnMax(pl.LightningModule):
             self.env.seed(SEED)
             self.test_env = make_env(env_id)
 
+
+        """
+        Zuma action meanings
+        0 Action.NOOP
+        1 Action.FIRE - jump
+        2 Action.UP - move up ladder
+        3 Action.RIGHT - walk right
+        4 Action.LEFT - walk left
+        5 Action.DOWN - down ladder
+        6 Action.UPRIGHT - move up right ladder not needed
+        7 Action.UPLEFT - move up left ladder not needed
+        8 Action.DOWNRIGHT - move down right ladder not needed
+        9 Action.DOWNLEFT - move up left ladder not needed
+        10 Action.UPFIRE - jump up ladder not needed
+        11 Action.RIGHTFIRE - jump right ladder not needed
+        12 Action.LEFTFIRE - jump left ladder not needed
+        13 Action.DOWNFIRE - jump down ladder not needed
+        14 Action.UPRIGHTFIRE - jump up right ladder not needed
+        15 Action.UPLEFTFIRE - jump up left ladder not needed
+        16 Action.DOWNRIGHTFIRE - jump down right ladder not needed
+        17 Action.DOWNLEFTFIRE - jump down left ladder not needed
+        """
+        log.warning('Reducing action set for Montezuma\'s revenge')
+        # Reduce action space to speed up training iteration, should converge to same performance without this
+        self.env.unwrapped._action_set = [
+            self.env.unwrapped._action_set[0],  # noop
+            self.env.unwrapped._action_set[1],  # fire (jump in zuma)
+            self.env.unwrapped._action_set[2],  # up (on ladder in zuma)
+            self.env.unwrapped._action_set[3],  # right
+            self.env.unwrapped._action_set[4],  # left
+            self.env.unwrapped._action_set[5],  # down  (on ladder in zuma)
+        ]
+        self.env._action_space = gym.spaces.Discrete(len(self.env.unwrapped._action_set ))
+        self.num_actions = self.env.action_space.n  # TODO: Change for zuma limited actions
+
         log.info(
             'Action map\n' +
-            '\n'.join(f'{i} {a}' for i, a in enumerate(self.env.unwrapped._action_set))
+            '\n'.join(f'{i} {a}' for i, a in enumerate(self.env.unwrapped._action_set))  # TODO: Change for zuma limited actions
         )
 
         self.obs_shape = self.env.observation_space.shape
-        self.num_actions = self.env.action_space.n
+
 
         # This action embedding will be concatenated with the dvq output. The transformer
         #  will then enumerate all actions for all possible dvq tokens for n_actions * n_embd total possible
@@ -343,7 +378,7 @@ class LearnMax(pl.LightningModule):
                        embd_pdrop=gpt_embd_pdrop, resid_pdrop=gpt_resid_pdrop, attn_pdrop=gpt_attn_pdrop,
                        should_input_embed=gpt_input_embed, num_actions=self.num_actions)
 
-        self.agent = LearnMaxAgent(model=self, num_actions=self.env.action_space.n)
+        self.agent = LearnMaxAgent(model=self, num_actions=self.num_actions)
         self.reset()
 
     def reset(self):
@@ -453,8 +488,6 @@ class LearnMax(pl.LightningModule):
                  new_states,
                  agent_states,
                  next_agent_states) = self._take_action_and_sample(episode_reward, episode_steps)
-                # TODO: If viz'ing add state here, then send state through dvq decoder and output as video
-                #   and sequences of images.
             if dones is None:
                 log.error('dones is None, what is going on??? - trying to continue')
                 time.sleep(5)
@@ -513,6 +546,7 @@ class LearnMax(pl.LightningModule):
             # TODO: If there's a very surprising experience, train on it right away
             episode_reward, episode_steps, is_done = self._take_action(episode_reward, episode_steps)
             if is_done:
+                wandb_log({'episode_steps': episode_steps})
                 self.done_episodes += 1
                 self.total_rewards.append(episode_reward)
                 self.total_episode_steps.append(episode_steps)
@@ -573,7 +607,7 @@ class LearnMax(pl.LightningModule):
         spawn_state = self.reset()
         self.replay_buffers.append(Experience(
             state=dead_state,
-            # Reset action is noop - refer to self.env.unwrapped._action_set
+            # Reset action is noop - refer to self.env.unwrapped._action_set  # TODO: Use limited zuma action set
             # to ensure this is true for your env. Montezuma=Yes
             action=0,
             reward=0,
@@ -934,9 +968,14 @@ class LearnMax(pl.LightningModule):
         wandb.init(entity='crizcraig', mode='disabled')
 
         test_loader = self.train_dataloader()
+
+        # Forward through a few to get different trajectories
         xl = next(iter(test_loader))[0].cuda()
         xl = next(iter(test_loader))[0].cuda()
-        # xl = next(iter(test_loader))[0].cuda()
+        xl = next(iter(test_loader))[0].cuda()
+        xl = next(iter(test_loader))[0].cuda()
+        xl = next(iter(test_loader))[0].cuda()
+
         x = xl.cuda().reshape(-1, 3, 84, 84)
         # TODO: List => Tensor
         # x = [t.cuda() for t in xl]
@@ -963,7 +1002,8 @@ class LearnMax(pl.LightningModule):
     def viz_gpt(self, logits, target_idx, state, batch_idx, postfix=None):
         postfix = postfix or ''
         batch_index = 0  # Viz first batch (set ALWAYS_SAMPLE_LATEST) to compare with simple predict trajectory
-        num_imgs_to_viz = 10
+        seq_win_size = target_idx.shape[-1]
+        num_imgs_to_viz = min(10, seq_win_size)
         top_n = 3
         imgs = state[batch_index][-num_imgs_to_viz:]  # Check end of sequence
 
@@ -1223,7 +1263,11 @@ class LearnMax(pl.LightningModule):
                     prop.zero_grad()
             batch_size = self.gpt_batch_size
             self.dvq.set_do_kmeans(False)
-            self.warm_start_size = 2 * self.gpt_batch_size * self.gpt_block_size  # One val and one train batch
+            if self.should_overfit_gpt:
+                self.warm_start_size = self.replay_buffers.overfit_length
+            else:
+                self.warm_start_size = 2 * self.gpt_batch_size * self.gpt_block_size  # One val and one train batch
+
         else:
             self.warm_start_size = self.dvq_batch_size
             batch_size = self.dvq_batch_size  # Already set in __init__ but in case we toggle training gpt, set here too
