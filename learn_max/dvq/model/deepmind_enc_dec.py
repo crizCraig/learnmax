@@ -2,6 +2,7 @@
 Patch Encoders / Decoders as used by DeepMind in their sonnet repo example:
 https://github.com/deepmind/sonnet/blob/v2/examples/vqvae_example.ipynb
 """
+import decimal
 import os
 
 import torch
@@ -32,14 +33,19 @@ class DeepMindEncoder(nn.Module):
 
     def __init__(self, input_channels=3, n_hid=64, input_width=32, embedding_dim=64, is_single_token2=False,
                  strides=None):
+        super().__init__()
         if strides is None:
             strides = [2, 2]
-        super().__init__()
-
+        self.strides = strides
         self.is_single_token2 = is_single_token2
 
         down_sample = np.prod(1/np.array(strides))
-        out_width = int(input_width * down_sample)
+        out_width = input_width * down_sample
+
+        if not is_single_token2 and strides != [2, 4]:
+            raise NotImplementedError('Figure out exact way strides and padding influences out width, as below ' +
+                                      'doesn\'t work with all strides, but does work with 2,4')
+        out_width = int(decimal.Decimal(out_width).quantize(decimal.Decimal('1'), rounding=decimal.ROUND_HALF_UP))
 
         if self.is_single_token2:
             self.output_channels = n_hid  # Want to see what decoding the encoder vs quantized looks like

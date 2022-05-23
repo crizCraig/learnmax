@@ -19,7 +19,7 @@ from loguru import logger as log
 from torch.nn import functional as F
 
 from learn_max.constants import ACC_LOG_PERIOD
-from learn_max.utils import accuracy, wandb_log
+from learn_max.utils import accuracy, wandb_log, get_batch_vars, sa2as
 
 
 class CausalSelfAttention(nn.Module):
@@ -105,7 +105,8 @@ class GPT(nn.Module):
                  # model definition args
                  output_size: int,  # size of the output vocabulary
                  num_input_embeddings: int,  # number of possible input tokens
-                 block_size: int,  # length of the model's context window in time
+                 num_state_embeddings: int,  # number of possible state tokens (i.e. not action tokens or delimiter token)
+                 frames_in_sequence_window: int,  # number of frames in sequence window (block)
                  n_layer: int,  # depth of the model; number of Transformer blocks in sequence
                  input_embedding_dim: int,  # the "width" of the input to the model
                  n_head: int,  # number of heads in each multi-head attention inside each Transformer block
@@ -119,9 +120,12 @@ class GPT(nn.Module):
                  should_input_embed: bool = False,  # whether to use embeddings or indexes as input to first layer
                  should_input_and_learn_embed: bool = False,  # whether to cat input embed with learned token embed
                  num_actions: int = 0,  # number of actions to use for action embedding
+                 is_single_token2: bool = False,  # whether there's one token per image
+                 tokens_per_frame: int = None,  # number of tokens per frame (1 in single token)
                  ):
         super().__init__()
         self.output_size = output_size
+        self.is_single_token2 = is_single_token2
 
         # save these for optimizer init later
         self.learning_rate = learning_rate
@@ -136,8 +140,15 @@ class GPT(nn.Module):
         # self.dvq_proj = nn.Linear(input_embedding_dim, embedding_dim)
         assert embedding_dim % n_head == 0, f'Embedding len {embedding_dim} not evenly divisible by number of heads {n_head}'
         self.tok_emb = nn.Embedding(num_input_embeddings, input_embedding_dim)  # This should be num of z_q_emb,
+
+        # block_size is the length of the model's context window in time
+        if is_single_token2:
+            block_size = frames_in_sequence_window
+        else:
+            block_size = frames_in_sequence_window * tokens_per_frame
         self.pos_emb = nn.Parameter(torch.zeros(1, block_size, embedding_dim))
         self.act_emb = nn.Embedding(num_actions, input_embedding_dim)
+        # self.delim_emb = nn.Embedding(1, embedding_dim)
 
         self.drop = nn.Dropout(embd_pdrop)
         # deep transformer: just a sequence of transformer blocks
@@ -165,6 +176,9 @@ class GPT(nn.Module):
         self.should_input_embed = should_input_embed
         self.should_input_and_learn_embed = should_input_and_learn_embed
         self.num_actions = num_actions
+        self.embedding_dim = embedding_dim
+        self.num_input_embeddings = num_input_embeddings
+        self.num_state_embeddings = num_state_embeddings
 
         self.global_step = 0
 
@@ -178,7 +192,10 @@ class GPT(nn.Module):
         reduces the amount of memory used in all subsequent layers that use the reduced layer width.
         """
         blocks = []
-        approx_scale = [0.1] + [1] * (n_layer - 1)  # TODO: Allow passing this in
+        if self.is_single_token2:
+            approx_scale = [0.1] + [1] * (n_layer - 1)  # TODO: Allow passing this in
+        else:
+            approx_scale = [1] * n_layer
         assert len(approx_scale) == n_layer
         out_dims = []
         for l_i in range(n_layer):
@@ -271,7 +288,35 @@ class GPT(nn.Module):
             print('trajectories: ', len(self.trajectory_counts))
             print('max_trajectory_count: ', self.max_trajectory_count)
 
-    def forward(self, embed, idx, actions):
+    def forward(self, *args):
+        if self.is_single_token2:
+            embed, idx, actions = args
+            return self.single_token_forward(actions, embed, idx)
+        else:
+            idx = args[0]
+            B, S = idx.size()
+            assert S <= self.block_size, "Cannot forward, model block size is exhausted."
+            # forward the GPT model
+            token_embed = self.tok_emb(idx)  # each input token index maps to a (learnable) vector
+            position_embed = self.pos_emb[:, :S, :]  # each position maps to a (learnable) vector
+
+            x = self.drop(token_embed + position_embed)
+            x = self.blocks(x)
+            x = self.ln_f(x)
+            logits = self.logit_p_head(x)
+            expected_deviation = self.deviation_head(
+                x)  # Uses mean deviation instead of standard deviation https://stats.stackexchange.com/q/81986/18187
+            wandb_log({'train/logits_std': logits.std()}, self.global_step)
+
+            # TODO: Sum and normalize the tokens over sequence, i.e.
+            #  emb_d * (num_state_positions (121) + 1 (action) + 1 (delim))
+            #  in the window as the possibilities regression target. We'll also need the previous possibilities to
+            #  detect saliency and a possibilities uncertainty target trained with possibilities loss to know how
+            #  sure we are about saliency.
+
+            return saliency, logits
+
+    def single_token_forward(self, actions, embed, idx):
         # if self.should_input_embed:
         #     b, t, embed = idx_or_embed.size()
         # else:
@@ -279,24 +324,21 @@ class GPT(nn.Module):
         #     embed = None
         b, t, e = embed.size()
         assert t <= self.block_size, "Cannot forward, model block size is exhausted."
-
         # forward the GPT model
         token_embed = self.tok_emb(idx)  # each input token index maps to a (learnable) vector
         position_embed = self.pos_emb[:, :t, :]  # each position maps to a (learnable) vector
         action_embed = self.act_emb(actions)  # each action maps to a (learnable) vector
         # token_embed = torch.cat((token_embed, action_embeddings), dim=2)
-
         # allow learning a transformation into the summed representation below so that we can learn how to best
         # distribute the dvq embedding to the attention heads
         # embed = self.dvq_proj(embed)  # this projection kills performance for some reason
-
         # x = self.drop(token_embed + position_embeddings + action_embeddings + dvq_proj)
         x = self.drop(token_embed + position_embed + action_embed)  # + embed)
         x = self.blocks(x)
         x = self.ln_f(x)
         logits = self.logit_p_head(x)
-        expected_deviation = self.deviation_head(x)  # Uses mean deviation instead of standard deviation https://stats.stackexchange.com/q/81986/18187
-
+        expected_deviation = self.deviation_head(
+            x)  # Uses mean deviation instead of standard deviation https://stats.stackexchange.com/q/81986/18187
         # wandb.log({'train/expected_deviation_median': torch.quantile(expected_deviation, 0.5)})
         # wandb.log({'train/expected_deviation_90pct': torch.quantile(expected_deviation, 0.9 )})
         # wandb.log({'train/expected_deviation_95pct': torch.quantile(expected_deviation, 0.95)})
@@ -304,19 +346,28 @@ class GPT(nn.Module):
         # wandb.log({'train/expected_deviation_mean': expected_deviation.mean()})
         # wandb.log({'train/expected_deviation_max': expected_deviation.max()})
         # wandb.log({'train/expected_deviation_min': expected_deviation.min()})
-
         wandb_log({'train/logits_std': logits.std()}, self.global_step)
-
         return logits, expected_deviation
 
     def step_(self, split, batch, batch_idx=None):
-        embed, idx, next_idx, a, a_next = batch  # gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y
-        if split == 'train':
-            assert embed.size()[1] == self.block_size, \
-                'Not filling block size in train will result in untrained latter positions.'
+        if self.is_single_token2:
+            embed, idx, next_idx, a, a_next = batch  # gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y
+            if split == 'train':
+                assert embed.size()[1] == self.block_size, \
+                    'Not filling block size in train will result in untrained latter positions.'
 
-        target_idx = self.s_i_to_as_i(next_idx, a_next)
-        logits, expected_deviation = self.forward(embed, idx, a)
+            target_idx = self.s_i_to_as_i(next_idx, a_next)
+            logits, expected_deviation = self.forward(embed, idx, a)
+        else:
+            idx, target_idx = batch
+            if split == 'train':
+                assert idx.size()[1] == self.block_size, \
+                    'Not filling block size in train will result in untrained latter positions.'
+            # TODO: Do forward that respects position of action and delim
+            salience, logits = self.forward(idx)
+
+
+
 
         # Calculate mean deviation loss for uncertainty ----------------------
         # Turn targets into one hot B x block_size x vocab_size with 1 in vocab
@@ -405,7 +456,7 @@ class GPT(nn.Module):
     def accuracy(self, logits, target_idx, split):
         """logits (Batch, sequence Window, Action-State) """
         # TODO: State based accuracy (currently action-state)
-        if not self.single_token2:
+        if not self.is_single_token2:
             raise NotImplementedError('Implement patch accuracy')
         # Batch, State, Action dims
         B, S, A = logits.shape[0], logits.shape[1]//self.num_actions, self.num_actions
@@ -460,3 +511,79 @@ class GPT(nn.Module):
 
     def test_step(self, *args, **kwargs):
         return self.step_('test', *args, **kwargs)
+
+    def get_batch_vars(self, batch):
+        s, a, r, d, s_next, agent_state = get_batch_vars(
+            batch,
+            return_agent_state=True,
+            populate_gpt=True,
+            single_token2=self.is_single_token2)
+
+        z_q_ind = torch.stack([a['dvq_z_q_ind'] for a in agent_state])
+        z_q_flat = torch.stack([a['dvq_z_q_flat'] for a in agent_state])
+
+        if self.is_single_token2:
+            a_x, a_y, gpt_x, z_q_ind_x, z_q_ind_y = sa2as(z_q_flat, z_q_ind, a)
+            ret = [gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y, s, agent_state]
+            return ret
+        else:
+            # Lightning collate does an annoying transpose with zip that switches B and S
+            #  and then
+            z_q_ind.squeeze_(2)
+            z_q_flat.squeeze_(2)
+
+            # permute from S,B => B,S
+            z_q_ind = z_q_ind.permute(1, 0, 2, 3)
+            z_q_flat = z_q_flat.permute(1, 0, 2, 3, 4)
+
+            # Add frame delimiter
+            # We don't really use z_q_flat in GPT anymore. We just need an extra cluster for the delim in z_q_ind.
+            # TODO: We should get the delimiter and action embeddings from the same embedding as tokens, just shift
+            #   the indexes. That way, we don't have as much overlap risk between the tensors, i.e. there's better
+            #   separation between actions and states and delimiters. For training, we can mask out the non-action
+            #   outputs when predicting actions, non-state when predicting states, and non-delim when predicting delim
+            #   parts of a sequence.
+            # TODO: Add within-frame position embeddings to dvq tokens for within image understanding
+            # TODO: Add frame position embeddings
+            device = z_q_ind.device
+            B, S, H, W, E = z_q_flat.shape  # batch sequence-frames height width embedding
+            delim_ind = self.num_state_embeddings + self.num_actions  # After state patches and action token
+
+            # Not using flat with patches as patches convey within-image info
+            # flat_delim = self.tok_emb(torch.tensor(delim_ind).to(device))
+            # flat_delim = flat_delim.repeat(B * S, 1)
+            # z_q_flat = z_q_flat.reshape(B * S, H * W * E)
+            # z_q_flat = torch.cat((z_q_flat, flat_delim), 1).reshape(B, S, H * W * E + E)
+
+            ind_delim = torch.tensor(delim_ind).to(device)  # add new cluster for delim
+            ind_delim = ind_delim.repeat(B * S, 1)
+            a_shifted = a + self.num_state_embeddings
+            a_shifted = a_shifted.reshape(B * S, 1)
+            ind = z_q_ind.reshape(B * S, H * W)
+            ind = torch.cat((ind, a_shifted, ind_delim), -1)
+            ind = ind.reshape(B, -1)
+
+            # Create autoregression targets by shifting, we have an extra frame in case next patch is next frame,
+            #   but only need to predict one patch
+            gpt_ind_x = ind[:, :self.block_size]
+            gpt_ind_y = ind[:, 1:1+self.block_size]
+
+            return gpt_ind_x, gpt_ind_y
+
+
+
+
+
+
+
+
+
+
+        # s_ind =
+        # z_q_flat shape single_token2 = 42, 2,  1, 4410 => S, B, 1, emb_d
+        # z_q_flat shape patch based   = 42, 16, 1, 11, 11, 30 => S, B, 1, H, W, emb_d
+        # The above H, W should be folded into S, but with some delimiter between frames
+
+
+
+

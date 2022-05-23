@@ -54,7 +54,7 @@ class LearnMax(pl.LightningModule):
             checkpoint: str = None,  # Model checkpoint
 
             embedding_dim: int = None,
-            num_embeddings: int = None,  # Number of possible discrete states shared between dvq and gpt
+            num_state_embeddings: int = None,  # Number of possible discrete states shared between dvq and gpt
 
             # dvq args - dvq = deep vector quantization
             dvq_batch_size: int = 32,  # DVQ batch size
@@ -153,12 +153,12 @@ class LearnMax(pl.LightningModule):
         self.is_single_token2 = single_token2
         default_num_embeddings, default_embedding_dim = get_default_embeddings(self.is_single_token2)
 
-        if num_embeddings is None:
-            num_embeddings, embedding_dim = default_num_embeddings, default_embedding_dim
+        if num_state_embeddings is None:
+            num_state_embeddings, embedding_dim = default_num_embeddings, default_embedding_dim
         # Hyperparameters
         self.dvq_embedding_dim = embedding_dim  # size of the embedding vector representing a cluster of embeddings
         self.dvq_n_hid = dvq_n_hid
-        self.dvq_num_embeddings = num_embeddings
+        self.dvq_num_embeddings = num_state_embeddings
         self.dvq_loss_flavor = dvq_loss_flavor
         self.dvq_input_channels = dvq_input_channels
         self.dvq_enc_dec_flavor = dvq_enc_dec_flavor
@@ -359,24 +359,30 @@ class LearnMax(pl.LightningModule):
         self.predicted_trajectory_buffer = deque(maxlen=self.predicted_trajectories_size if 'DEBUG_TRAJ_BUFF' not in os.environ else 10)
 
         if self.is_single_token2:
-            self.dvq = VQVAE(n_hid=dvq_n_hid, num_embeddings=num_embeddings, embedding_dim=self.dvq_embedding_dim,
+            self.dvq = VQVAE(n_hid=dvq_n_hid, num_embeddings=num_state_embeddings, embedding_dim=self.dvq_embedding_dim,
                              loss_flavor=dvq_loss_flavor, input_channels=dvq_input_channels,
                              enc_dec_flavor=dvq_enc_dec_flavor, vq_flavor=dvq_vq_flavor,
                              quantize_proj=dvq_quantize_proj,
                              is_single_token2=self.is_single_token2, enable_kmeans=dvq_enable_kmeans)
+            num_gpt_embeddings = num_state_embeddings * self.num_actions
+            tokens_per_frame = 1
         else:
             # TODO: Need to test that distance between clusters is further than avg distance between points in a cluster
-            self.dvq = VQVAE(n_hid=dvq_n_hid, num_embeddings=num_embeddings, embedding_dim=self.dvq_embedding_dim,
+            self.dvq = VQVAE(n_hid=dvq_n_hid, num_embeddings=num_state_embeddings, embedding_dim=self.dvq_embedding_dim,
                              loss_flavor=dvq_loss_flavor, input_channels=dvq_input_channels,
                              enc_dec_flavor=dvq_enc_dec_flavor, vq_flavor=dvq_vq_flavor, quantize_proj=None,
                              is_single_token2=self.is_single_token2)
+            num_gpt_embeddings = num_state_embeddings + self.num_actions + 1  # actions + 1 for frame delimiter
+            tokens_per_frame = self.dvq.encoder.out_width ** 2 + 2  # H*W patches + 1 action + 1 delimiter
 
-        self.gpt = GPT(output_size=num_embeddings * self.num_actions, num_input_embeddings=num_embeddings,
-                       block_size=gpt_block_size, n_layer=gpt_n_layer,
+        self.gpt = GPT(output_size=num_gpt_embeddings, num_input_embeddings=num_gpt_embeddings,
+                       num_state_embeddings=num_state_embeddings,
+                       frames_in_sequence_window=gpt_block_size, n_layer=gpt_n_layer,
                        input_embedding_dim=self.gpt_input_embedding_dim, n_head=gpt_n_head,
                        learning_rate=gpt_learning_rate, weight_decay=gpt_weight_decay, betas=gpt_betas,
                        embd_pdrop=gpt_embd_pdrop, resid_pdrop=gpt_resid_pdrop, attn_pdrop=gpt_attn_pdrop,
-                       should_input_embed=gpt_input_embed, num_actions=self.num_actions)
+                       should_input_embed=gpt_input_embed, num_actions=self.num_actions,
+                       is_single_token2=single_token2, tokens_per_frame=tokens_per_frame)
 
         self.agent = LearnMaxAgent(model=self, num_actions=self.num_actions)
         self.reset()
@@ -562,7 +568,10 @@ class LearnMax(pl.LightningModule):
             # If training GPT, we need to return the dvq state indexes as well to be used in on_train_batch_end
             #   in lr_decay _, y = batch
             # Sample 2 extra as we shift actions back 1 for action-states and targets forward 1 see sa2as()
-            num_extra_block_indices = 2
+            if self.is_single_token2:
+                num_extra_block_indices = 2  # action => states and shift targets by 1
+            else:
+                num_extra_block_indices = 1  # shift targets by 1
             start_range = np.arange(len(self.train_buf) - self.gpt_block_size + 1 - num_extra_block_indices)
             start_indices = np.random.choice(start_range, self.gpt_batch_size, replace=False)
             if 'ALWAYS_SAMPLE_LATEST' in os.environ:
@@ -712,13 +721,15 @@ class LearnMax(pl.LightningModule):
 
         if self.should_train_gpt:
             self.dvq.set_do_kmeans(False)
-            gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y, s, agent_state = get_batch_vars(batch,
-                                                                                   return_agent_state=True,
-                                                                                   populate_gpt=True)
             if self.gpt_learning_rate == 0 or 'ZERO_LR' in os.environ:
                 # For testing that train step and visualize methods produce same output, basically disable dropout
                 self.eval()
-            gpt_ret = self.gpt.training_step(batch=(gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y), batch_idx=batch_idx)
+            if self.is_single_token2:
+                gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y, s, agent_state = self.gpt.get_batch_vars(batch)
+                gpt_ret = self.gpt.training_step(batch=(gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y), batch_idx=batch_idx)
+            else:
+                gpt_ind_x, gpt_ind_y = self.gpt.get_batch_vars(batch)
+                gpt_ret = self.gpt.training_step(batch=(gpt_ind_x, gpt_ind_x), batch_idx=batch_idx)
             self.gpt.global_step = self.global_step
 
             # Visualization steps
@@ -801,7 +812,8 @@ class LearnMax(pl.LightningModule):
         if self.should_train_gpt:
             gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y, s, agent_state = get_batch_vars(batch,
                                                                                    return_agent_state=True,
-                                                                                   populate_gpt=True)
+                                                                                   populate_gpt=True,
+                                                                                   single_token2=self.is_single_token2)
             gpt_ret = self.gpt.test_step(batch=(gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y), batch_idx=batch_idx)
             loss = gpt_ret['loss']
             wandb_log({'loss/test': loss}, self.global_step)

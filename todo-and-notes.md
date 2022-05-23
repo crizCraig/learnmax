@@ -51,6 +51,8 @@
 - Salient loss - we can predict the sum of the next n-frames (summing all patches or all single tokens) and compute the MSE or softmax/cross-entropy for loss. This ensures that the logits or last layer activations contain information necessary for determining when a large change in possibilities happens. A problem, however occurs when we start following the same salient path over and over, in which case the possibilities change will be more gradual. In this case we are forgetting the other possibilities before and after the salient state, and hardcoding to the possibilities that occur in the salient path. I guess this is okay, so long as we don't recalculate salient states and forget that the state is salient. Even if we do, the lower level will just follow the salient path and forget that it's possible to not follow the salient path in which case it sort of acts like salient compression.
 - Make a legit dataset that we can do real epics with. Start with small max episode steps and make sure test set does not contain sequences in the train set. This will require some hash stable of sequences in train. Then we can start to see how hard it is to get high test prediction accuracy with low environment complexity (i.e. small transition table due to small episode size). We can also train on this with traditional dataloaders etc... as we don't need to run Atari.
 - Patch based DVQ
+  - Concat patches along sequence window with delimiter token
+  - GPT accuracy support
   - Actions should be given one part of the sequence window, instead of added to every token in the sequence. You could add to every patch token I guess, but that forces the whole network to disentangle the action from the patch whereas many times the next frame patch at the same position does not depend on the action (like the background or skull)
   - Due to above, we don't have action-states in each token. This is nice as we output an action. The disadvantage is that the sequence window size grows a lot. We reduced the embedding size to ~70(emb_d)*441(n_patch)=30870+action from 4410 for a net growth in input size of 10x therefore (n^2) 100x net size! So we'll have to reduce the sequence window to less than 10 likely.
     To extend the window without N**2 more weights, we could use https://arxiv.org/abs/2203.08913 or referenced methods. We can try reducing the number of patches though from 441 to 144 = 12*12 as atari img's are 84x84 and therefore patch sizes would be 7x7 instead of 4x4 pixels.
@@ -64,10 +66,15 @@
     - Also add an in-image position encoding to the patch (should not be needed per Flamingo?).
     - Tokenize images into 16x16, normalize -1=>1 and divide by root(16) - Shouldn't need as we learn a nice discrete embedding
     - Encode image patches through one resnet block - Shouldn't need as we learn a nice discrete embedding
-    - They're narrower transformers 2048, 1536, 768 than me at around 4k and much more compute. 
+    - They're narrower transformers 2048, 1536, 768 than me at around 4k and much more compute. Their patch embeddings at 768 must be small, like 10??
 Notes:
 #### Comparison with hierarchy of abstract machines (HAMs)
 These have discrete action, call, choice, and stop where execution is occurring at one level of abstraction at a time (i.e. sequentially). A big difference between this and learnmax is that learnmax can search within different levels of abstraction in parallel. Since high level plans don't change as often, most searching is done in the lower levels even when executing a high level plan to find some long term entropy. So your basically optimizing for entropy reduction per unit time. However since high level entropy possibly unlocks new vistas and worlds of low level entropy, we still should perhaps afford more weight to high level entropy just based on level alone. 
 
 #### Comparison with options in hierarchical RL
 It seems that options may support planning at multiple levels simultaneously. However, I don't see a way to automatically learn the options. Rather they are provided by humans. 
+
+
+#### Comparison with human visual cortex
+Number of possible images too large to represent with ints (single token). Similarly for visual cortex, third layer is made up of combination of discrete 
+representations (lines in different directions) from layer 2. i.e. there is no single grandmother neuron. https://en.wikipedia.org/wiki/Grandmother_cell

@@ -5,6 +5,7 @@ from datetime import datetime
 from functools import wraps
 from typing import List
 
+from einops import rearrange
 from loguru import logger as log
 import torch
 import numpy as np
@@ -245,7 +246,8 @@ def _wandb_log_closure():
 wandb_log, wandb_check_flush = _wandb_log_closure()
 
 
-def get_batch_vars(batch, use_next=False, return_agent_state=False, populate_gpt=False, use_compressed_clusters=False):
+def get_batch_vars(batch, use_next=False, return_agent_state=False, populate_gpt=False, use_compressed_clusters=False,
+                   single_token2=False):
     # TODO: Just put everything in agent_state, next_agent_state dicts
     agent_state = None
     if len(batch) == 5:
@@ -260,6 +262,7 @@ def get_batch_vars(batch, use_next=False, return_agent_state=False, populate_gpt
         s, a, r, d, s_next, agent_state = batch
         dvq_x = s
     else:
+        raise NotImplementedError('Need to update this')
         # Text (i.e. not atari)
         a = None  # This is for text so no action TODO: remove
         dvq_x, y = batch  # hate that i have to do this here in the model
@@ -269,19 +272,7 @@ def get_batch_vars(batch, use_next=False, return_agent_state=False, populate_gpt
             dvq_batch = dvq_x, agent_state
         return dvq_batch
     else:
-        # Populate GPT
-        z_q_ind = torch.stack([a['dvq_z_q_ind'] for a in agent_state])
-        z_q_flat = torch.stack([a['dvq_z_q_flat'] for a in agent_state])
-
-        # s_ind =
-        # z_q_flat shape single_token2 = 42, 2,  1, 4410 => S, B, 1, emb_d
-        # z_q_flat shape patch based   = 42, 16, 1, 11, 11, 30 => S, B, 1, H, W, emb_d
-        # The above H, W should be folded into S, but with some delimiter between frames
-        a_x, a_y, gpt_x, z_q_ind_x, z_q_ind_y = sa2as(z_q_flat, z_q_ind, a)
-        ret = [gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y, s]
-        if return_agent_state:
-            ret.append(agent_state)
-        return ret
+        return s, a, r, d, s_next, agent_state
 
 
 def sa2as(z_q_flat, z_q_ind, a):

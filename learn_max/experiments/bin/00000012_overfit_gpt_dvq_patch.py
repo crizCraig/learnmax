@@ -9,12 +9,12 @@ train_to_test_collection_ratio = 10
 def get_model_args():
     args = get_blank_model_args()
     args.gpt_batch_size = 16
-    args.gpt_block_size = 40
+    args.gpt_block_size = 9  # 10 gives OOM
     args.single_token2 = False
     args.viz_predict_trajectory = True
     args.should_train_gpt = True
     args.dvq_checkpoint = '/home/a/src/learnmax/.lightning/learnmax-learn_max_experiments_bin/37yv98e9/checkpoints/epoch=8-step=85999.ckpt'
-    args.num_embeddings = 256
+    args.num_state_embeddings = 256
     args.embedding_dim = 30
 
     # Overfit args
