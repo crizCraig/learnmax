@@ -365,7 +365,7 @@ class LearnMax(pl.LightningModule):
                              quantize_proj=dvq_quantize_proj,
                              is_single_token2=self.is_single_token2, enable_kmeans=dvq_enable_kmeans)
             num_gpt_embeddings = num_state_embeddings * self.num_actions
-            tokens_per_frame = 1
+            tokens_in_frame = 1
         else:
             # TODO: Need to test that distance between clusters is further than avg distance between points in a cluster
             self.dvq = VQVAE(n_hid=dvq_n_hid, num_embeddings=num_state_embeddings, embedding_dim=self.dvq_embedding_dim,
@@ -373,7 +373,7 @@ class LearnMax(pl.LightningModule):
                              enc_dec_flavor=dvq_enc_dec_flavor, vq_flavor=dvq_vq_flavor, quantize_proj=None,
                              is_single_token2=self.is_single_token2)
             num_gpt_embeddings = num_state_embeddings + self.num_actions + 1  # actions + 1 for frame delimiter
-            tokens_per_frame = self.dvq.encoder.out_width ** 2 + 2  # H*W patches + 1 action + 1 delimiter
+            tokens_in_frame = self.dvq.encoder.out_width ** 2 + 2  # H*W patches + 1 action + 1 delimiter
 
         self.gpt = GPT(output_size=num_gpt_embeddings, num_input_embeddings=num_gpt_embeddings,
                        num_state_embeddings=num_state_embeddings,
@@ -382,7 +382,8 @@ class LearnMax(pl.LightningModule):
                        learning_rate=gpt_learning_rate, weight_decay=gpt_weight_decay, betas=gpt_betas,
                        embd_pdrop=gpt_embd_pdrop, resid_pdrop=gpt_resid_pdrop, attn_pdrop=gpt_attn_pdrop,
                        should_input_embed=gpt_input_embed, num_actions=self.num_actions,
-                       is_single_token2=single_token2, tokens_per_frame=tokens_per_frame)
+                       is_single_token2=single_token2, tokens_in_frame=tokens_in_frame,
+                       batch_size=self.gpt_batch_size)
 
         self.agent = LearnMaxAgent(model=self, num_actions=self.num_actions)
         self.reset()
@@ -514,17 +515,18 @@ class LearnMax(pl.LightningModule):
             if self.total_steps % self.batches_per_epoch == 0:
                 break
 
-    def gen_validation_batch(self, ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def validation_batch_gen(self, ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if len(self.replay_buffers.test_buf) == 0:
             yield from self._yield_empty_validation_batch()
         else:
-            # TODO: Move this tuple into a @dataclass
+
             start_indices = np.arange(start=0,
                                       stop=len(self.test_buf) - self.gpt_block_size + 1,
                                       step=self.gpt_block_size)
             if len(start_indices) == 0:
                 yield from self._yield_empty_validation_batch()
             else:
+                # TODO: Move this tuple into a @dataclass
                 states, actions, rewards, dones, new_states, agent_states, next_agent_states = self.sample_sequential(
                     buffer=self.test_buf,
                     start_indices=start_indices,
@@ -571,9 +573,16 @@ class LearnMax(pl.LightningModule):
             if self.is_single_token2:
                 num_extra_block_indices = 2  # action => states and shift targets by 1
             else:
-                num_extra_block_indices = 1  # shift targets by 1
-            start_range = np.arange(len(self.train_buf) - self.gpt_block_size + 1 - num_extra_block_indices)
-            start_indices = np.random.choice(start_range, self.gpt_batch_size, replace=False)
+                num_extra_block_indices = 0
+            sample_size = self.gpt_batch_size * self.gpt_block_size
+            start_range = np.arange(len(self.train_buf) - 1 - sample_size - num_extra_block_indices)
+
+            # We want sequential start indices so that we can detect salience across batch
+            start_idx = np.random.choice(start_range, 1, replace=False)[0]
+            start_indices = np.arange(start=start_idx,
+                                      stop=start_idx + sample_size,
+                                      step=self.gpt_block_size)
+
             if 'ALWAYS_SAMPLE_LATEST' in os.environ:
                 start_indices[0] = start_range[-1]
             states, actions, rewards, dones, new_states, agent_states, next_agent_states = self.sample_sequential(
@@ -728,12 +737,12 @@ class LearnMax(pl.LightningModule):
                 gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y, s, agent_state = self.gpt.get_batch_vars(batch)
                 gpt_ret = self.gpt.training_step(batch=(gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y), batch_idx=batch_idx)
             else:
-                gpt_ind_x, gpt_ind_y = self.gpt.get_batch_vars(batch)
-                gpt_ret = self.gpt.training_step(batch=(gpt_ind_x, gpt_ind_x), batch_idx=batch_idx)
+                gpt_ind = self.gpt.get_batch_vars(batch)
+                gpt_ret = self.gpt.training_step(batch=(gpt_ind,), batch_idx=batch_idx)
             self.gpt.global_step = self.global_step
 
             # Visualization steps
-            if 'ZERO_LR' in os.environ:
+            if 'ZERO_LR' in os.environ and self.is_single_token2:
                 test_logits, _ = self.gpt.forward(gpt_x, z_q_ind_x, a_x)
                 test_target = self.gpt.s_i_to_as_i(z_q_ind_y, a_x)
                 self.viz_gpt(test_logits, test_target, state=s, batch_idx=79797979)
@@ -1303,7 +1312,7 @@ class LearnMax(pl.LightningModule):
     def val_dataloader(self) -> DataLoader:
         """Get validation loader"""
 
-        validation_dataset = ExperienceSourceDataset(self.gen_validation_batch)
+        validation_dataset = ExperienceSourceDataset(self.validation_batch_gen)
 
         if not self.pin_memory:
             log.warning('Pin memory is off, data loading will be slow. Turn on when using disk backed replay buffer')

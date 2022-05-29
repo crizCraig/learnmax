@@ -8,7 +8,7 @@ GPT model:
 """
 
 import math
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import Dict, Tuple
 
 import torch
@@ -121,11 +121,15 @@ class GPT(nn.Module):
                  should_input_and_learn_embed: bool = False,  # whether to cat input embed with learned token embed
                  num_actions: int = 0,  # number of actions to use for action embedding
                  is_single_token2: bool = False,  # whether there's one token per image
-                 tokens_per_frame: int = None,  # number of tokens per frame (1 in single token)
+                 tokens_in_frame: int = None,  # number of tokens per frame (1 in single token)
+                 batch_size: int = None,
                  ):
         super().__init__()
         self.output_size = output_size
         self.is_single_token2 = is_single_token2
+        self.batch_size = batch_size
+        self.frames_in_sequence_window = frames_in_sequence_window
+        self.tokens_in_frame = tokens_in_frame
 
         # save these for optimizer init later
         self.learning_rate = learning_rate
@@ -145,8 +149,13 @@ class GPT(nn.Module):
         if is_single_token2:
             block_size = frames_in_sequence_window
         else:
-            block_size = frames_in_sequence_window * tokens_per_frame
+            block_size = frames_in_sequence_window * tokens_in_frame
+            # Queue to store history of combined recent states for determining salience
+            self.possibility_q = deque(maxlen=block_size)
         self.pos_emb = nn.Parameter(torch.zeros(1, block_size, embedding_dim))
+        self.patch_emb = nn.Parameter(torch.zeros(1, tokens_in_frame, embedding_dim))
+        self.frame_emb = nn.Parameter(torch.zeros(1, frames_in_sequence_window, tokens_in_frame, embedding_dim))
+
         self.act_emb = nn.Embedding(num_actions, input_embedding_dim)
         # self.delim_emb = nn.Embedding(1, embedding_dim)
 
@@ -181,6 +190,8 @@ class GPT(nn.Module):
         self.num_state_embeddings = num_state_embeddings
 
         self.global_step = 0
+        self.salience_reservoir_n = 0
+        self.salience_reservoir_k = 10_000
 
         log.info("number of parameters: %e" % sum(p.numel() for p in self.parameters()))
 
@@ -256,8 +267,10 @@ class GPT(nn.Module):
                     # weights of blacklist modules will NOT be weight decayed
                     no_decay.add(fpn)
 
-        # special case the position embedding parameter in the root GPT module as not decayed
+        # special case the position embedding parameters in the root GPT module as not decayed
         no_decay.add('pos_emb')
+        no_decay.add('patch_emb')
+        no_decay.add('frame_emb')
 
         # validate that we considered every parameter
         param_dict = {pn: p for pn, p in self.named_parameters()}
@@ -294,13 +307,20 @@ class GPT(nn.Module):
             return self.single_token_forward(actions, embed, idx)
         else:
             idx = args[0]
-            B, S = idx.size()
-            assert S <= self.block_size, "Cannot forward, model block size is exhausted."
+
+            # TODO: We should split the index and target here so that we can add the patch and frame embeddings first
+            #   as well as optionally look at frame-based salience
+
+            B, SF, FP = idx.size()
+            assert SF * FP <= self.block_size, "Cannot forward, model block size is exhausted."
             # forward the GPT model
             token_embed = self.tok_emb(idx)  # each input token index maps to a (learnable) vector
-            position_embed = self.pos_emb[:, :S, :]  # each position maps to a (learnable) vector
 
-            x = self.drop(token_embed + position_embed)
+            # map frame and patch positions to a learnable vector
+            frame_embed = self.frame_emb[:, :SF, :]  # support partial sequences
+            patch_embed = self.patch_emb[:, :FP, :]  # support partial frames
+
+            x = self.drop(token_embed + frame_embed + patch_embed)
             x = self.blocks(x)
             x = self.ln_f(x)
             logits = self.logit_p_head(x)
@@ -308,13 +328,54 @@ class GPT(nn.Module):
                 x)  # Uses mean deviation instead of standard deviation https://stats.stackexchange.com/q/81986/18187
             wandb_log({'train/logits_std': logits.std()}, self.global_step)
 
-            # TODO: Sum and normalize the tokens over sequence, i.e.
+            # Sum and normalize the tokens over sequence, i.e.
             #  emb_d * (num_state_positions (121) + 1 (action) + 1 (delim))
-            #  in the window as the possibilities regression target. We'll also need the previous possibilities to
-            #  detect saliency and a possibilities uncertainty target trained with possibilities loss to know how
-            #  sure we are about saliency.
+            #  in the window as the possibilities' regression target.
+            #
+            # TODO: We need a buffer of previous possibilities
+            #  of length block_size to detect saliency and a possibilities uncertainty target trained
+            #  with possibilities loss to know how sure we are about saliency.
 
-            return saliency, logits
+            possibilities = logits.sum(axis=-1)
+
+            # don't want to use this as it's relative to current batch
+            # salience = ((salience - salience.min()) / max(1e-12, salience.max() - salience.min()))  # normalize 0=>1
+
+            # This is a little better but still relative to min sum in batch
+            # torch.log(logits.sum(axis=-1) - logits.sum(axis=-1).min() + 1e-12).min()
+
+            # Deterministically squash saliency, i.e. not relative to current batch
+            possibilities /= (self.block_size / 100)
+
+            # TODO: As higher levels of abstraction are created, squash sums by dividing by some small epsilon plus
+            #   the block size, i.e. salience = salience / (salience_lvl * block_size * epsilon)
+            #   epsilon should be sized such that the max level of abstraction leads to numbers amenable to
+            #   the optimizer. Should be easy to write some basic tests for this. This as the salience will be used
+            #   as the embedding for the higher level. We could cluster the embedding and assign it an int
+            #   value and remap it to a learned embedding to alleviate this. Then we just need to stay inside non-NaN
+            #   range. We'd want to ensure the clustering is stable as new clusters are added, i.e. cluster 0 continues
+            #   to represent the same types of things when adding new clusters.
+
+            assert possibilities.max() < 5, 'salience levels getting hard to optimize as embeddings '
+            if B == 1 and not self.training:
+                # Detect realtime salience with integration q
+                self.possibility_q.append(possibilities)  # About 4.4MB with B=1,S=1107 * 4 bytes per int32 = B * S^2 * 4B
+            else:
+                # TODO: Detect across batch
+                # Batch sequence needs to be sampled sequentially for this to work.
+                # TODO:
+                #   Slide the window across the batch and check for salience in train. Salience can pop up here
+                #   when it didn't in realtime due to changing weights/logits
+                windows = possibilities.flatten().unfold(dimension=0, size=possibilities.shape[-1], step=1)
+
+                # TODO: Should we do a euclidean or other distance?
+                salience = abs(windows[1:,:] - windows[:-1,:])
+                salience = salience.sum(axis=1)
+                # TODO: Look at top x% (abs?) and compare. We should look at the top 1% across more than just the batch.
+                #   Ideally this is all time. So maybe reservoir sampling or just keep max N with some expiration.
+                self.salience_reservoir_n += salience.numel()
+
+            return possibilities, logits
 
     def single_token_forward(self, actions, embed, idx):
         # if self.should_input_embed:
@@ -359,9 +420,10 @@ class GPT(nn.Module):
             target_idx = self.s_i_to_as_i(next_idx, a_next)
             logits, expected_deviation = self.forward(embed, idx, a)
         else:
-            idx, target_idx = batch
+            idx = batch[0]
             if split == 'train':
-                assert idx.size()[1] == self.block_size, \
+                B, SF, FP = idx.size()  # batch, sequence frames, frame patches
+                assert SF * FP == self.block_size, \
                     'Not filling block size in train will result in untrained latter positions.'
             # TODO: Do forward that respects position of action and delim
             salience, logits = self.forward(idx)
@@ -527,12 +589,11 @@ class GPT(nn.Module):
             ret = [gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y, s, agent_state]
             return ret
         else:
-            # Lightning collate does an annoying transpose with zip that switches B and S
-            #  and then
             z_q_ind.squeeze_(2)
             z_q_flat.squeeze_(2)
 
-            # permute from S,B => B,S
+            # Lightning collate does an annoying transpose on lists of dicts using zip() that switches B and S,
+            # so permute from S,B => B,S
             z_q_ind = z_q_ind.permute(1, 0, 2, 3)
             z_q_flat = z_q_flat.permute(1, 0, 2, 3, 4)
 
@@ -561,14 +622,18 @@ class GPT(nn.Module):
             a_shifted = a_shifted.reshape(B * S, 1)
             ind = z_q_ind.reshape(B * S, H * W)
             ind = torch.cat((ind, a_shifted, ind_delim), -1)
-            ind = ind.reshape(B, -1)
-
-            # Create autoregression targets by shifting, we have an extra frame in case next patch is next frame,
-            #   but only need to predict one patch
-            gpt_ind_x = ind[:, :self.block_size]
-            gpt_ind_y = ind[:, 1:1+self.block_size]
-
-            return gpt_ind_x, gpt_ind_y
+            ind = ind.reshape(B, S, self.tokens_in_frame)
+            return ind
+            # frame_len = ind.shape[-1]
+            # ind = ind.reshape(B, -1)
+            #
+            #
+            # # Create autoregression targets by shifting, we have an extra frame in case next patch is next frame,
+            # #   but only need to predict one patch
+            # gpt_ind_x = ind[:, :self.block_size]
+            # gpt_ind_y = ind[:, 1:1+self.block_size]
+            #
+            # return gpt_ind_x, gpt_ind_y
 
 
 
