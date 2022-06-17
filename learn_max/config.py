@@ -99,7 +99,7 @@ def add_model_specific_args(arg_parser: argparse.ArgumentParser, ) -> argparse.A
     arg_parser.add_argument('--should_train_gpt', action='store_true', help="Whether to train GPT", default=False)
     arg_parser.add_argument('--gpt_learning_rate', type=float, help="GPT batch size", default=6e-4)
     arg_parser.add_argument('--gpt_batch_size', type=int, help="GPT batch size", default=8)
-    arg_parser.add_argument('--gpt_block_size', type=int, help="block size for the model (length of window of context)", default=40)
+    arg_parser.add_argument('--gpt_seq_len', type=int, help="sequence length for the model (length of temporal window)", default=40)
     arg_parser.add_argument('--actions_per_batch', type=int, help="avoids overfitting with more data generated between updates", default=1)
     return arg_parser
 

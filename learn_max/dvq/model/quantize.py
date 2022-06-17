@@ -133,6 +133,7 @@ class VQVAEQuantize(nn.Module):
         # this is the distance that's learned by the embedding table between each input token and each centroid
         # so (flatten - embed.weight)^2 = flatten^2 - 2 * flatten @ embed.weight + embed.weight^2
         # embed.weight shape is (num_embeddings, embedding_dim)
+        # Below is same as torch.cdist(flatten, self.embed.weight)**2
         dist = (
             flatten.pow(2).sum(1, keepdim=True)
             - 2 * flatten @ self.embed.weight.t()

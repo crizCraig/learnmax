@@ -9,7 +9,7 @@ train_to_test_collection_ratio = 10
 def get_model_args():
     args = get_blank_model_args()
     args.gpt_batch_size = 16
-    args.gpt_block_size = 40
+    args.gpt_seq_len = 40
     args.viz_predict_trajectory = True
     args.should_train_gpt = True
     args.dvq_checkpoint = '/home/a/src/learnmax/epoch=3-step=30999.ckpt'

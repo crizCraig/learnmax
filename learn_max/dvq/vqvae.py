@@ -10,8 +10,7 @@ from argparse import ArgumentParser
 from loguru import logger as log
 import numpy as np
 import torch
-import wandb
-from torch import nn, einsum
+from torch import nn
 import torch.nn.functional as F
 
 import pytorch_lightning as pl
@@ -19,12 +18,10 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 
 from learn_max.data.cifar10 import CIFAR10Data
 from learn_max.dvq.model.deepmind_enc_dec import DeepMindEncoder, DeepMindDecoder
-from learn_max.dvq.model.openai_enc_dec import OpenAIEncoder, OpenAIDecoder
 from learn_max.dvq.model.openai_enc_dec import Conv2d as PatchedConv2d
 from learn_max.dvq.model.quantize import VQVAEQuantize, GumbelQuantize
 from learn_max.dvq.model.loss import Normal, LogitLaplace
-from learn_max import dvq
-from learn_max.utils import get_batch_vars, wandb_log
+from learn_max.utils import wandb_log
 
 if 'TRAIN_DVQ_ONLY' in os.environ:
     dvq_module = pl.LightningModule
@@ -150,14 +147,20 @@ class VQVAE(dvq_module):
         self.enable_kmeans = value
         self.quantizer.enable_kmeans = value
 
+    def get_batch_vars(self, batch):
+        # TODO: Just put everything in agent_state, next_agent_state dicts
+        assert len(batch) == 7
+        s, a, r, d, s_next, agent_state, indices = batch
+        return s, agent_state
+
     def training_step(self, batch, batch_idx):
-        x = get_batch_vars(batch, use_next=True)
+        x, _ = self.get_batch_vars(batch)
         x, x_hat, z_q_emb, z_q_flat, latent_loss, recon_loss, dvq_loss, z_q_ind = self.forward(x)
         loss = dvq_loss  # weird lightning need to call this "loss"?
         return loss, recon_loss, latent_loss, x_hat
 
     def validation_step(self, batch, batch_idx):
-        x = get_batch_vars(batch)
+        x, _ = self.get_batch_vars(batch)
         if len(x.shape) == 5:  # B, block_size, C, H, W
             # Includes gpt block size in shape, flatten first two dimensions
             x = x.view(x.shape[0] * x.shape[1], x.shape[2], x.shape[3], x.shape[4])

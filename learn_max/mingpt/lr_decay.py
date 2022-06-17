@@ -3,10 +3,6 @@ import os
 
 import pytorch_lightning as pl
 
-from learn_max import dvq
-from learn_max.utils import get_batch_vars
-
-
 class GptWarmupCosineLearningRateDecay(pl.Callback):
     """
     based on the number of tokens seen during training will adjust the learning rate:
@@ -23,10 +19,13 @@ class GptWarmupCosineLearningRateDecay(pl.Callback):
         self.tokens = 0
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx=None):
-        gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y, s = get_batch_vars(batch, return_agent_state=False, populate_gpt=True,
-                                                                  single_token2=pl_module.is_single_token2)
-        # _, y = batch
-        self.tokens += (z_q_ind_y >= 0).sum()  # y == -100 is "ignore", so don't count these
+        if pl_module.is_single_token2:
+            a_x, a_y, gpt_x, z_q_ind_x, z_q_ind_y = pl_module.gpt.get_batch_vars(batch)
+            ind = z_q_ind_y
+        else:
+            z_q_ind, indices = pl_module.gpt.get_batch_vars(batch)
+            ind = z_q_ind
+        self.tokens += (ind >= 0).sum()  # y == -100 is "ignore", so don't count these (-100 is Karpathy artifact, no longer needed really. always is ind.numel())
         if self.tokens < self.warmup_tokens:
             # linear warmup
             lr_mult = float(self.tokens) / float(max(1, self.warmup_tokens))

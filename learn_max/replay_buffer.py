@@ -252,7 +252,7 @@ def test_replay_buffers_sanity():
     replay_buffers = ReplayBuffers(env_id='my_test_env', short_term_mem_length=5, frames_per_file=3,
                                    train_to_test_collection_ratio=2,
                                    max_lru_size=2, verbose=False)
-
+    # Flush one file to both train and test buffers
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     for i in range(replay_buffers.frames_per_file * replay_buffers.train_to_test_collection_ratio):
         replay_buffers.append(Experience(
@@ -262,18 +262,24 @@ def test_replay_buffers_sanity():
             done=False,
             new_state=AgentState()))
 
+    assert replay_buffers.total_length == replay_buffers.frames_per_file * replay_buffers.train_to_test_collection_ratio
     assert replay_buffers.curr_buf.is_test()
     assert replay_buffers.train_buf.length == 3
     assert replay_buffers.test_buf.length == 3
     assert replay_buffers.flush_i == 2
     assert len(replay_buffers.train_buf.files) == 1
 
+    # Add one new in-memory (i.e. not flushed) experience to test
     replay_buffers.append(Experience(
         state=AgentState(state=torch.tensor(0).to(device)),
         action=replay_buffers.total_length,
         reward=1,
         done=True,
         new_state=AgentState()))
+
+    # Ensure index overflows into in-memory buffer correctly
+    assert replay_buffers.test_buf.get(3)[0].action == replay_buffers.total_length - 1 == 6
+    assert replay_buffers.test_buf.get(4) == []
 
     assert replay_buffers.episode_i == 1
     assert replay_buffers.curr_buf.is_test()
@@ -293,6 +299,9 @@ def test_replay_buffers_sanity():
             reward=i,
             done=False,
             new_state=AgentState()))
+
+    # Ensure that previously in-memory exp was flushed and has a stable index
+    assert replay_buffers.test_buf.get(3)[0].action == 6
 
     lru_keys = list(replay_buffers.train_buf.lru.mp.keys())
     assert len(lru_keys) != replay_buffers.train_buf.files

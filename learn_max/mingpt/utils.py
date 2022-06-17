@@ -40,7 +40,7 @@ def sample(model, x, steps, temperature=1.0, sample=False, top_k=None):
         probs = F.softmax(logits, dim=-1)
         # sample from the distribution or take the most likely
         if sample:
-            ix = torch.multinomial(probs, num_samples=1)
+            ix = torch.multinomial(probs, num_samples=1)  # This is slow use random indexes instead  https://discuss.pytorch.org/t/torch-equivalent-of-numpy-random-choice/16146
         else:
             _, ix = torch.topk(probs, k=1, dim=-1)
         # append to the sequence and continue

@@ -13,13 +13,11 @@ from typing import Dict, Tuple
 
 import torch
 import torch.nn as nn
-import wandb
-from einops import rearrange
 from loguru import logger as log
 from torch.nn import functional as F
 
 from learn_max.constants import ACC_LOG_PERIOD
-from learn_max.utils import accuracy, wandb_log, get_batch_vars, sa2as
+from learn_max.utils import accuracy, wandb_log, sa2as, torch_random_choice
 
 
 class CausalSelfAttention(nn.Module):
@@ -147,26 +145,26 @@ class GPT(nn.Module):
 
         # block_size is the length of the model's context window in time
         if is_single_token2:
-            block_size = frames_in_sequence_window
+            seq_len = frames_in_sequence_window
         else:
-            block_size = frames_in_sequence_window * tokens_in_frame
+            seq_len = tokens_in_frame * frames_in_sequence_window
             # Queue to store history of combined recent states for determining salience
-            self.possibility_q = deque(maxlen=block_size)
-        self.pos_emb = nn.Parameter(torch.zeros(1, block_size, embedding_dim))
-        self.patch_emb = nn.Parameter(torch.zeros(1, tokens_in_frame, embedding_dim))
-        self.frame_emb = nn.Parameter(torch.zeros(1, frames_in_sequence_window, tokens_in_frame, embedding_dim))
+            self.possibility_q = deque(maxlen=seq_len)
+        self.pos_emb = nn.Parameter(torch.zeros(1, seq_len, embedding_dim))
+        self.patch_pos_emb = nn.Parameter(torch.zeros(1, tokens_in_frame, embedding_dim))
+        self.frame_pos_emb = nn.Parameter(torch.zeros(1, frames_in_sequence_window, tokens_in_frame, embedding_dim))
 
         self.act_emb = nn.Embedding(num_actions, input_embedding_dim)
         # self.delim_emb = nn.Embedding(1, embedding_dim)
 
         self.drop = nn.Dropout(embd_pdrop)
         # deep transformer: just a sequence of transformer blocks
-        self.blocks, _, out_dims = self.init_blocks(attn_pdrop, block_size, embedding_dim, n_head, n_layer, resid_pdrop)
+        self.blocks, _, out_dims = self.init_blocks(attn_pdrop, seq_len, embedding_dim, n_head, n_layer, resid_pdrop)
         out_embedding_dim = out_dims[-1]
 
         # decoder: at the end one more layernorm and decode the answers
         self.ln_f = nn.LayerNorm(out_embedding_dim)
-        self.logit_p_head = nn.Linear(out_embedding_dim, output_size, bias=False) # no need for extra bias due to one in ln_f
+        self.logit_p_head = nn.Linear(out_embedding_dim, output_size, bias=False)  # no need for extra bias due to one in ln_f
 
         # TODO: Remove or change to deviation over longer timescale - we want to know how the entropy of the
         #   probs changes over time so that, in the case of an aleotoric process like a slot machine, we see that
@@ -176,7 +174,7 @@ class GPT(nn.Module):
 
         self.target_idx = torch.arange(output_size)
 
-        self.block_size = block_size
+        self.seq_len = seq_len
         self.apply(self._init_weights)
 
         self.iter = 0
@@ -190,8 +188,8 @@ class GPT(nn.Module):
         self.num_state_embeddings = num_state_embeddings
 
         self.global_step = 0
+        self.salience_reservoir = deque(maxlen=10_000)
         self.salience_reservoir_n = 0
-        self.salience_reservoir_k = 10_000
 
         log.info("number of parameters: %e" % sum(p.numel() for p in self.parameters()))
 
@@ -224,7 +222,7 @@ class GPT(nn.Module):
         return embedding_dim
 
     def get_block_size(self):
-        return self.block_size
+        return self.seq_len
 
     def _init_weights(self, module):
         """
@@ -269,8 +267,8 @@ class GPT(nn.Module):
 
         # special case the position embedding parameters in the root GPT module as not decayed
         no_decay.add('pos_emb')
-        no_decay.add('patch_emb')
-        no_decay.add('frame_emb')
+        no_decay.add('patch_pos_emb')
+        no_decay.add('frame_pos_emb')
 
         # validate that we considered every parameter
         param_dict = {pn: p for pn, p in self.named_parameters()}
@@ -303,24 +301,23 @@ class GPT(nn.Module):
 
     def forward(self, *args):
         if self.is_single_token2:
-            embed, idx, actions = args
-            return self.single_token_forward(actions, embed, idx)
+            embed, z_q_ind, actions = args
+            return self.single_token_forward(actions, embed, z_q_ind)
         else:
-            idx = args[0]
-
-            # TODO: We should split the index and target here so that we can add the patch and frame embeddings first
-            #   as well as optionally look at frame-based salience
-
-            B, SF, FP = idx.size()
-            assert SF * FP <= self.block_size, "Cannot forward, model block size is exhausted."
-            # forward the GPT model
-            token_embed = self.tok_emb(idx)  # each input token index maps to a (learnable) vector
+            z_q_ind, replay_ind = args
+            B, FiS, TiF = z_q_ind.size()  # batch, frames in sequence, tokens in frame
+            assert TiF * FiS <= self.seq_len, "Cannot forward, model sequence length is exhausted."
+            token_embed = self.tok_emb(z_q_ind)  # each input token index maps to a (learnable) vector
+            assert FiS <= self.frames_in_sequence_window
+            assert TiF <= self.tokens_in_frame
 
             # map frame and patch positions to a learnable vector
-            frame_embed = self.frame_emb[:, :SF, :]  # support partial sequences
-            patch_embed = self.patch_emb[:, :FP, :]  # support partial frames
+            frame_pos_embed = self.frame_pos_emb[:, :FiS]  # support partial sequences
+            patch_pos_embed = self.patch_pos_emb[:, :TiF]  # support partial frames
 
-            x = self.drop(token_embed + frame_embed + patch_embed)
+            x = token_embed + frame_pos_embed + patch_pos_embed  # broadcast sum embeddings
+            x = x.reshape(B, self.seq_len, self.embedding_dim)
+            x = self.drop(x)
             x = self.blocks(x)
             x = self.ln_f(x)
             logits = self.logit_p_head(x)
@@ -331,51 +328,135 @@ class GPT(nn.Module):
             # Sum and normalize the tokens over sequence, i.e.
             #  emb_d * (num_state_positions (121) + 1 (action) + 1 (delim))
             #  in the window as the possibilities' regression target.
-            #
+
             # TODO: We need a buffer of previous possibilities
             #  of length block_size to detect saliency and a possibilities uncertainty target trained
             #  with possibilities loss to know how sure we are about saliency.
 
-            possibilities = logits.sum(axis=-1)
+            possibilities = self.detect_salience(B, logits, replay_ind)
 
-            # don't want to use this as it's relative to current batch
-            # salience = ((salience - salience.min()) / max(1e-12, salience.max() - salience.min()))  # normalize 0=>1
+            return possibilities, logits, expected_deviation
 
-            # This is a little better but still relative to min sum in batch
-            # torch.log(logits.sum(axis=-1) - logits.sum(axis=-1).min() + 1e-12).min()
+    def detect_salience(self, B, logits, replay_ind):
+        # Representation hierarchy is batch, sequences, frames, patches, logits
+        # Sum the whole sequence of logits in order to get a description of what happened in the sequence
+        # salience = ((salience - salience.min()) / max(1e-12, salience.max() - salience.min()))  # normalize 0=>1
+        # This is a little better but still relative to min sum in batch
+        # torch.log(logits.sum(axis=-1) - logits.sum(axis=-1).min() + 1e-12).min()
+        S = self.seq_len
+        FiS = self.frames_in_sequence_window
+        TiF = self.tokens_in_frame
+        L = logits.shape[-1]  # logit size
+        # Deterministically squash saliency, i.e. not relative to current batch
+        logits /= (S * L / 50)
+        # TODO: As higher levels of abstraction are created, squash sums by dividing by some small epsilon plus
+        #   the block size, i.e. salience = salience / (salience_lvl * block_size * epsilon)
+        #   epsilon should be sized such that the max level of abstraction leads to numbers amenable to
+        #   the optimizer. Should be easy to write some basic tests for this. This as the salience will be used
+        #   as the embedding for the higher level. We could cluster the embedding and assign it an int
+        #   value and remap it to a learned embedding to alleviate this. Then we just need to stay inside non-NaN
+        #   range. We'd want to ensure the clustering is stable as new clusters are added, i.e. cluster 0 continues
+        #   to represent the same types of things when adding new clusters.
+        if logits.abs().max() > 5 or logits.abs().median() < 1e-5:
+            log.warning(f'salience levels getting hard to optimize as embeddings '
+                        f'max {logits.max()} '
+                        f'median {logits.median()} '
+                        f'mean {logits.mean()} '
+                        f'min {logits.min()} '
+                        )
+        if B == 1 and not self.training:
+            # Detect realtime salience with integration q
+            self.possibility_q.append(logits)  # About 4.4MB with B=1,S=1107 * 4 bytes per int32 = B * S^2 * 4B
+        elif self.training:
+            # TODO: Detect across batch
+            # Batch sequence needs to be sampled sequentially for this to work.
+            # TODO:
+            #   Slide the window across the batch and check for salience in train. Salience can pop up here
+            #   when it didn't in realtime due to changing weights/logits
 
-            # Deterministically squash saliency, i.e. not relative to current batch
-            possibilities /= (self.block_size / 100)
+            assert S == logits.shape[-2], 'Could be partial window, but otherwise should ' \
+                                                            'be true and windowing will be hard'
+            # Sliding window across batch
 
-            # TODO: As higher levels of abstraction are created, squash sums by dividing by some small epsilon plus
-            #   the block size, i.e. salience = salience / (salience_lvl * block_size * epsilon)
-            #   epsilon should be sized such that the max level of abstraction leads to numbers amenable to
-            #   the optimizer. Should be easy to write some basic tests for this. This as the salience will be used
-            #   as the embedding for the higher level. We could cluster the embedding and assign it an int
-            #   value and remap it to a learned embedding to alleviate this. Then we just need to stay inside non-NaN
-            #   range. We'd want to ensure the clustering is stable as new clusters are added, i.e. cluster 0 continues
-            #   to represent the same types of things when adding new clusters.
+            # key frames separated by sequence length to avoid overlap as nth frame logits
+            # describe frame n-seq_len => n
+            # windows = logits.flatten().unfold(dimension=0, size=self.tokens_in_frame, step=self.seq_len)
+            windows = logits.flatten().unfold(dimension=0, size=S * L, step=TiF * L)
+            assert (B-1) * S * L / (TiF * L) + 1 == windows.shape[0]  # sliding window check
+            # Note we don't want to normalize this distance to the current batch as we want them to be comparable
+            # across batches
 
-            assert possibilities.max() < 5, 'salience levels getting hard to optimize as embeddings '
-            if B == 1 and not self.training:
-                # Detect realtime salience with integration q
-                self.possibility_q.append(possibilities)  # About 4.4MB with B=1,S=1107 * 4 bytes per int32 = B * S^2 * 4B
+            # manhattan distance between sequences shifted one sequence length apart
+            salience = abs(windows[FiS:, :] - windows[:-FiS, :])
+
+            # Sum salience across sequence
+            salience = salience.sum(axis=1)
+
+            assert int(replay_ind[1] - replay_ind[0]) == FiS
+            # Interpolate replay indexes as we only have frame key indexes
+            replay_ind = torch.arange(start=replay_ind[0], end=replay_ind[-1])
+            replay_ind += self.frames_in_sequence_window - 1
+            assert len(replay_ind) == len(salience) + FiS - 1, 'Last two sequences are used for last salience so we ' \
+                                                              'have one fewer salient sequence than sequences in batch'
+            # TODO: Look at top x% (abs?) and compare. We should look at the top 1% across more than just the batch.
+            #   Ideally this is all time. So maybe reservoir sampling or just keep max N with some expiration.
+
+            # Make sure reservoir is full
+            if self.salience_reservoir.maxlen > len(self.salience_reservoir):
+                num_to_insert = min(self.salience_reservoir.maxlen - len(self.salience_reservoir), len(salience))
+                for i in range(num_to_insert):
+                    self.salience_reservoir.append((replay_ind[i], salience[i]))
+                    self.salience_reservoir_n += 1
+
             else:
-                # TODO: Detect across batch
-                # Batch sequence needs to be sampled sequentially for this to work.
-                # TODO:
-                #   Slide the window across the batch and check for salience in train. Salience can pop up here
-                #   when it didn't in realtime due to changing weights/logits
-                windows = possibilities.flatten().unfold(dimension=0, size=possibilities.shape[-1], step=1)
+                # Approx reservoir sampling probability for set with mean (believe this yields a recency bias)
+                #   - prob of sampling one value from reservoir is k / n (see standard reservoir sampling)
+                #   - the mean prob for set of samples with size m would then be:
+                #     k * (1/n + 1/(n+1)... + 1/(n+m)) / m
+                n = self.salience_reservoir_n
+                m = salience.numel()
+                k = int(0.1 * n)
+                mean_prob = k * torch.sum(1 / torch.arange(n, n + m + 1)) / m
+                salient_k = int(mean_prob * m)
 
-                # TODO: Should we do a euclidean or other distance?
-                salience = abs(windows[1:,:] - windows[:-1,:])
-                salience = salience.sum(axis=1)
-                # TODO: Look at top x% (abs?) and compare. We should look at the top 1% across more than just the batch.
-                #   Ideally this is all time. So maybe reservoir sampling or just keep max N with some expiration.
-                self.salience_reservoir_n += salience.numel()
+                # We diverge from reservoir sampling here as we actually want the highest salience
+                # experiences across a large number of batches. There will also be some duplicate
+                # salient events detected which the distribution across batches helps a bit with
+                # as we always sample some percentage of each batch. This as opposed to taking the most salient
+                # across all batches which could result in many duplicates for the most salient events.
+                samples, idx = torch.topk(salience, salient_k)
+                for i, sample in enumerate(samples):
+                    self.salience_reservoir.append((replay_ind[idx[i]], sample))
 
-            return possibilities, logits
+                self.salience_reservoir_n += m
+
+                if n > 10 * self.salience_reservoir.maxlen:
+                    # TOOD: Look at the most salient events
+                    pass
+            # The salience window index needs to be mapped back to a logits
+            # batch/exp index with arg max that can be
+            # visualized and eventually recognized as a recurring salient event
+
+            # TODO: Try max cosine distance from (8) https://arxiv.org/pdf/2206.04114.pdf for detecting salient
+            #   events
+
+            # TODO: Randonmly sample mean_prob * batch length items from batch
+            # TODO: High level context will be salient embeddings (these can be new clusters added to the
+            #   existing trasformer softmax, a new transformer, or reused low level embeddings.
+            #   These context tokens will have their own high level context slot (specifying the goal) for the
+            #   low level. We may also have a prev context slot and num steps.
+            #   Then for low level context, we detect when ANY salient event is encountered and update the input
+            #   in the top level transformer when it is. This allows variable numbers of low level states to happen
+            #   before a given salient (i.e. jumping up and down or taking a shorter or
+            #   longer / circuitous route to a goal)
+            #   For adding outputs to softmax, we can do net surgery or more simply have inactive outputs
+            #   with logits forced to zero so no gradient flows until we allocate that output to something
+            #   and stop zeroing its input logit.
+
+            # TODO: Add salient events to replay buffers so that
+            #  we can train with appropriate high level and low level context tokens. First
+            #  let's just confirm we can detect salient events.
+        return logits
 
     def single_token_forward(self, actions, embed, idx):
         # if self.should_input_embed:
@@ -384,7 +465,7 @@ class GPT(nn.Module):
         #     b, t = idx_or_embed.size()
         #     embed = None
         b, t, e = embed.size()
-        assert t <= self.block_size, "Cannot forward, model block size is exhausted."
+        assert t <= self.seq_len, "Cannot forward, model block size is exhausted."
         # forward the GPT model
         token_embed = self.tok_emb(idx)  # each input token index maps to a (learnable) vector
         position_embed = self.pos_emb[:, :t, :]  # each position maps to a (learnable) vector
@@ -395,7 +476,7 @@ class GPT(nn.Module):
         # embed = self.dvq_proj(embed)  # this projection kills performance for some reason
         # x = self.drop(token_embed + position_embeddings + action_embeddings + dvq_proj)
         x = self.drop(token_embed + position_embed + action_embed)  # + embed)
-        x = self.blocks(x)
+        x = self.blocks(x)   # 1, 40, 4410 = B, S, H*W*dvq_proj
         x = self.ln_f(x)
         logits = self.logit_p_head(x)
         expected_deviation = self.deviation_head(
@@ -412,28 +493,31 @@ class GPT(nn.Module):
 
     def step_(self, split, batch, batch_idx=None):
         if self.is_single_token2:
-            embed, idx, next_idx, a, a_next = batch  # gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y
+            embed, z_q_ind, next_idx, a, a_next = batch  # gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y
             if split == 'train':
-                assert embed.size()[1] == self.block_size, \
+                assert embed.size()[1] == self.seq_len, \
                     'Not filling block size in train will result in untrained latter positions.'
 
             target_idx = self.s_i_to_as_i(next_idx, a_next)
-            logits, expected_deviation = self.forward(embed, idx, a)
+            logits, expected_deviation = self.forward(embed, z_q_ind, a)  # B, S
         else:
-            idx = batch[0]
+            z_q_ind, exp_ind = batch[0]
+            B, FiS, TiF = z_q_ind.size()  # batch, frames in sequence, tokens in frame
             if split == 'train':
-                B, SF, FP = idx.size()  # batch, sequence frames, frame patches
-                assert SF * FP == self.block_size, \
+                assert FiS * TiF >= self.seq_len, \
                     'Not filling block size in train will result in untrained latter positions.'
-            # TODO: Do forward that respects position of action and delim
-            salience, logits = self.forward(idx)
+            # Shift targets by one patch
+            target_idx = z_q_ind.reshape(B, -1)[:, 1:-(z_q_ind.shape[-1]-1)]
 
-
+            z_q_ind = z_q_ind[:,:-1,:]  # Remove extra frame we included for targets
+            salience, logits, expected_deviation = self.forward(z_q_ind, exp_ind)
 
 
         # Calculate mean deviation loss for uncertainty ----------------------
         # Turn targets into one hot B x block_size x vocab_size with 1 in vocab
+
         one_hot = F.one_hot(target_idx, num_classes=self.output_size).squeeze()
+
         probs = F.softmax(logits, dim=-1)
 
         entropy = -torch.sum(probs * torch.log(probs), dim=-1)  # Entropy across action-states
@@ -518,40 +602,53 @@ class GPT(nn.Module):
     def accuracy(self, logits, target_idx, split):
         """logits (Batch, sequence Window, Action-State) """
         # TODO: State based accuracy (currently action-state)
+
         if not self.is_single_token2:
-            raise NotImplementedError('Implement patch accuracy')
-        # Batch, State, Action dims
-        B, S, A = logits.shape[0], logits.shape[1]//self.num_actions, self.num_actions
-        assert self.output_size == A * S
-        top_acc_lvls_as = {
-            '1': 1,
-            '3': 3,
-            'a': A,
-            '1pct': self.output_size // 100,
-            '10pct': self.output_size // 10,
-        }
-        acc_as = self._get_acc(logits, split, target_idx, top_acc_lvls_as, 'acc_as')
+            top_acc_lvls = {
+                '1': 1,
+                '3': 3,
+                'a': self.num_actions,
+                '1pct': self.output_size // 100,
+                '10pct': self.output_size // 10,
+            }
+            acc = self._get_acc(logits, split, target_idx, top_acc_lvls, 'acc')
+            return sorted(list(zip(top_acc_lvls.values(), (float(x) for x in acc))))
 
-        # Get state based accuracy, i.e. how accurate are we in predicting the state
-        # that resulted from the chosen action
-        action_taken = self.as_i_to_a_i(target_idx)
-        target_states = self.as_i_to_s_i(target_idx)
-        broadcast_target = torch.ones((B, S))
-        target_actions = (broadcast_target.cuda() * action_taken.reshape(B, 1)).long()
+        if self.is_single_token2:
+            # Batch, State, Action dims
+            B, S, A = logits.shape[0], logits.shape[1]//self.num_actions, self.num_actions
+            assert self.output_size == A * S
 
-        # Get logits of states for taken actions
-        logits = logits.reshape(B, S, A)
-        logits_states = logits.take_along_dim(target_actions.reshape(B, S, 1), dim=2).squeeze(-1)
-        assert bool(logits[0][0][action_taken[0]] == logits_states[0][0]), 'Action selected for each batch'
-        top_acc_lvls_s = {
-            '1': 1,
-            '3': 3,
-            'a': A,  # Should be irrelevant as actions are factored out, but want to compare with action-state acc
-            '1pct': S // 100,
-            '10pct': S // 10,
-        }
-        acc_s = self._get_acc(logits_states, split, target_states, top_acc_lvls_s, 'acc_s')
-        return sorted(list(zip(top_acc_lvls_s.values(), (float(x) for x in acc_s))))
+            top_acc_lvls_as = {
+                '1': 1,
+                '3': 3,
+                'a': A,
+                '1pct': self.output_size // 100,
+                '10pct': self.output_size // 10,
+            }
+
+            acc_as = self._get_acc(logits, split, target_idx, top_acc_lvls_as, 'acc_as')
+
+            # Get state based accuracy, i.e. how accurate are we in predicting the state
+            # that resulted from the chosen action
+            action_taken = self.as_i_to_a_i(target_idx)
+            target_states = self.as_i_to_s_i(target_idx)
+            broadcast_target = torch.ones((B, S))
+            target_actions = (broadcast_target.cuda() * action_taken.reshape(B, 1)).long()
+
+            # Get logits of states for taken actions
+            logits = logits.reshape(B, S, A)
+            logits_states = logits.take_along_dim(target_actions.reshape(B, S, 1), dim=2).squeeze(-1)
+            assert bool(logits[0][0][action_taken[0]] == logits_states[0][0]), 'Action selected for each batch'
+            top_acc_lvls_s = {
+                '1': 1,
+                '3': 3,
+                'a': A,  # Should be irrelevant as actions are factored out, but want to compare with action-state acc
+                '1pct': S // 100,
+                '10pct': S // 10,
+            }
+            acc_s = self._get_acc(logits_states, split, target_states, top_acc_lvls_s, 'acc_s')
+            return sorted(list(zip(top_acc_lvls_s.values(), (float(x) for x in acc_s))))
 
     def _get_acc(self, logits, split, target_idx, top_acc_lvls, name):
         acc = accuracy(
@@ -575,12 +672,17 @@ class GPT(nn.Module):
         return self.step_('test', *args, **kwargs)
 
     def get_batch_vars(self, batch):
-        s, a, r, d, s_next, agent_state = get_batch_vars(
-            batch,
-            return_agent_state=True,
-            populate_gpt=True,
-            single_token2=self.is_single_token2)
+        # TODO: Just put everything in agent_state, next_agent_state dicts
+        if len(batch) == 7:
+            # Has agent state and indices
+            s, a, r, d, s_next, agent_state, indices = batch
+        else:
+            raise NotImplementedError('Need to update this if we want to train on text again')
+            # Text (i.e. not atari)
+            a = None  # This is for text so no action TODO: remove
+            x, y = batch  # hate that i have to do this here in the model
 
+        # TODO: Delete below once testing dvq training again
         z_q_ind = torch.stack([a['dvq_z_q_ind'] for a in agent_state])
         z_q_flat = torch.stack([a['dvq_z_q_flat'] for a in agent_state])
 
@@ -620,10 +722,10 @@ class GPT(nn.Module):
             ind_delim = ind_delim.repeat(B * S, 1)
             a_shifted = a + self.num_state_embeddings
             a_shifted = a_shifted.reshape(B * S, 1)
-            ind = z_q_ind.reshape(B * S, H * W)
-            ind = torch.cat((ind, a_shifted, ind_delim), -1)
-            ind = ind.reshape(B, S, self.tokens_in_frame)
-            return ind
+            z_q_ind = z_q_ind.reshape(B * S, H * W)
+            z_q_ind = torch.cat((z_q_ind, a_shifted, ind_delim), -1)
+            z_q_ind = z_q_ind.reshape(B, S, self.tokens_in_frame)
+            return z_q_ind, indices
             # frame_len = ind.shape[-1]
             # ind = ind.reshape(B, -1)
             #

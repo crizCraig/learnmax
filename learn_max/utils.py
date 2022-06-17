@@ -246,35 +246,6 @@ def _wandb_log_closure():
 wandb_log, wandb_check_flush = _wandb_log_closure()
 
 
-def get_batch_vars(batch, use_next=False, return_agent_state=False, populate_gpt=False, use_compressed_clusters=False,
-                   single_token2=False):
-    # TODO: Just put everything in agent_state, next_agent_state dicts
-    agent_state = None
-    if len(batch) == 5:
-        # No agent state
-        s, a, r, d, s_next = batch
-        if use_next:
-            dvq_x = torch.cat((s, s_next))  # doubles batch size which we don't want with GPT as there's OOM
-        else:
-            dvq_x = s
-    elif len(batch) == 6:
-        # Has agent state
-        s, a, r, d, s_next, agent_state = batch
-        dvq_x = s
-    else:
-        raise NotImplementedError('Need to update this')
-        # Text (i.e. not atari)
-        a = None  # This is for text so no action TODO: remove
-        dvq_x, y = batch  # hate that i have to do this here in the model
-    if not populate_gpt:
-        dvq_batch = dvq_x
-        if return_agent_state:
-            dvq_batch = dvq_x, agent_state
-        return dvq_batch
-    else:
-        return s, a, r, d, s_next, agent_state
-
-
 def sa2as(z_q_flat, z_q_ind, a):
     """
     Reorder gpt inputs/targets as action-states, i.e. action that leads to state, whereas inputs are state-actions,
@@ -408,6 +379,27 @@ def best_effort(f):
         except:
             print(traceback.format_exc())
     return wrapper
+
+
+def dist(a, b):
+    """
+    Compute distance between all elements of a and b
+    (a-b)^2
+
+    a^2 - 2ab + b^2
+    """
+    return (
+        a.pow(2).sum(1, keepdim=True)
+        - 2 * a @ b.t()
+        + b.pow(2).sum(1, keepdim=True).t()
+    )
+
+
+def torch_random_choice(tensor, salient_k):
+    perm = torch.randperm(tensor.size(0))
+    idx = perm[:salient_k]
+    samples = tensor[idx]
+    return samples, idx
 
 
 if __name__ == '__main__':

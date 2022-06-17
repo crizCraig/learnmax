@@ -53,8 +53,8 @@ class LearnMaxAgent:
                  ):
         self.model = model
         self.num_actions = num_actions
-        # self.s_buff = deque(maxlen=model.gpt_block_size)  # History of states
-        # self.a_buff = deque(maxlen=model.gpt_block_size)  # History of actions
+        # self.s_buff = deque(maxlen=model.gpt_seq_len)  # History of states
+        # self.a_buff = deque(maxlen=model.gpt_seq_len)  # History of actions
         # Start with noop:
         #  https://github.com/mgbellemare/Arcade-Learning-Environment/blob/master/docs/manual/manual.pdf
         # self.a_buff.append([0] * num_environments)
@@ -109,7 +109,7 @@ class LearnMaxAgent:
         if (
             'RAND_ACTION' in os.environ or
             not self.model.should_train_gpt or
-            len(self.model.train_buf) < self.model.gpt_block_size
+            len(self.model.train_buf) < self.model.gpt_seq_len
         ):  # TODO: Use self.dvq_ready to do dvq training again
             ret = self.get_random_action(len(agent_state.state))
             if len(agent_state.state) != 1:
