@@ -149,7 +149,7 @@ class GPT(nn.Module):
         else:
             seq_len = tokens_in_frame * frames_in_sequence_window
             # Queue to store history of combined recent states for determining salience
-            self.possibility_q = deque(maxlen=seq_len)
+            self.saliency_q = deque(maxlen=seq_len)
         self.pos_emb = nn.Parameter(torch.zeros(1, seq_len, embedding_dim))
         self.patch_pos_emb = nn.Parameter(torch.zeros(1, tokens_in_frame, embedding_dim))
         self.frame_pos_emb = nn.Parameter(torch.zeros(1, frames_in_sequence_window, tokens_in_frame, embedding_dim))
@@ -325,19 +325,11 @@ class GPT(nn.Module):
                 x)  # Uses mean deviation instead of standard deviation https://stats.stackexchange.com/q/81986/18187
             wandb_log({'train/logits_std': logits.std()}, self.global_step)
 
-            # Sum and normalize the tokens over sequence, i.e.
-            #  emb_d * (num_state_positions (121) + 1 (action) + 1 (delim))
-            #  in the window as the possibilities' regression target.
+            saliencies = self.detect_salience(B, z_q_ind, replay_ind)
 
-            # TODO: We need a buffer of previous possibilities
-            #  of length block_size to detect saliency and a possibilities uncertainty target trained
-            #  with possibilities loss to know how sure we are about saliency.
+            return saliencies, logits, expected_deviation
 
-            possibilities = self.detect_salience(B, logits, replay_ind)
-
-            return possibilities, logits, expected_deviation
-
-    def detect_salience(self, B, logits, replay_ind):
+    def detect_salience(self, B, z_q_ind, replay_ind):
         # Representation hierarchy is batch, sequences, frames, patches, logits
         # Sum the whole sequence of logits in order to get a description of what happened in the sequence
         # salience = ((salience - salience.min()) / max(1e-12, salience.max() - salience.min()))  # normalize 0=>1
@@ -346,9 +338,8 @@ class GPT(nn.Module):
         S = self.seq_len
         FiS = self.frames_in_sequence_window
         TiF = self.tokens_in_frame
-        L = logits.shape[-1]  # logit size
         # Deterministically squash saliency, i.e. not relative to current batch
-        logits /= (S * L / 50)
+        # z_q_ind /= (S * Z / 50)
         # TODO: As higher levels of abstraction are created, squash sums by dividing by some small epsilon plus
         #   the block size, i.e. salience = salience / (salience_lvl * block_size * epsilon)
         #   epsilon should be sized such that the max level of abstraction leads to numbers amenable to
@@ -357,16 +348,16 @@ class GPT(nn.Module):
         #   value and remap it to a learned embedding to alleviate this. Then we just need to stay inside non-NaN
         #   range. We'd want to ensure the clustering is stable as new clusters are added, i.e. cluster 0 continues
         #   to represent the same types of things when adding new clusters.
-        if logits.abs().max() > 5 or logits.abs().median() < 1e-5:
-            log.warning(f'salience levels getting hard to optimize as embeddings '
-                        f'max {logits.max()} '
-                        f'median {logits.median()} '
-                        f'mean {logits.mean()} '
-                        f'min {logits.min()} '
-                        )
+        # if z_q_ind.abs().max() > 5 or z_q_ind.abs().median() < 1e-5:
+        #     log.warning(f'salience levels getting hard to optimize as embeddings '
+        #                 f'max {z_q_ind.max()} '
+        #                 f'median {z_q_ind.median()} '
+        #                 f'mean {z_q_ind.mean()} '
+        #                 f'min {z_q_ind.min()} '
+        #                 )
         if B == 1 and not self.training:
             # Detect realtime salience with integration q
-            self.possibility_q.append(logits)  # About 4.4MB with B=1,S=1107 * 4 bytes per int32 = B * S^2 * 4B
+            self.saliency_q.append(z_q_ind)  # About 4.4MB with B=1,S=1107 * 4 bytes per int32 = B * S^2 * 4B
         elif self.training:
             # TODO: Detect across batch
             # Batch sequence needs to be sampled sequentially for this to work.
@@ -374,30 +365,38 @@ class GPT(nn.Module):
             #   Slide the window across the batch and check for salience in train. Salience can pop up here
             #   when it didn't in realtime due to changing weights/logits
 
-            assert S == logits.shape[-2], 'Could be partial window, but otherwise should ' \
-                                                            'be true and windowing will be hard'
+            assert (B, FiS, TiF) == z_q_ind.shape, 'No support for partial windows in salience detection'
             # Sliding window across batch
-
             # key frames separated by sequence length to avoid overlap as nth frame logits
-            # describe frame n-seq_len => n
+            # use frames n-seq_len => n to output frame n+1
             # windows = logits.flatten().unfold(dimension=0, size=self.tokens_in_frame, step=self.seq_len)
-            windows = logits.flatten().unfold(dimension=0, size=S * L, step=TiF * L)
-            assert (B-1) * S * L / (TiF * L) + 1 == windows.shape[0]  # sliding window check
+            windows = z_q_ind.flatten().unfold(dimension=0, size=S, step=TiF)
+            assert (B-1) * S / TiF + 1 == windows.shape[0]  # sliding window check
+
+            # Sum across sequence token-wise to see saliencies across the whole sequence.
+            # This is basically saying that the spatial ordering of tokens is important for determining if we're
+            # in a new situation. However, if the same things happen, but just in a different
+            # temporal order, then the agent could just be walking around the same place in a different way.
+            # So I don't want to count that. However, if the agent has moved some item, like a door or grabbed a key,
+            # then new things have happened, and we DO want to count that.
+            windows = windows.reshape(-1, FiS, TiF).transpose(2, 1)
+            windows = windows.sum(dim=-1)
+
             # Note we don't want to normalize this distance to the current batch as we want them to be comparable
             # across batches
 
             # manhattan distance between sequences shifted one sequence length apart
             salience = abs(windows[FiS:, :] - windows[:-FiS, :])
 
-            # Sum salience across sequence
-            salience = salience.sum(axis=1)
+            # Sum diff across patches to get total diff for entire window
+            salience = salience.sum(axis=-1)
 
             assert int(replay_ind[1] - replay_ind[0]) == FiS
             # Interpolate replay indexes as we only have frame key indexes
             replay_ind = torch.arange(start=replay_ind[0], end=replay_ind[-1])
             replay_ind += self.frames_in_sequence_window - 1
             assert len(replay_ind) == len(salience) + FiS - 1, 'Last two sequences are used for last salience so we ' \
-                                                              'have one fewer salient sequence than sequences in batch'
+                                                               'have one fewer salient sequence than sequences in batch'
             # TODO: Look at top x% (abs?) and compare. We should look at the top 1% across more than just the batch.
             #   Ideally this is all time. So maybe reservoir sampling or just keep max N with some expiration.
 
@@ -456,7 +455,7 @@ class GPT(nn.Module):
             # TODO: Add salient events to replay buffers so that
             #  we can train with appropriate high level and low level context tokens. First
             #  let's just confirm we can detect salient events.
-        return logits
+        return z_q_ind
 
     def single_token_forward(self, actions, embed, idx):
         # if self.should_input_embed:
