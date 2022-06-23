@@ -359,10 +359,8 @@ class GPT(nn.Module):
             # Detect realtime salience with integration q
             self.saliency_q.append(z_q_ind)  # About 4.4MB with B=1,S=1107 * 4 bytes per int32 = B * S^2 * 4B
         elif self.training:
-            # TODO: Detect across batch
-            # Batch sequence needs to be sampled sequentially for this to work.
-            # TODO:
-            #   Slide the window across the batch and check for salience in train. Salience can pop up here
+            # Note: Batch sequence needs to be sampled sequentially for this to work.
+            # Slide the window across the batch and check for salience in train. Salience can pop up here
             #   when it didn't in realtime due to changing weights/logits
 
             assert (B, FiS, TiF) == z_q_ind.shape, 'No support for partial windows in salience detection'
@@ -373,32 +371,42 @@ class GPT(nn.Module):
             windows = z_q_ind.flatten().unfold(dimension=0, size=S, step=TiF)
             assert (B-1) * S / TiF + 1 == windows.shape[0]  # sliding window check
 
-            # Sum across sequence token-wise to see saliencies across the whole sequence.
+            # Combine across sequence token-wise to see saliencies across the whole sequence.
             # This is basically saying that the spatial ordering of tokens is important for determining if we're
             # in a new situation. However, if the same things happen, but just in a different
             # temporal order, then the agent could just be walking around the same place in a different way.
             # So I don't want to count that. However, if the agent has moved some item, like a door or grabbed a key,
             # then new things have happened, and we DO want to count that.
             windows = windows.reshape(-1, FiS, TiF).transpose(2, 1)
-            windows = windows.sum(dim=-1)
+            # We use geometric mean instead arithmetic mean to reduce state aliasing.
+            # We also add 5e3 to get larger products which have fewer factors vs summands.
+            # This helps reduce state aliasing.
+            # Finally, we take the root first to avoid NaNs from prod.
+            windows = ((windows + 5e3) ** (1/FiS)).prod(dim=-1)
 
             # Note we don't want to normalize this distance to the current batch as we want them to be comparable
             # across batches
 
-            # manhattan distance between sequences shifted one sequence length apart
+            # Manhattan distance between sequences shifted to be one sequence length apart
             salience = abs(windows[FiS:, :] - windows[:-FiS, :])
 
             # Sum diff across patches to get total diff for entire window
             salience = salience.sum(axis=-1)
 
             assert int(replay_ind[1] - replay_ind[0]) == FiS
-            # Interpolate replay indexes as we only have frame key indexes
+            # Interpolate replay indexes as we only have sequence start frame indexes
             replay_ind = torch.arange(start=replay_ind[0], end=replay_ind[-1])
             replay_ind += self.frames_in_sequence_window - 1
             assert len(replay_ind) == len(salience) + FiS - 1, 'Last two sequences are used for last salience so we ' \
                                                                'have one fewer salient sequence than sequences in batch'
             # TODO: Look at top x% (abs?) and compare. We should look at the top 1% across more than just the batch.
             #   Ideally this is all time. So maybe reservoir sampling or just keep max N with some expiration.
+
+            # TODO: Use set to make sure you don't add the same replay index twice
+
+            # TODO: We need to plan not just to get a large distance away from the centroid of previously encountered
+            #   events at the highest level of saliency, BUT to also explore and resolve the most uncertainty possible
+            #   at the highest level of saliency.
 
             # Make sure reservoir is full
             if self.salience_reservoir.maxlen > len(self.salience_reservoir):
@@ -432,9 +440,10 @@ class GPT(nn.Module):
                 if n > 10 * self.salience_reservoir.maxlen:
                     # TOOD: Look at the most salient events
                     pass
-            # The salience window index needs to be mapped back to a logits
-            # batch/exp index with arg max that can be
-            # visualized and eventually recognized as a recurring salient event
+            # TODO: Visualize salient events
+
+            # TODO: Maximize a total salient distance in the planning horizon to avoid loops
+            #  Uncertainty is better than total distance though, as it also allows back tracking.
 
             # TODO: Try max cosine distance from (8) https://arxiv.org/pdf/2206.04114.pdf for detecting salient
             #   events

@@ -344,12 +344,13 @@ class LearnMax(pl.LightningModule):
 
         # Replay buffers (test and train)
         short_term_mem_length = 1000 if self.should_overfit_gpt else self.gpt_seq_len * 2
+        frames_per_file = max(self.dvq_batch_size,
+                              self.gpt_seq_len * self.gpt_batch_size + self.get_num_extra_seq_samples())
         self.replay_buffers = ReplayBuffers(env_id=self.env_id, short_term_mem_length=short_term_mem_length,
                                             overfit_to_short_term=should_overfit_gpt,
                                             train_to_test_collection_ratio=train_to_test_collection_ratio,
                                             # Get a full val batch when training starts
-                                            frames_per_file=max(self.dvq_batch_size,
-                                                                self.gpt_seq_len * self.gpt_batch_size))
+                                            frames_per_file=frames_per_file)
         self.train_buf = self.replay_buffers.train_buf
         self.test_buf = self.replay_buffers.test_buf
         self.recent_experience = self.replay_buffers.short_term_mem
@@ -517,16 +518,18 @@ class LearnMax(pl.LightningModule):
                 break
 
     def validation_batch_gen(self, ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if not self.should_train_gpt:
+            log.warning('Validation not implemented for dvq')
+            return
         if len(self.replay_buffers.test_buf) == 0:
             yield from self._yield_empty_validation_batch()
         else:
-
-            start_indices = np.arange(start=0,
-                                      stop=len(self.test_buf) - self.gpt_seq_len,
-                                      step=self.gpt_seq_len)
+            assert len(self.test_buf) >= self.gpt_batch_size * self.gpt_seq_len
+            start_indices = np.arange(start=0, stop=self.gpt_batch_size * self.gpt_seq_len, step=self.gpt_seq_len)  # stop is non-inclusive
             if len(start_indices) == 0:
                 yield from self._yield_empty_validation_batch()
             else:
+                assert len(start_indices) >= self.gpt_batch_size
                 # TODO: Move this tuple into a @dataclass
                 states, actions, rewards, dones, new_states, agent_states, next_agent_states = self.sample_sequential(
                     buffer=self.test_buf,
@@ -1334,7 +1337,7 @@ class LearnMax(pl.LightningModule):
 
         # Images on GPU already so pin_memory raises exception
         return DataLoader(dataset=validation_dataset, batch_size=batch_size, num_workers=self.num_workers,
-                          drop_last=True, pin_memory=self.pin_memory)
+                          drop_last=True, pin_memory=self.pin_memory, shuffle=False)
 
     @staticmethod
     def make_environment(env_name: str, seed: Optional[int] = None) -> Env:
@@ -1978,7 +1981,7 @@ def train_gpt(args, fast_dev_run, model):
                          # overfit_batches=1,
                          fast_dev_run=fast_dev_run,
                          num_sanity_val_steps=0,
-                         val_check_interval=args.train_to_test_collection_ratio * 2,
+                         val_check_interval=10,
                          # Ensure we have data before validating
                          )
     # checkpoint_callback = ModelCheckpoint(save_top_k=1, monitor="max_interesting", mode="max", period=1, verbose=True)
