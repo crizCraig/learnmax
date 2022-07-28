@@ -47,3 +47,23 @@ def sample(model, x, steps, temperature=1.0, sample=False, top_k=None):
         x = torch.cat((x, ix), dim=1)
 
     return x
+
+
+def add_action_and_delim(actions, z_q_ind, num_state_embeddings, num_actions, tokens_in_frame):
+    device = z_q_ind.device
+    B, S, TiF = z_q_ind.shape  # batch sequence-frames height width embedding
+    # E = self.embedding_dim
+    delim_ind = num_state_embeddings + num_actions  # After state patches and action token
+    # Not using flat with patches as patches convey within-image info
+    # flat_delim = self.tok_emb(torch.tensor(delim_ind).to(device))
+    # flat_delim = flat_delim.repeat(B * S, 1)
+    # z_q_flat = z_q_flat.reshape(B * S, H * W * E)
+    # z_q_flat = torch.cat((z_q_flat, flat_delim), 1).reshape(B, S, H * W * E + E)
+    ind_delim = torch.tensor(delim_ind).to(device)  # add new cluster for delim
+    ind_delim = ind_delim.repeat(B * S, 1)
+    a_shifted = actions + num_state_embeddings
+    a_shifted = a_shifted.reshape(B * S, 1)
+    z_q_ind = z_q_ind.reshape(B * S, TiF)
+    z_q_ind = torch.cat((z_q_ind, a_shifted, ind_delim), -1)
+    z_q_ind = z_q_ind.reshape(B, S, tokens_in_frame)
+    return z_q_ind

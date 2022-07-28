@@ -125,7 +125,10 @@ class VQVAE(dvq_module):
     def decode_flat(self, z_q_emb_flat, output_proj):
         """
         Takes flat embedding of dims B,E, i.e. 1,4410 and decodes it into an image
+        Is this only for single token???
         """
+        if not self.is_single_token2:
+            log.warning('decode flat probably only works for single token, try just using decode')
         in_dims = z_q_emb_flat.size()
 
         width = int(np.sqrt(in_dims[-1] // output_proj))

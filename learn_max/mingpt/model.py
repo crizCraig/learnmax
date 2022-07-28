@@ -14,9 +14,12 @@ from typing import Dict, Tuple
 import torch
 import torch.nn as nn
 from loguru import logger as log
+from tdigest import TDigest
 from torch.nn import functional as F
 
 from learn_max.constants import ACC_LOG_PERIOD
+from learn_max.mingpt.utils import add_action_and_delim
+from learn_max.salience import detect_salience
 from learn_max.utils import accuracy, wandb_log, sa2as, torch_random_choice
 
 
@@ -188,7 +191,10 @@ class GPT(nn.Module):
         self.num_state_embeddings = num_state_embeddings
 
         self.global_step = 0
-        self.salience_reservoir = deque(maxlen=10_000)
+
+        # Consider ddsketch to reduce error since we're interested in long tail salience
+        # https://blog.acolyer.org/2019/09/06/ddsketch/
+        self.tdigest = TDigest()
         self.salience_reservoir_n = 0
 
         log.info("number of parameters: %e" % sum(p.numel() for p in self.parameters()))
@@ -304,8 +310,10 @@ class GPT(nn.Module):
             embed, z_q_ind, actions = args
             return self.single_token_forward(actions, embed, z_q_ind)
         else:
-            z_q_ind, replay_ind = args
+            z_q_ind, actions = args
+            z_q_ind = self.add_action_and_delim(actions, z_q_ind)
             B, FiS, TiF = z_q_ind.size()  # batch, frames in sequence, tokens in frame
+            assert TiF == self.tokens_in_frame
             assert TiF * FiS <= self.seq_len, "Cannot forward, model sequence length is exhausted."
             token_embed = self.tok_emb(z_q_ind)  # each input token index maps to a (learnable) vector
             assert FiS <= self.frames_in_sequence_window
@@ -325,146 +333,11 @@ class GPT(nn.Module):
                 x)  # Uses mean deviation instead of standard deviation https://stats.stackexchange.com/q/81986/18187
             wandb_log({'train/logits_std': logits.std()}, self.global_step)
 
-            saliencies = self.detect_salience(B, z_q_ind, replay_ind)
+            return logits, expected_deviation
 
-            return saliencies, logits, expected_deviation
-
-    def detect_salience(self, B, z_q_ind, replay_ind):
-        # Representation hierarchy is batch, sequences, frames, patches, logits
-        # Sum the whole sequence of logits in order to get a description of what happened in the sequence
-        # salience = ((salience - salience.min()) / max(1e-12, salience.max() - salience.min()))  # normalize 0=>1
-        # This is a little better but still relative to min sum in batch
-        # torch.log(logits.sum(axis=-1) - logits.sum(axis=-1).min() + 1e-12).min()
-        S = self.seq_len
-        FiS = self.frames_in_sequence_window
-        TiF = self.tokens_in_frame
-        # Deterministically squash saliency, i.e. not relative to current batch
-        # z_q_ind /= (S * Z / 50)
-        # TODO: As higher levels of abstraction are created, squash sums by dividing by some small epsilon plus
-        #   the block size, i.e. salience = salience / (salience_lvl * block_size * epsilon)
-        #   epsilon should be sized such that the max level of abstraction leads to numbers amenable to
-        #   the optimizer. Should be easy to write some basic tests for this. This as the salience will be used
-        #   as the embedding for the higher level. We could cluster the embedding and assign it an int
-        #   value and remap it to a learned embedding to alleviate this. Then we just need to stay inside non-NaN
-        #   range. We'd want to ensure the clustering is stable as new clusters are added, i.e. cluster 0 continues
-        #   to represent the same types of things when adding new clusters.
-        # if z_q_ind.abs().max() > 5 or z_q_ind.abs().median() < 1e-5:
-        #     log.warning(f'salience levels getting hard to optimize as embeddings '
-        #                 f'max {z_q_ind.max()} '
-        #                 f'median {z_q_ind.median()} '
-        #                 f'mean {z_q_ind.mean()} '
-        #                 f'min {z_q_ind.min()} '
-        #                 )
-        if B == 1 and not self.training:
-            # Detect realtime salience with integration q
-            self.saliency_q.append(z_q_ind)  # About 4.4MB with B=1,S=1107 * 4 bytes per int32 = B * S^2 * 4B
-        elif self.training:
-            # Note: Batch sequence needs to be sampled sequentially for this to work.
-            # Slide the window across the batch and check for salience in train. Salience can pop up here
-            #   when it didn't in realtime due to changing weights/logits
-
-            assert (B, FiS, TiF) == z_q_ind.shape, 'No support for partial windows in salience detection'
-            # Sliding window across batch
-            # key frames separated by sequence length to avoid overlap as nth frame logits
-            # use frames n-seq_len => n to output frame n+1
-            # windows = logits.flatten().unfold(dimension=0, size=self.tokens_in_frame, step=self.seq_len)
-            windows = z_q_ind.flatten().unfold(dimension=0, size=S, step=TiF)
-            assert (B-1) * S / TiF + 1 == windows.shape[0]  # sliding window check
-
-            # Combine across sequence token-wise to see saliencies across the whole sequence.
-            # This is basically saying that the spatial ordering of tokens is important for determining if we're
-            # in a new situation. However, if the same things happen, but just in a different
-            # temporal order, then the agent could just be walking around the same place in a different way.
-            # So I don't want to count that. However, if the agent has moved some item, like a door or grabbed a key,
-            # then new things have happened, and we DO want to count that.
-            windows = windows.reshape(-1, FiS, TiF).transpose(2, 1)
-            # We use geometric mean instead arithmetic mean to reduce state aliasing.
-            # We also add 5e3 to get larger products which have fewer factors vs summands.
-            # This helps reduce state aliasing.
-            # Finally, we take the root first to avoid NaNs from prod.
-            windows = ((windows + 5e3) ** (1/FiS)).prod(dim=-1)
-
-            # Note we don't want to normalize this distance to the current batch as we want them to be comparable
-            # across batches
-
-            # Manhattan distance between sequences shifted to be one sequence length apart
-            salience = abs(windows[FiS:, :] - windows[:-FiS, :])
-
-            # Sum diff across patches to get total diff for entire window
-            salience = salience.sum(axis=-1)
-
-            assert int(replay_ind[1] - replay_ind[0]) == FiS
-            # Interpolate replay indexes as we only have sequence start frame indexes
-            replay_ind = torch.arange(start=replay_ind[0], end=replay_ind[-1])
-            replay_ind += self.frames_in_sequence_window - 1
-            assert len(replay_ind) == len(salience) + FiS - 1, 'Last two sequences are used for last salience so we ' \
-                                                               'have one fewer salient sequence than sequences in batch'
-            # TODO: Look at top x% (abs?) and compare. We should look at the top 1% across more than just the batch.
-            #   Ideally this is all time. So maybe reservoir sampling or just keep max N with some expiration.
-
-            # TODO: Use set to make sure you don't add the same replay index twice
-
-            # TODO: We need to plan not just to get a large distance away from the centroid of previously encountered
-            #   events at the highest level of saliency, BUT to also explore and resolve the most uncertainty possible
-            #   at the highest level of saliency.
-
-            # Make sure reservoir is full
-            if self.salience_reservoir.maxlen > len(self.salience_reservoir):
-                num_to_insert = min(self.salience_reservoir.maxlen - len(self.salience_reservoir), len(salience))
-                for i in range(num_to_insert):
-                    self.salience_reservoir.append((replay_ind[i], salience[i]))
-                    self.salience_reservoir_n += 1
-
-            else:
-                # Approx reservoir sampling probability for set with mean (believe this yields a recency bias)
-                #   - prob of sampling one value from reservoir is k / n (see standard reservoir sampling)
-                #   - the mean prob for set of samples with size m would then be:
-                #     k * (1/n + 1/(n+1)... + 1/(n+m)) / m
-                n = self.salience_reservoir_n
-                m = salience.numel()
-                k = int(0.1 * n)
-                mean_prob = k * torch.sum(1 / torch.arange(n, n + m + 1)) / m
-                salient_k = int(mean_prob * m)
-
-                # We diverge from reservoir sampling here as we actually want the highest salience
-                # experiences across a large number of batches. There will also be some duplicate
-                # salient events detected which the distribution across batches helps a bit with
-                # as we always sample some percentage of each batch. This as opposed to taking the most salient
-                # across all batches which could result in many duplicates for the most salient events.
-                samples, idx = torch.topk(salience, salient_k)
-                for i, sample in enumerate(samples):
-                    self.salience_reservoir.append((replay_ind[idx[i]], sample))
-
-                self.salience_reservoir_n += m
-
-                if n > 10 * self.salience_reservoir.maxlen:
-                    # TOOD: Look at the most salient events
-                    pass
-            # TODO: Visualize salient events
-
-            # TODO: Maximize a total salient distance in the planning horizon to avoid loops
-            #  Uncertainty is better than total distance though, as it also allows back tracking.
-
-            # TODO: Try max cosine distance from (8) https://arxiv.org/pdf/2206.04114.pdf for detecting salient
-            #   events
-
-            # TODO: Randonmly sample mean_prob * batch length items from batch
-            # TODO: High level context will be salient embeddings (these can be new clusters added to the
-            #   existing trasformer softmax, a new transformer, or reused low level embeddings.
-            #   These context tokens will have their own high level context slot (specifying the goal) for the
-            #   low level. We may also have a prev context slot and num steps.
-            #   Then for low level context, we detect when ANY salient event is encountered and update the input
-            #   in the top level transformer when it is. This allows variable numbers of low level states to happen
-            #   before a given salient (i.e. jumping up and down or taking a shorter or
-            #   longer / circuitous route to a goal)
-            #   For adding outputs to softmax, we can do net surgery or more simply have inactive outputs
-            #   with logits forced to zero so no gradient flows until we allocate that output to something
-            #   and stop zeroing its input logit.
-
-            # TODO: Add salient events to replay buffers so that
-            #  we can train with appropriate high level and low level context tokens. First
-            #  let's just confirm we can detect salient events.
-        return z_q_ind
+    def detect_salience(self, actions, z_q_ind, replay_ind):
+        return detect_salience(actions, z_q_ind, replay_ind, self.seq_len, self.frames_in_sequence_window,
+                               self.tokens_in_frame, self.num_state_embeddings, self.num_actions, self.tdigest)
 
     def single_token_forward(self, actions, embed, idx):
         # if self.should_input_embed:
@@ -509,16 +382,24 @@ class GPT(nn.Module):
             target_idx = self.s_i_to_as_i(next_idx, a_next)
             logits, expected_deviation = self.forward(embed, z_q_ind, a)  # B, S
         else:
-            z_q_ind, exp_ind = batch[0]
-            B, FiS, TiF = z_q_ind.size()  # batch, frames in sequence, tokens in frame
+            z_q_ind, actions = batch
+            B, FiS, H, W = z_q_ind.shape
+            TiF = H * W
+            assert TiF <= self.tokens_in_frame  # delim and action not added yet
+            z_q_ind = z_q_ind.reshape(B, FiS, TiF)
             if split == 'train':
                 assert FiS * TiF >= self.seq_len, \
                     'Not filling block size in train will result in untrained latter positions.'
             # Shift targets by one patch
-            target_idx = z_q_ind.reshape(B, -1)[:, 1:-(z_q_ind.shape[-1]-1)]
+            # target_idx = z_q_ind[:,1:,:]
+            target_idx = self.add_action_and_delim(actions, z_q_ind)
+            assert target_idx.shape[-1] == self.tokens_in_frame
+            target_idx = target_idx.reshape(B, -1)[:, 1:-(target_idx.shape[-1] - 1)]
+            # TODO: Figure out patch target
 
-            z_q_ind = z_q_ind[:,:-1,:]  # Remove extra frame we included for targets
-            salience, logits, expected_deviation = self.forward(z_q_ind, exp_ind)
+            z_q_ind = z_q_ind[:,:-1,:]  # Remove extra frame from end we included for targets
+            actions = actions[:,:-1]
+            logits, expected_deviation = self.forward(z_q_ind, actions)
 
 
         # Calculate mean deviation loss for uncertainty ----------------------
@@ -681,13 +562,13 @@ class GPT(nn.Module):
 
     def get_batch_vars(self, batch):
         # TODO: Just put everything in agent_state, next_agent_state dicts
-        if len(batch) == 7:
+        if len(batch) == 6:
             # Has agent state and indices
-            s, a, r, d, s_next, agent_state, indices = batch
+            states, actions, rewards, dones, states_next, agent_state = batch
         else:
             raise NotImplementedError('Need to update this if we want to train on text again')
             # Text (i.e. not atari)
-            a = None  # This is for text so no action TODO: remove
+            actions = None  # This is for text so no action TODO: remove
             x, y = batch  # hate that i have to do this here in the model
 
         # TODO: Delete below once testing dvq training again
@@ -695,8 +576,8 @@ class GPT(nn.Module):
         z_q_flat = torch.stack([a['dvq_z_q_flat'] for a in agent_state])
 
         if self.is_single_token2:
-            a_x, a_y, gpt_x, z_q_ind_x, z_q_ind_y = sa2as(z_q_flat, z_q_ind, a)
-            ret = [gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y, s, agent_state]
+            a_x, a_y, gpt_x, z_q_ind_x, z_q_ind_y = sa2as(z_q_flat, z_q_ind, actions)
+            ret = [gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y, states, agent_state]
             return ret
         else:
             z_q_ind.squeeze_(2)
@@ -705,60 +586,17 @@ class GPT(nn.Module):
             # Lightning collate does an annoying transpose on lists of dicts using zip() that switches B and S,
             # so permute from S,B => B,S
             z_q_ind = z_q_ind.permute(1, 0, 2, 3)
-            z_q_flat = z_q_flat.permute(1, 0, 2, 3, 4)
+            # z_q_flat = z_q_flat.permute(1, 0, 2, 3, 4)
 
-            # Add frame delimiter
             # We don't really use z_q_flat in GPT anymore. We just need an extra cluster for the delim in z_q_ind.
             # TODO: We should get the delimiter and action embeddings from the same embedding as tokens, just shift
             #   the indexes. That way, we don't have as much overlap risk between the tensors, i.e. there's better
             #   separation between actions and states and delimiters. For training, we can mask out the non-action
             #   outputs when predicting actions, non-state when predicting states, and non-delim when predicting delim
             #   parts of a sequence.
-            # TODO: Add within-frame position embeddings to dvq tokens for within image understanding
-            # TODO: Add frame position embeddings
-            device = z_q_ind.device
-            B, S, H, W, E = z_q_flat.shape  # batch sequence-frames height width embedding
-            delim_ind = self.num_state_embeddings + self.num_actions  # After state patches and action token
+            return z_q_ind, actions
 
-            # Not using flat with patches as patches convey within-image info
-            # flat_delim = self.tok_emb(torch.tensor(delim_ind).to(device))
-            # flat_delim = flat_delim.repeat(B * S, 1)
-            # z_q_flat = z_q_flat.reshape(B * S, H * W * E)
-            # z_q_flat = torch.cat((z_q_flat, flat_delim), 1).reshape(B, S, H * W * E + E)
-
-            ind_delim = torch.tensor(delim_ind).to(device)  # add new cluster for delim
-            ind_delim = ind_delim.repeat(B * S, 1)
-            a_shifted = a + self.num_state_embeddings
-            a_shifted = a_shifted.reshape(B * S, 1)
-            z_q_ind = z_q_ind.reshape(B * S, H * W)
-            z_q_ind = torch.cat((z_q_ind, a_shifted, ind_delim), -1)
-            z_q_ind = z_q_ind.reshape(B, S, self.tokens_in_frame)
-            return z_q_ind, indices
-            # frame_len = ind.shape[-1]
-            # ind = ind.reshape(B, -1)
-            #
-            #
-            # # Create autoregression targets by shifting, we have an extra frame in case next patch is next frame,
-            # #   but only need to predict one patch
-            # gpt_ind_x = ind[:, :self.block_size]
-            # gpt_ind_y = ind[:, 1:1+self.block_size]
-            #
-            # return gpt_ind_x, gpt_ind_y
-
-
-
-
-
-
-
-
-
-
-        # s_ind =
-        # z_q_flat shape single_token2 = 42, 2,  1, 4410 => S, B, 1, emb_d
-        # z_q_flat shape patch based   = 42, 16, 1, 11, 11, 30 => S, B, 1, H, W, emb_d
-        # The above H, W should be folded into S, but with some delimiter between frames
-
-
+    def add_action_and_delim(self, actions, z_q_ind):
+        return add_action_and_delim(actions, z_q_ind, self.num_state_embeddings, self.num_actions, self.tokens_in_frame)
 
 

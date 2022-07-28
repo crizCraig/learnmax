@@ -21,7 +21,6 @@ class AgentState:
     dvq_latent_loss: torch.Tensor = None
     dvq_recon_loss: torch.Tensor = None
     dvq_loss: torch.Tensor = None
-    append_i: torch.tensor = -1  # for bug hunting
     split: torch.tensor = 0  # 0 for train 1 for test
 
     def dict(self):
@@ -33,7 +32,7 @@ class AgentState:
                 ret[k] = d[k]
         return ret
 
-    def to(self, device):
+    def to_(self, device):
         for field in dataclasses.fields(self):
             val = getattr(self, field.name)
             if torch.is_tensor(val):

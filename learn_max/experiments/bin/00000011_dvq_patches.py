@@ -22,7 +22,7 @@ def get_model_args():
         # args.dvq_checkpoint = '/home/a/src/learnmax/.lightning/learnmax-learn_max_experiments_bin/1qh8t75h/checkpoints/epoch=5-step=51999.ckpt'  # 70 emb_d
         args.dvq_checkpoint = '/home/a/src/learnmax/.lightning/learnmax-learn_max_experiments_bin/37yv98e9/checkpoints/epoch=8-step=85999.ckpt'  # 70 emb_d
 
-    args.num_embeddings = 256
+    args.num_state_embeddings = 256
     args.embedding_dim = 30  # decrease to get longer sequence length (aka block size / context window size)
 
     # Model + train args

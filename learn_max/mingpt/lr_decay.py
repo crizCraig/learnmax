@@ -23,7 +23,7 @@ class GptWarmupCosineLearningRateDecay(pl.Callback):
             a_x, a_y, gpt_x, z_q_ind_x, z_q_ind_y = pl_module.gpt.get_batch_vars(batch)
             ind = z_q_ind_y
         else:
-            z_q_ind, indices = pl_module.gpt.get_batch_vars(batch)
+            z_q_ind, actions = pl_module.gpt.get_batch_vars(batch)
             ind = z_q_ind
         self.tokens += (ind >= 0).sum()  # y == -100 is "ignore", so don't count these (-100 is Karpathy artifact, no longer needed really. always is ind.numel())
         if self.tokens < self.warmup_tokens:

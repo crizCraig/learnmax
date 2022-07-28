@@ -7,7 +7,7 @@ import random
 BLOCK_SIZE = 128  # spatial extent of the model for its context
 # NEPTUNE_RUN = neptune.init(project='crizcraig/safeobjective', api_token=os.environ['NEPTUNE_CREDS'])
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-DATE_FMT = '%Y_%m_%d_%H_%M_%S_%f'
+DATE_FMT = '%Y.%m.%d_%H:%M:%S.%f'
 DATE_STR = datetime.now().strftime(DATE_FMT)
 SAVE_DIR = f'{ROOT_DIR}/checkpoints'
 CHECKPOINT_NAME = f'{DATE_STR}.ckpt'
