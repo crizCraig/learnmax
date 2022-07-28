@@ -76,28 +76,28 @@ class ReplayBuffers:
         self.overfit_to_short_term = overfit_to_short_term
         self.verbose = verbose
         if verbose and overfit_to_short_term:
-            log.warning("Overfitting to short term mem")
+            log.warning('Overfitting to short term mem')
 
         self.short_term_mem_length = short_term_mem_max_length
         self.overfit_length = short_term_mem_max_length
         self.short_term_mem = deque(maxlen=short_term_mem_max_length)
         self.episode_i = 0  # Index of episode
         self.train_to_test_collection_ratio = train_to_test_collection_ratio  # Episodes to train vs test on
-        self.flush_i = 0  # Number of all replay buffers" flushes to disk
+        self.flush_i = 0  # Number of all replay buffers' flushes to disk
         self.total_length = 0  # Count of experiences in all buffers
-        root_data_dir = ROOT_DIR + "/data"
+        root_data_dir = ROOT_DIR + '/data'
         os.makedirs(root_data_dir, exist_ok=True)
         if data_dir is None:
-            data_dir = f"{root_data_dir}/replay_buff_{DATE_STR}_r-{RUN_ID}_env-{env_id}"
+            data_dir = f'{root_data_dir}/replay_buff_{DATE_STR}_r-{RUN_ID}_env-{env_id}'
             os.makedirs(data_dir)
         else:
-            raise NotImplementedError("Need to get replay_index from last episode_end_i and fill files of buffers")
-        log.info(f"Saving replay buffer to {data_dir}")
+            raise NotImplementedError('Need to get replay_index from last episode_end_i and fill files of buffers')
+        log.info(f'Saving replay buffer to {data_dir}')
         self.data_dir = data_dir
-        self.test_dir = data_dir + "/test"
-        self.train_dir = data_dir + "/train"
-        self.test_buf = ReplayBuffer("test", self, self.test_dir, max_lru_size=max_lru_size)
-        self.train_buf = ReplayBuffer("train", self, self.train_dir, max_lru_size=max_lru_size)
+        self.test_dir = data_dir + '/test'
+        self.train_dir = data_dir + '/train'
+        self.test_buf = ReplayBuffer('test', self, self.test_dir, max_lru_size=max_lru_size)
+        self.train_buf = ReplayBuffer('train', self, self.train_dir, max_lru_size=max_lru_size)
         self.curr_buf = self.test_buf  # Fill test buff first
 
     def append(self, exp):
