@@ -34,7 +34,9 @@ from torch.nn import functional as F
 from learn_max.config import get_train_args_from_cli, get_model_args_from_cli
 from learn_max.agent import LearnMaxAgent, AgentState
 from learn_max.dvq.model.deepmind_enc_dec import ResBlock
+from learn_max.mingpt.utils import get_num_embeddings
 from learn_max.replay_buffer import ReplayBuffers, Experience
+from learn_max.salience.salience_store import SalienceStore
 from learn_max.utils import topk_interesting, _init_weights, get_date_str, get_action_states, \
     wandb_log, no_train, wandb_check_flush, best_effort
 from learn_max.constants import SAVE_DIR, SEED, DEBUGGING, DATE_STR, ROOT_DIR, RUN_ID, WANDB_MAX_LOG_PERIOD, ACC_LOG_PERIOD
@@ -352,6 +354,7 @@ class LearnMax(pl.LightningModule):
                                             train_to_test_collection_ratio=train_to_test_collection_ratio,
                                             # Get a full val batch when training starts
                                             frames_per_file=frames_per_file)
+        self.salience_store = SalienceStore()
         self.train_buf = self.replay_buffers.train_buf
         self.test_buf = self.replay_buffers.test_buf
         self.recent_experience = self.replay_buffers.short_term_mem
@@ -374,7 +377,7 @@ class LearnMax(pl.LightningModule):
                              loss_flavor=dvq_loss_flavor, input_channels=dvq_input_channels,
                              enc_dec_flavor=dvq_enc_dec_flavor, vq_flavor=dvq_vq_flavor, quantize_proj=None,
                              is_single_token2=self.is_single_token2)
-            num_gpt_embeddings = num_state_embeddings + self.num_actions + 1  # actions + 1 for frame delimiter
+            num_gpt_embeddings = get_num_embeddings(num_state_embeddings, self.num_actions)
             tokens_in_frame = self.dvq.encoder.out_width ** 2 + 2  # H*W patches + 1 action + 1 delimiter
 
         self.gpt = GPT(output_size=num_gpt_embeddings, num_input_embeddings=num_gpt_embeddings,
@@ -475,7 +478,7 @@ class LearnMax(pl.LightningModule):
 
         self.predicted_trajectory_buffer.append(predicted_trajectory)
 
-        # Creates new AgentState so replay_i is correct
+        # Creates new AgentState from same next_state as above so replay_i is correct
         self.agent_state = self.get_agent_state(next_state)
 
         if self.should_train_gpt:
@@ -501,13 +504,15 @@ class LearnMax(pl.LightningModule):
         # TODO: Call GPT forward here on z_q_ind from above
         if look_back >= 2 * self.gpt.frames_in_sequence_window:
             # We have 2 sequences to use for detecting salience
-            B, _, H, W = z_q_ind.shape  # batch, frames in sequence, height, width
+            B, S, H, W = z_q_ind.shape  # batch, frames in sequence, height, width
             # TODO: This is the only place we should be calling detect_salience unless we use logits
             #  and want to 'reflect' after updating net
-            salient_replay_i = self.gpt.detect_salience(actions, z_q_ind, replay_ind)
+            salience = self.gpt.detect_salience(actions, z_q_ind, z_q_embed, replay_ind)
+            self.salience_store.add(salience)
+            salient_replay_ind = [s['replay_ind'] for s in salience]
             FiS = self.gpt.frames_in_sequence_window
-            if salient_replay_i:
-                self.viz_salience(FiS, salient_replay_i)
+            if salient_replay_ind:
+                self.viz_salience(FiS, salient_replay_ind)
 
     def viz_salience(self, FiS, salient_replay_i):
         os.makedirs(f'{ROOT_DIR}/images/viz_salience', exist_ok=True)
@@ -896,9 +901,9 @@ class LearnMax(pl.LightningModule):
 
     @no_train
     def viz_dvq_clusters(self, batch_idx):
-        self._viz_dvq_clusters(
-            f'{ROOT_DIR}/images/viz_clusters/{get_date_str()}_r_{RUN_ID}_e_{self.current_epoch}_b_{batch_idx}'
-        )
+        folder = f'{ROOT_DIR}/images/viz_clusters/{get_date_str()}_r_{RUN_ID}_e_{self.current_epoch}_b_{batch_idx}'
+        self._viz_dvq_clusters(folder)
+        log.info(f'Wrote dvq clusters to {folder}')
 
     @no_train
     def viz_dvq_clusters_knn_standalone(self):

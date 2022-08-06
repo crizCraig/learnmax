@@ -18,9 +18,9 @@ from tdigest import TDigest
 from torch.nn import functional as F
 
 from learn_max.constants import ACC_LOG_PERIOD
-from learn_max.mingpt.utils import add_action_and_delim
-from learn_max.salience import detect_salience
-from learn_max.utils import accuracy, wandb_log, sa2as, torch_random_choice
+from learn_max.mingpt.utils import add_action_and_delim_ind
+from learn_max.salience.detect_salience import detect_salience
+from learn_max.utils import accuracy, wandb_log, sa2as
 
 
 class CausalSelfAttention(nn.Module):
@@ -157,6 +157,7 @@ class GPT(nn.Module):
         self.patch_pos_emb = nn.Parameter(torch.zeros(1, tokens_in_frame, embedding_dim))
         self.frame_pos_emb = nn.Parameter(torch.zeros(1, frames_in_sequence_window, tokens_in_frame, embedding_dim))
 
+        # Only for single token, tok_emb does actions and delim otherwise
         self.act_emb = nn.Embedding(num_actions, input_embedding_dim)
         # self.delim_emb = nn.Embedding(1, embedding_dim)
 
@@ -335,9 +336,18 @@ class GPT(nn.Module):
 
             return logits, expected_deviation
 
-    def detect_salience(self, actions, z_q_ind, replay_ind):
-        return detect_salience(actions, z_q_ind, replay_ind, self.seq_len, self.frames_in_sequence_window,
-                               self.tokens_in_frame, self.num_state_embeddings, self.num_actions, self.tdigest)
+    def detect_salience(self, actions, z_q_ind, z_q_emb, replay_ind):
+        return detect_salience(actions=actions,
+                               z_q_ind=z_q_ind,
+                               z_q_emb=z_q_emb,
+                               replay_ind=replay_ind,
+                               seq_len=self.seq_len,
+                               frames_in_sequence_window=self.frames_in_sequence_window,
+                               state_tokens_in_frame=self.tokens_in_frame,
+                               num_state_embeddings=self.num_state_embeddings,
+                               num_actions=self.num_actions,
+                               tdigest=self.tdigest,
+                               use_emb=True, )
 
     def single_token_forward(self, actions, embed, idx):
         # if self.should_input_embed:
@@ -597,6 +607,6 @@ class GPT(nn.Module):
             return z_q_ind, actions
 
     def add_action_and_delim(self, actions, z_q_ind):
-        return add_action_and_delim(actions, z_q_ind, self.num_state_embeddings, self.num_actions, self.tokens_in_frame)
+        return add_action_and_delim_ind(actions, z_q_ind, self.num_state_embeddings, self.num_actions, self.tokens_in_frame)
 
 

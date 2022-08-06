@@ -1,5 +1,7 @@
 import json
 
+import numpy as np
+import scipy
 from sklearn.cluster import AffinityPropagation
 from sklearn import metrics
 from sklearn.datasets import make_blobs
@@ -13,15 +15,20 @@ X, labels_true = make_blobs(
 
 # #############################################################################
 # Compute Affinity Propagation
+# TODO: init preference with median similarity between initial samples
+distances = scipy.spatial.distance.cdist(X, X)
+
+# af = AffinityPropagation(preference=np.median(distances), random_state=0).fit(X)
 af = AffinityPropagation(preference=-50, random_state=0).fit(X)
+# af = AffinityPropagation(random_state=0).fit(X)
 cluster_centers_indices = af.cluster_centers_indices_
 labels = af.labels_
 
 n_clusters_ = len(cluster_centers_indices)
 
-json.dump({'dvq_checkpoint': 'self.dvq_checkpoint',
-           'labels': af.labels_,
-           'cluster_centers': af.cluster_centers_indices_}, open('/tmp/dvq_compress', 'w'), )
+# json.dump({'dvq_checkpoint': 'self.dvq_checkpoint',
+#            'labels': af.labels_,
+#            'cluster_centers': af.cluster_centers_indices_}, open('/tmp/dvq_compress', 'w'), )
 
 print("Estimated number of clusters: %d" % n_clusters_)
 print("Homogeneity: %0.3f" % metrics.homogeneity_score(labels_true, labels))
@@ -36,6 +43,14 @@ print(
     "Silhouette Coefficient: %0.3f"
     % metrics.silhouette_score(X, labels, metric="sqeuclidean")
 )
+print("Calinski Harabasz score: %0.3f",
+      metrics.calinski_harabasz_score(X, labels)
+)
+print("Davies Bouldin score: %0.3f",
+      metrics.davies_bouldin_score(X, labels)
+)
+
+# TODO: Jump method if needed https://github.com/v-iashin/JumpMethod/commits?author=v-iashin
 
 # #############################################################################
 # Plot result
@@ -64,4 +79,3 @@ for k, col in zip(range(n_clusters_), colors):
 
 plt.title("Estimated number of clusters: %d" % n_clusters_)
 plt.show()
-pass

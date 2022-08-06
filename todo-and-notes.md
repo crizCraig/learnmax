@@ -70,6 +70,8 @@
 
 - Find out why the learned embedding (derived from z_q_ind ints) is so much better than the z_q_emb embedding from the top of the auto-encoder. We really need to be able to use semantic embeddings so that similar experiences can be used for task transfer.
 - Detect salience on a pre-recorded dataset of Montezuma so that we don't have to learn to play and can focus on salience detection.
+- See if we can use the methods discussed in Progress and Compress https://arxiv.org/abs/1805.06370
+- In paper, note how we address requirements of [_Biological underpinnings for lifelong learning machines_](https://www.nature.com/articles/s42256-022-00452-0)
 Notes:
 #### Comparison with hierarchy of abstract machines (HAMs)
 These have discrete action, call, choice, and stop where execution is occurring at one level of abstraction at a time (i.e. sequentially). A big difference between this and learnmax is that learnmax can search within different levels of abstraction in parallel. Since high level plans don't change as often, most searching is done in the lower levels even when executing a high level plan to find some long term entropy. So your basically optimizing for entropy reduction per unit time. However since high level entropy possibly unlocks new vistas and worlds of low level entropy, we still should perhaps afford more weight to high level entropy just based on level alone. 

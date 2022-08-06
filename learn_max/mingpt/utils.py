@@ -18,6 +18,7 @@ def top_k_logits(logits, k):
     out[out < v[:, [-1]]] = -float('Inf')
     return out
 
+
 @torch.no_grad()
 def sample(model, x, steps, temperature=1.0, sample=False, top_k=None):
     """
@@ -49,7 +50,19 @@ def sample(model, x, steps, temperature=1.0, sample=False, top_k=None):
     return x
 
 
-def add_action_and_delim(actions, z_q_ind, num_state_embeddings, num_actions, tokens_in_frame):
+def get_num_embeddings(num_state_embeddings, num_actions):
+    return num_state_embeddings + num_actions + 1  # actions + 1 for frame delimiter
+
+
+def get_action_and_delim_emb(actions, z_q_ind, z_q_emb, num_state_embeddings, num_actions, tokens_in_frame):
+    # ret = tok_emb(z_q_ind)
+    ret = quantizer.embed_code(z_q_ind)
+    ret_emb_check = ret[:,:,:-2]
+    assert ret[:,:,:-2] == z_q_emb.reshape(ret_emb_check.shape)
+    return ret
+
+
+def add_action_and_delim_ind(actions, z_q_ind, num_state_embeddings, num_actions, tokens_in_frame):
     device = z_q_ind.device
     B, S, TiF = z_q_ind.shape  # batch sequence-frames height width embedding
     # E = self.embedding_dim
@@ -61,9 +74,9 @@ def add_action_and_delim(actions, z_q_ind, num_state_embeddings, num_actions, to
     # z_q_flat = torch.cat((z_q_flat, flat_delim), 1).reshape(B, S, H * W * E + E)
     ind_delim = torch.tensor(delim_ind).to(device)  # add new cluster for delim
     ind_delim = ind_delim.repeat(B * S, 1)
-    a_shifted = actions + num_state_embeddings
-    a_shifted = a_shifted.reshape(B * S, 1)
+    action_z_q_ind = actions + num_state_embeddings
+    action_z_q_ind = action_z_q_ind.reshape(B * S, 1)
     z_q_ind = z_q_ind.reshape(B * S, TiF)
-    z_q_ind = torch.cat((z_q_ind, a_shifted, ind_delim), -1)
+    z_q_ind = torch.cat((z_q_ind, action_z_q_ind, ind_delim), -1)
     z_q_ind = z_q_ind.reshape(B, S, tokens_in_frame)
     return z_q_ind
