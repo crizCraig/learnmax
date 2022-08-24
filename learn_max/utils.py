@@ -12,7 +12,7 @@ import numpy as np
 import wandb
 from numpy import array
 from torch import nn
-
+from PIL import Image
 
 from learn_max.constants import DATE_FMT, WANDB_MAX_LOG_PERIOD
 
@@ -368,6 +368,10 @@ def no_train(f):
     return wrapper
 
 
+# def get_viz_salience_folder():
+#     f'{ROOT_DIR}/images/viz_salience/{get_date_str()}_r_{RUN_ID}_e_{self.current_epoch}'
+
+
 def best_effort(f):
     """
     Decorator for model ops that don't require grads and should be done in eval mode for things like Dropout
@@ -400,6 +404,38 @@ def torch_random_choice(tensor, salient_k):
     idx = perm[:salient_k]
     samples = tensor[idx]
     return samples, idx
+
+
+def viz_experiences(experiences, folder, dvq_decoder, device):
+    for i, x in enumerate(experiences):
+        imo = viz_experience(x, dvq_decoder, device)
+        filename = f'{folder}/{str(i).zfill(9)}.png'
+        imo.save(filename)
+
+
+def viz_experience(x, dvq_decoder, device):
+    im = x.state.state.squeeze(0).permute(1, 2, 0).detach().cpu().numpy()
+    # emb = x.state.dvq_z_q_flat.to(self.device)
+    # B, H, W, E = emb.shape
+    # if not self.is_single_token2:
+    #     emb = emb.reshape(-1, self.dvq_embedding_dim)
+    imz = dvq_decoder.forward(x.state.dvq_z_q_emb.to(device))
+
+    # Image.fromarray(np.uint8(self.dvq.decoder.forward(x.state.dvq_z_q_emb.to(self.device)).squeeze(0).permute(1, 2, 0).detach().cpu().numpy() * 255)).show()
+
+    # imz = self.dvq.decode_flat(emb, output_proj=self.dvq.quantizer.output_proj)
+    imz = imz.squeeze(0).permute(1, 2, 0).clamp(0, 1)
+
+
+    # Combine patches into single image
+    # imz = imz.reshape(H, W, *imz.shape[1:])
+    # imz = imz.permute(0, 2, 1, 3, -1)
+    # _, HP, _, WP, _ = imz.shape
+    # imz = imz.reshape(H * HP, W * WP, -1)
+
+    imz = imz.detach().cpu().numpy()
+    imo = Image.fromarray(np.uint8(np.concatenate((im, imz), axis=0) * 255))
+    return imo
 
 
 if __name__ == '__main__':

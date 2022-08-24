@@ -11,3 +11,5 @@ fire
 lightning-bolts
 wandb
 einops
+seaborn
+pandas

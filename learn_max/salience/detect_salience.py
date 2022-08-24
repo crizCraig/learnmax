@@ -13,7 +13,8 @@ from learn_max.mingpt.utils import add_action_and_delim_ind
 
 @torch.no_grad()
 def detect_salience(actions, z_q_ind, z_q_emb, replay_ind, seq_len, frames_in_sequence_window, state_tokens_in_frame,
-                    num_state_embeddings, num_actions, tdigest, min_reservoir=1000, use_emb=False, ):
+                    tokens_in_frame, num_state_embeddings, num_actions, tdigest, min_reservoir=1000,
+                    use_emb=False, logits=None):
     """
     Compare subsequent sequences of length frames_in_sequence_window. If the patch-wise difference
     is greater than the 90th percentile of previously seen data (approximated by a t-digest), then return the
@@ -26,8 +27,7 @@ def detect_salience(actions, z_q_ind, z_q_emb, replay_ind, seq_len, frames_in_se
     # torch.log(logits.sum(axis=-1) - logits.sum(axis=-1).min() + 1e-12).min()
     FiS = frames_in_sequence_window
     TiF = state_tokens_in_frame
-    S = seq_len
-    assert S == FiS * TiF  # Avoid passing seq_len if this is always true
+    S = FiS * TiF
 
     # Deterministically squash saliency, i.e. not relative to current batch
     # z_q_ind /= (S * Z / 50)
@@ -101,10 +101,10 @@ def detect_salience(actions, z_q_ind, z_q_emb, replay_ind, seq_len, frames_in_se
     # When only 2 sequence lengths are fed in, this just ends up taking the last minus first window.
     salience = abs(windows[FiS:] - windows[:-FiS])
 
-    assert salience.shape[0] == _FiS - 2 * FiS + 1, 'Two sequence lengths slid across input'
+    assert salience.shape[0] == _FiS - 2 * FiS + 1, 'Two sequence lengths slid across windows'
 
     # Sum diff across sequence-patches to get total salience for sequence
-    salience = salience.sum(axis=-1)
+    salience = salience.reshape(salience.shape[0], -1).sum(axis=-1)
 
     replay_ind = replay_ind.squeeze(0)
     # assert int(replay_ind[1] - replay_ind[0]) == FiS
@@ -127,8 +127,9 @@ def detect_salience(actions, z_q_ind, z_q_emb, replay_ind, seq_len, frames_in_se
     #   data in case the network has learned new possibilities. Alternatively, we could wait to encounter the event again.
     #   ----
     #   This allows aggregating what's possible after a state from experience, not just what happened once.
-    #   However, by combining many examples of the same salient state, we should be able to get something similar.
-    #   The problem is that the state might not be captured as salient unless all possibilties are considered.
+    #   However, by combining many examples of the same salient state without logits,
+    #   we should be able to get something similar. The problem is that the state might not be captured as salient
+    #   unless all possibilties are considered.
 
     # TODO: We should include semantic data (logits/patch embeddings) in salient state embeddings to allow for task transfer
     #   I.e. imagine the skull is blue and slightly larger, or there's a rolling ball. The knowledge on how to
@@ -153,16 +154,17 @@ def detect_salience(actions, z_q_ind, z_q_emb, replay_ind, seq_len, frames_in_se
                 before_salient = windows[i]
                 after_salient = windows[i + FiS]
                 patch_diff = after_salient - before_salient
-                assert sum(abs(patch_diff)) == s
+                assert patch_diff.abs().sum() == s
                 ret.append(dict(replay_ind=replay_ind[i] + FiS - 1,
                                 patch_diff=patch_diff))
 
-    if len(salience) == 1:
-        tdigest.update(salience[0])
-        if random.random() < 0.01:
-            tdigest.compress()
-    elif len(salience) > 1:
-        tdigest.batch_update(salience)  # always does compress
+    if len(salience) > 0:
+        if len(salience) == 1:
+            tdigest.update(salience[0])
+            if random.random() < 0.01:
+                tdigest.compress()  # Perform tdigest maintenance once in a while
+        else:
+            tdigest.batch_update(salience)  # this always does maintenance
     # else:
     #     # Approx reservoir sampling probability for set with mean (believe this yields a slight recency bias vs
     #     # sampling one at a time)
@@ -221,6 +223,7 @@ def _test_detect_salience(num_sequences=2, use_emb=False):
     num_state_embeddings = 256
     patch_width = 11
     state_tokens_in_frame = 121
+    tokens_in_frame = 123  # 1 action + 1 delimiter
     embedding_size = 30
     batch_size = 1
     # num_input_embeddings = get_num_embeddings(num_state_embeddings, num_actions)
@@ -243,11 +246,14 @@ def _test_detect_salience(num_sequences=2, use_emb=False):
     min_reservoir = 10
     for i in range(min_reservoir * 2):
         # Fill up with zeroes
+        # actions, z_q_ind, z_q_emb, replay_ind, seq_len, frames_in_sequence_window, tokens_in_frame,
+        #                     state_tokens_in_frame, num_state_embeddings, num_actions, tdigest,
         detect_salience(actions, 0 * z_q_ind, 0 * z_q_emb, replay_ind, seq_len, frames_in_sequence_window,
-                        state_tokens_in_frame, num_state_embeddings, num_actions, tdigest, min_reservoir=min_reservoir,
-                        use_emb=use_emb)
-    ret = detect_salience(actions, z_q_ind, z_q_emb, replay_ind, seq_len, frames_in_sequence_window, state_tokens_in_frame,
-                          num_state_embeddings, num_actions, tdigest, min_reservoir=min_reservoir, use_emb=use_emb,)
+                        state_tokens_in_frame, tokens_in_frame, num_state_embeddings, num_actions, tdigest,
+                        min_reservoir=min_reservoir, use_emb=use_emb)
+    ret = detect_salience(actions, z_q_ind, z_q_emb, replay_ind, seq_len, frames_in_sequence_window,
+                          state_tokens_in_frame, tokens_in_frame, num_state_embeddings, num_actions, tdigest,
+                          min_reservoir=min_reservoir, use_emb=use_emb,)
     assert len(ret) == num_frames - 2 * frames_in_sequence_window + 1, 'Two sequences slid across input'
     return ret
 

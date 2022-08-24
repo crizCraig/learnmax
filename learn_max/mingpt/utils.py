@@ -64,7 +64,13 @@ def get_action_and_delim_emb(actions, z_q_ind, z_q_emb, num_state_embeddings, nu
 
 def add_action_and_delim_ind(actions, z_q_ind, num_state_embeddings, num_actions, tokens_in_frame):
     device = z_q_ind.device
-    B, S, TiF = z_q_ind.shape  # batch sequence-frames height width embedding
+    if len(z_q_ind.shape) == 3:
+        B, S, TiF = z_q_ind.shape  # batch sequence-frames height width embedding
+    elif len(z_q_ind.shape) == 2:
+        B = 1
+        S, TiF = z_q_ind.shape
+    else:
+        raise RuntimeError('Unexpected z_q_ind shape')
     # E = self.embedding_dim
     delim_ind = num_state_embeddings + num_actions  # After state patches and action token
     # Not using flat with patches as patches convey within-image info

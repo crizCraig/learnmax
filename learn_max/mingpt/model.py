@@ -122,6 +122,7 @@ class GPT(nn.Module):
                  should_input_and_learn_embed: bool = False,  # whether to cat input embed with learned token embed
                  num_actions: int = 0,  # number of actions to use for action embedding
                  is_single_token2: bool = False,  # whether there's one token per image
+                 state_tokens_in_frame: int = None,  # number of state tokens (i.e. not action or delimeter) in frame
                  tokens_in_frame: int = None,  # number of tokens per frame (1 in single token)
                  batch_size: int = None,
                  ):
@@ -130,6 +131,7 @@ class GPT(nn.Module):
         self.is_single_token2 = is_single_token2
         self.batch_size = batch_size
         self.frames_in_sequence_window = frames_in_sequence_window
+        self.state_tokens_in_frame = state_tokens_in_frame
         self.tokens_in_frame = tokens_in_frame
 
         # save these for optimizer init later
@@ -325,7 +327,7 @@ class GPT(nn.Module):
             patch_pos_embed = self.patch_pos_emb[:, :TiF]  # support partial frames
 
             x = token_embed + frame_pos_embed + patch_pos_embed  # broadcast sum embeddings
-            x = x.reshape(B, self.seq_len, self.embedding_dim)
+            x = x.reshape(B, TiF * FiS, self.embedding_dim)
             x = self.drop(x)
             x = self.blocks(x)
             x = self.ln_f(x)
@@ -336,18 +338,20 @@ class GPT(nn.Module):
 
             return logits, expected_deviation
 
-    def detect_salience(self, actions, z_q_ind, z_q_emb, replay_ind):
+    def detect_salience(self, actions, z_q_ind, z_q_emb, replay_ind, logits=None):
         return detect_salience(actions=actions,
                                z_q_ind=z_q_ind,
                                z_q_emb=z_q_emb,
                                replay_ind=replay_ind,
                                seq_len=self.seq_len,
                                frames_in_sequence_window=self.frames_in_sequence_window,
-                               state_tokens_in_frame=self.tokens_in_frame,
+                               tokens_in_frame=self.tokens_in_frame,
+                               state_tokens_in_frame=self.state_tokens_in_frame,
                                num_state_embeddings=self.num_state_embeddings,
                                num_actions=self.num_actions,
                                tdigest=self.tdigest,
-                               use_emb=True, )
+                               use_emb=True,
+                               logits=logits,)
 
     def single_token_forward(self, actions, embed, idx):
         # if self.should_input_embed:

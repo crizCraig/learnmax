@@ -21,6 +21,7 @@ class AgentState:
     dvq_latent_loss: torch.Tensor = None
     dvq_recon_loss: torch.Tensor = None
     dvq_loss: torch.Tensor = None
+    gpt_logits: torch.Tensor = None
     split: torch.tensor = 0  # 0 for train 1 for test
 
     def dict(self):
