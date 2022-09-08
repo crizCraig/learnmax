@@ -25,8 +25,9 @@ def detect_salience(actions, z_q_ind, z_q_emb, replay_ind, seq_len, frames_in_se
     # salience = ((salience - salience.min()) / max(1e-12, salience.max() - salience.min()))  # normalize 0=>1
     # This is a little better but still relative to min sum in batch
     # torch.log(logits.sum(axis=-1) - logits.sum(axis=-1).min() + 1e-12).min()
+    # logits: 14, 8*123=984, 263
     FiS = frames_in_sequence_window
-    TiF = state_tokens_in_frame
+    TiF = state_tokens_in_frame if logits is None else tokens_in_frame  # actions part of state with logits (FINE)
     S = FiS * TiF
 
     # Deterministically squash saliency, i.e. not relative to current batch
@@ -46,29 +47,37 @@ def detect_salience(actions, z_q_ind, z_q_emb, replay_ind, seq_len, frames_in_se
     #                 f'mean {z_q_ind.mean()} '
     #                 f'min {z_q_ind.min()} '
     #                 )
-    # Note: Batch sequence needs to be sampled sequentially for this to work.
+    # Note: Input sequences needs to be sampled sequentially for this to work.
     # Slide the window across the batch and check for salience in train. Salience can pop up here
     #   when it didn't in realtime due to changing weights/logits
     B, _FiS, H, W, E = z_q_emb.shape
+    L = None
     z_q_ind = z_q_ind.reshape(B, _FiS, H * W)
 
     # We don't want to add the action and delim tokens here because we want salience recognition to be agnostic to
     # actions and delims are implicit in the way diffs are done.
     # z_q_ind = add_action_and_delim_ind(actions, z_q_ind, num_state_embeddings, num_actions, tokens_in_frame)
-    if use_emb:
+    if logits is not None:
+        assert not use_emb, 'Expect either logits or use_emb, but both set'
+        L = logits.shape[-1]
+        x = logits.reshape(B, _FiS, -1, L)
+    elif use_emb:
         # Set x to embedding so that distances are meaningful in input space
         x = z_q_emb.reshape(B, _FiS, H * W, E)
     else:
         x = z_q_ind
-    assert B == 1
     assert (B, _FiS, TiF) == x.shape[:3], 'No support for partial windows in salience detection'
 
-    if use_emb:
+    assert B == 1
+
+    if logits is not None:
+        x = x.reshape(B * _FiS * TiF, L)
+    elif use_emb:
         x = x.reshape(B * _FiS * TiF, E)
     else:
         x = x.flatten()
 
-    # Sliding window across z_q_ind with length equal to the sequence size, and step equal to one frame
+    # Slide sequence window across tokens/patches one frame at a time
     windows = x.unfold(dimension=0, size=S, step=TiF)
     assert _FiS - FiS + 1 == windows.shape[0]  # sliding window check
 
@@ -79,15 +88,18 @@ def detect_salience(actions, z_q_ind, z_q_emb, replay_ind, seq_len, frames_in_se
     # temporal order, then the agent could just be walking around the same place in a different way.
     # So I don't want to count that. However, if the agent has moved some item, like a door or grabbed a key,
     # then new things have happened _spatially_ within the frame, and we DO want to count that.
-    if use_emb:
-        windows = windows.reshape(windows.shape[0], FiS, TiF, E)
+    # TODO: Remove these redundant if blocks
+    if logits is not None:
+        windows = windows.reshape(windows.shape[0], L, FiS, TiF)
+    elif use_emb:
+        windows = windows.reshape(windows.shape[0], E, FiS, TiF)
     else:
         windows = windows.reshape(windows.shape[0], FiS, TiF)
-    windows = windows.transpose(2, 1)
-    # We use geometric mean instead arithmetic mean and add 5e3 to get larger products.
+    # windows = windows.transpose(1, 3)
+    # We add 5e3 and use geometric mean instead of arithmetic mean to get more separation.
     # These help reduce state aliasing when combining as there are fewer common factors than common summands.
     # Finally, we take the root first to avoid NaNs from prod.
-    if use_emb:
+    if use_emb or logits is not None:
         combine_dim = -2
     else:
         combine_dim = -1
@@ -97,11 +109,20 @@ def detect_salience(actions, z_q_ind, z_q_emb, replay_ind, seq_len, frames_in_se
     # Note we don't want to normalize this distance to the current batch as we want them to be comparable
     # across batches
 
-    # Manhattan distances between 2 sequences shifted to be one sequence length apart.
-    # When only 2 sequence lengths are fed in, this just ends up taking the last minus first window.
+    # Manhattan distances between subsequent sequences
+    #   E.g. say our sequence length is 8 frames and our input has 16 (_FiS) total frames, so 2 sequences.
+    #   Then we just subtract the first sequence from the second.
+    #   |________;________|  => B - A
+    #       A         B
+    #   However, you'd have 9 windows since you start at the first 8 frames (1 window) and then step the window
+    #   8 more times (+ 8 windows) until the end of the window reaches the 16th frame when you use `unfold`
+    #   Most of these windows are not used when only 2 sequences are fed in,
+    #   but if even one more frame is fed in, we'll start utilizing a greater percentage of the windows.
+    #   E.g. say you feed in 17 frames, then you'd get 10 windows and 2 salience diffs (20% usage, from 11%),
+    #   and if you fed in 24 frames, you'd get 17 windows and 8 salience diffs (47% usage).
     salience = abs(windows[FiS:] - windows[:-FiS])
 
-    assert salience.shape[0] == _FiS - 2 * FiS + 1, 'Two sequence lengths slid across windows'
+    assert salience.shape[0] == _FiS - 2 * FiS + 1, 'Two subsequent sequences slid across windows'
 
     # Sum diff across sequence-patches to get total salience for sequence
     salience = salience.reshape(salience.shape[0], -1).sum(axis=-1)
@@ -223,7 +244,7 @@ def _test_detect_salience(num_sequences=2, use_emb=False):
     num_state_embeddings = 256
     patch_width = 11
     state_tokens_in_frame = 121
-    tokens_in_frame = 123  # 1 action + 1 delimiter
+    tokens_in_frame = state_tokens_in_frame + 2  #  + 1 action + 1 delimiter
     embedding_size = 30
     batch_size = 1
     # num_input_embeddings = get_num_embeddings(num_state_embeddings, num_actions)

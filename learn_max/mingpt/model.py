@@ -317,7 +317,7 @@ class GPT(nn.Module):
             z_q_ind = self.add_action_and_delim(actions, z_q_ind)
             B, FiS, TiF = z_q_ind.size()  # batch, frames in sequence, tokens in frame
             assert TiF == self.tokens_in_frame
-            assert TiF * FiS <= self.seq_len, "Cannot forward, model sequence length is exhausted."
+            assert TiF * FiS <= self.seq_len, 'Cannot forward, model sequence length is exhausted.'
             token_embed = self.tok_emb(z_q_ind)  # each input token index maps to a (learnable) vector
             assert FiS <= self.frames_in_sequence_window
             assert TiF <= self.tokens_in_frame
@@ -338,7 +338,17 @@ class GPT(nn.Module):
 
             return logits, expected_deviation
 
-    def detect_salience(self, actions, z_q_ind, z_q_emb, replay_ind, logits=None):
+    def detect_salience(self, actions, z_q_ind, z_q_emb, replay_ind,):
+
+        def get_logits():
+            """Get logits for z_q_ind and actions"""
+            _, S, H, W = z_q_ind.shape
+            # Break forward up into multiple self.frames_in_sequence_window tensors
+            z_q_ind_f = z_q_ind.reshape(S//self.frames_in_sequence_window, -1, H*W)
+            actions_f = actions.reshape(S//self.frames_in_sequence_window, -1)
+            logits, expected_deviation = self.forward(z_q_ind_f, actions_f)
+            return logits
+
         return detect_salience(actions=actions,
                                z_q_ind=z_q_ind,
                                z_q_emb=z_q_emb,
@@ -350,8 +360,8 @@ class GPT(nn.Module):
                                num_state_embeddings=self.num_state_embeddings,
                                num_actions=self.num_actions,
                                tdigest=self.tdigest,
-                               use_emb=True,
-                               logits=logits,)
+                               use_emb=False,
+                               logits=get_logits(),)
 
     def single_token_forward(self, actions, embed, idx):
         # if self.should_input_embed:

@@ -1,7 +1,6 @@
 import random
 import numpy as np
 import torch
-import torch.nn as nn
 from torch.nn import functional as F
 
 
@@ -65,7 +64,7 @@ def get_action_and_delim_emb(actions, z_q_ind, z_q_emb, num_state_embeddings, nu
 def add_action_and_delim_ind(actions, z_q_ind, num_state_embeddings, num_actions, tokens_in_frame):
     device = z_q_ind.device
     if len(z_q_ind.shape) == 3:
-        B, S, TiF = z_q_ind.shape  # batch sequence-frames height width embedding
+        B, S, TiF = z_q_ind.shape  # batch, sequence-frames, tokens-in-frame
     elif len(z_q_ind.shape) == 2:
         B = 1
         S, TiF = z_q_ind.shape

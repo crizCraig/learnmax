@@ -406,19 +406,25 @@ class LearnMax(pl.LightningModule):
         self.agent_state = self.get_agent_state(self.env.reset())
         return self.agent_state
 
-    def get_agent_state(self, state, action=None):
+    def get_agent_state(self, state):
+        """
+        Populate agent state with external and internal (dvq only) state.
+
+        We avoid storing GPT logits as we expect those to change more frequently when the network updates
+        and want salience detection to get those fresh logits with forward.
+        """
         if not isinstance(state, list):
             state = [state]
         if not isinstance(state, torch.Tensor):
-            state = torch.tensor(np.array(state), device=self.device)  # causes issues when num_workers > 0
+            state = torch.tensor(np.array(state), device=self.device)  # Cause issues when num_workers > 0
 
-        gpt_logits = None
+        # gpt_logits = None
         if self.should_train_gpt:
             dvq_loss, latent_loss, recon_loss, x, x_hat, z_q_emb, z_q_flat, z_q_ind = self.get_dvq_outputs(state)
-            if action is not None and not self.is_single_token2:
-                pass
-                with torch.no_grad():
-                    gpt_logits = self.gpt.forward(z_q_ind.reshape(1, -1), torch.tensor([action], device=self.device))
+            # if action is not None and not self.is_single_token2:
+            #     pass
+            #     with torch.no_grad():
+            #         gpt_logits, _ = self.gpt.forward(z_q_ind.reshape(1, -1), torch.tensor([action], device=self.device))
         else:
             dvq_loss, latent_loss, recon_loss, x, x_hat, z_q_emb, z_q_flat, z_q_ind = (
                 None, None, None, None, None, None, None, None
@@ -436,7 +442,8 @@ class LearnMax(pl.LightningModule):
                                  dvq_recon_loss=recon_loss,
                                  dvq_loss=dvq_loss,
                                  dvq_z_q_ind=z_q_ind,
-                                 gpt_logits=gpt_logits)
+                                 # gpt_logits=gpt_logits,
+                                 )
         return agent_state
 
     @no_train
@@ -485,7 +492,7 @@ class LearnMax(pl.LightningModule):
         next_state, reward, done, info = self.env.step(action[0])
         self.episode_steps += 1
         self.episode_reward += reward
-        next_agent_state = self.get_agent_state(next_state, action)
+        next_agent_state = self.get_agent_state(next_state)
         exp = Experience(state=self.agent_state, action=action[0], reward=reward, done=done,
                          new_state=next_agent_state)
 
@@ -494,10 +501,7 @@ class LearnMax(pl.LightningModule):
         self.predicted_trajectory_buffer.append(predicted_trajectory)
 
         # Creates new AgentState from same next_state as above so replay_i is correct
-        self.agent_state = self.get_agent_state(next_state, action)
-
-        if self.should_train_gpt and self.non_internal_salience:
-            self.detect_salience()
+        self.agent_state = self.get_agent_state(next_state)
 
         if done:
             wandb_log({'episode_steps': self.episode_steps})
@@ -509,20 +513,21 @@ class LearnMax(pl.LightningModule):
             self.episode_steps = 0
             self.episode_reward = 0
 
-    def detect_salience(self, logits=None):
+    def detect_salience(self):
         two_sequence_size = 2 * self.gpt.frames_in_sequence_window
         assert self.replay_buffers.train_buf.frames_per_file >= two_sequence_size, \
             'Not enough contiguous experience to detect salience'
         actions, just_died, look_back, z_q_embed, z_q_ind, replay_ind = self.get_recent_experience(
             max_size=2 * self.gpt.frames_in_sequence_window,
             train_only=True)
-        # TODO: Call GPT forward here on z_q_ind from above
+        # TODO: Try feeding in longer sequences? We'll get more efficient use of windows in detect_salience, but
+        #   have more potential overlap between steps when weights may not have changed much.
         if look_back >= 2 * self.gpt.frames_in_sequence_window:
             # We have 2 sequences to use for detecting salience
             B, S, H, W = z_q_ind.shape  # batch, frames in sequence, height, width
-            # TODO: This is the only place we should be calling detect_salience unless we use logits
-            #  and want to 'reflect' after updating net
-            saliences = self.gpt.detect_salience(actions, z_q_ind, z_q_embed, replay_ind, logits)
+
+            # This is the only place we should be calling detect_salience
+            saliences = self.gpt.detect_salience(actions, z_q_ind, z_q_embed, replay_ind)
             if saliences:
                 self.salience_store.add(saliences, self.dvq.decoder, self.device)
             salient_replay_ind = [s['replay_ind'] for s in saliences]
@@ -802,7 +807,7 @@ class LearnMax(pl.LightningModule):
                 gpt_ret = self.gpt.training_step(batch=(gpt_ind, actions), batch_idx=batch_idx)
                 if not self.non_internal_salience:
                     # Use internal signals (e.g. logits) for salience
-                    self.detect_salience(gpt_ret['logits'])
+                    self.detect_salience()
             self.gpt.global_step = self.global_step
 
             # Visualization steps
