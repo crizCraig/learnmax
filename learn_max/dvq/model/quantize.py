@@ -127,7 +127,7 @@ class VQVAEQuantize(nn.Module):
             self.data_initialized.fill_(0)
 
         if self.initial_centroid_spread is not None:
-            wandb_log({'initial_centroid_spread': self.initial_centroid_spread}, self.global_step)
+            wandb_log({'initial_centroid_spread': self.initial_centroid_spread})
 
         # Extract indexes from embedding and computes distance (similar to k-means here?)
         # this is the distance that's learned by the embedding table between each input token and each centroid
@@ -142,9 +142,9 @@ class VQVAEQuantize(nn.Module):
         # dimensions are (num_tokens, num_embeddings)
 
         _, z_q_ind = (-dist).max(1)
-        wandb_log({'unique_closest_clusters': torch.unique(z_q_ind).numel()}, self.global_step)
+        wandb_log({'unique_closest_clusters': torch.unique(z_q_ind).numel()})
         if self.forward_iter % 100 == 0:
-            wandb_log({'centroid_spread': self.get_centroid_spread()}, self.global_step)
+            wandb_log({'centroid_spread': self.get_centroid_spread()})
         # Dist between centroids
         # Avg Dist betweeen points
         if not self.is_single_token2:
@@ -158,11 +158,11 @@ class VQVAEQuantize(nn.Module):
             z_q_ind = 0 * z_q_ind + 3070
         z_q_emb = self.embed_code(z_q_ind)  # (B, H, W, C) (128, 8, 8, 64) OR ST2=> (B, E) (128, 4096)
         point_spread = self.get_point_spread(z_e, z_q_emb)
-        wandb_log({'point_spread': point_spread}, self.global_step)
+        wandb_log({'point_spread': point_spread})
         if self.initial_point_spread is None:
             self.initial_point_spread = point_spread
             log.debug(f'initial_point_spread {self.initial_point_spread}')
-        wandb_log({'initial_point_spread': self.initial_point_spread}, self.global_step)
+        wandb_log({'initial_point_spread': self.initial_point_spread})
 
         commitment_cost = 0.25
         latent_loss = commitment_cost * (z_q_emb.detach() - z_e).pow(2).mean() + (z_q_emb - z_e.detach()).pow(2).mean()

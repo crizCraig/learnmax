@@ -6,11 +6,12 @@ GPT model:
     - all blocks feed into a central residual pathway similar to resnets
 - the final decoder is a linear projection into a vanilla Softmax classifier
 """
-
+import collections
 import math
 from collections import defaultdict, deque
 from typing import Dict, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 from loguru import logger as log
@@ -200,6 +201,12 @@ class GPT(nn.Module):
         self.tdigest = TDigest()
         self.salience_reservoir_n = 0
 
+        # Track most recent maxlen batches of logits so we can normalize logits for salience detection
+        logit_sum_len = 10
+        self.logit_dq_sum = collections.deque(maxlen=logit_sum_len)
+        self.logit_dq_numel = collections.deque(maxlen=logit_sum_len)
+        self.logit_dq_std = collections.deque(maxlen=logit_sum_len)
+
         log.info("number of parameters: %e" % sum(p.numel() for p in self.parameters()))
 
     def init_blocks(self, attn_pdrop, block_size, embedding_dim, n_head, n_layer, resid_pdrop):
@@ -334,12 +341,21 @@ class GPT(nn.Module):
             logits = self.logit_p_head(x)
             expected_deviation = self.deviation_head(
                 x)  # Uses mean deviation instead of standard deviation https://stats.stackexchange.com/q/81986/18187
-            wandb_log({'train/logits_std': logits.std()}, self.global_step)
+            wandb_log({'train/logits_std': logits.std()})
 
             return logits, expected_deviation
 
-    def detect_salience(self, actions, z_q_ind, z_q_emb, replay_ind,):
+    def detect_salience(self, actions, z_q_ind, z_q_emb, replay_ind, use_logits=True):
+        """
 
+        @param actions:
+        @param z_q_ind:
+        @param z_q_emb:
+        @param replay_ind:
+        @param use_logits: Allows detecting a big change in the predicted future not just the current observed state
+            For example, if I open a door, there are lots of new possibilities.
+        @return:
+        """
         def get_logits():
             """Get logits for z_q_ind and actions"""
             _, S, H, W = z_q_ind.shape
@@ -347,8 +363,32 @@ class GPT(nn.Module):
             z_q_ind_f = z_q_ind.reshape(S//self.frames_in_sequence_window, -1, H*W)
             actions_f = actions.reshape(S//self.frames_in_sequence_window, -1)
             logits, expected_deviation = self.forward(z_q_ind_f, actions_f)
-            return logits
+            # TODO:
 
+            # Normalize logits - These need to be normalized by dividing by the average of recent logits,
+            #   that way we can compare old saliences to new ones even when logits increase over time.
+            #   Thinking the increasing logits could be from GELU activations where activations are
+            #   increasingly surpassing the zero cuttoff.
+            #   Since the data in a minibatch is sequential, we need to average multiple minibatches
+            #   to reduce correlation and determine a more global salience.
+            self.logit_dq_sum.append(float(logits.sum()))
+            self.logit_dq_numel.append(float(logits.numel()))
+            self.logit_dq_std.append(float(logits.std()))
+            if len(self.logit_dq_std) < 10:
+                return None  # need to bootstrap more std()
+            avg_recent = sum(self.logit_dq_sum) / sum(self.logit_dq_numel)
+            if len(self.logit_dq_sum) == 1:
+                assert np.isclose(float(logits.mean()), avg_recent)
+            ret = (logits - avg_recent) / np.mean(self.logit_dq_std)  # z-normalize
+            assert ret.std() < 1E10, 'Logit variance is blowing up'
+            wandb_log({'salience/logits_u': logits.mean(), 'salience/logits_std': logits.std()})
+
+            return ret   # W, (H*W+a+d) * FiS, E
+
+        if use_logits:
+            logits = get_logits()
+            if logits is None:
+                return
         return detect_salience(actions=actions,
                                z_q_ind=z_q_ind,
                                z_q_emb=z_q_emb,
@@ -360,8 +400,9 @@ class GPT(nn.Module):
                                num_state_embeddings=self.num_state_embeddings,
                                num_actions=self.num_actions,
                                tdigest=self.tdigest,
-                               use_emb=False,
-                               logits=get_logits(),)
+                               use_emb=False, logits=logits,
+                               # use_emb=True, logits=None,
+                               )
 
     def single_token_forward(self, actions, embed, idx):
         # if self.should_input_embed:
@@ -393,7 +434,7 @@ class GPT(nn.Module):
         # wandb.log({'train/expected_deviation_mean': expected_deviation.mean()})
         # wandb.log({'train/expected_deviation_max': expected_deviation.max()})
         # wandb.log({'train/expected_deviation_min': expected_deviation.min()})
-        wandb_log({'train/logits_std': logits.std()}, self.global_step)
+        wandb_log({'train/logits_std': logits.std()})
         return logits, expected_deviation
 
     def step_(self, split, batch, batch_idx=None):
@@ -434,8 +475,8 @@ class GPT(nn.Module):
         probs = F.softmax(logits, dim=-1)
 
         entropy = -torch.sum(probs * torch.log(probs), dim=-1)  # Entropy across action-states
-        wandb_log({'entropy/action-state': entropy.mean()}, self.global_step)
-        wandb_log({'probs_std': probs.std()}, self.global_step)
+        wandb_log({'entropy/action-state': entropy.mean()})
+        wandb_log({'probs_std': probs.std()})
 
         # Use last position's logits as this is what we use for auto-regression / prediction (i.e. throwout
         #   most of the window generated with causal mask)
@@ -572,7 +613,7 @@ class GPT(nn.Module):
             target=target_idx,
             topk=top_acc_lvls.values(), )
         for lvl_i, lvl_name in enumerate(top_acc_lvls):
-            wandb_log({f'{name}/{split}/top{lvl_name}': acc[lvl_i]}, self.global_step)
+            wandb_log({f'{name}/{split}/top{lvl_name}': acc[lvl_i]})
         return acc
 
     def training_step(self, *args, **kwargs):

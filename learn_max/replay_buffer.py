@@ -100,6 +100,9 @@ class ReplayBuffers:
         self.train_buf = ReplayBuffer('train', self, self.train_dir, max_lru_size=max_lru_size)
         self.curr_buf = self.test_buf  # Fill test buff first
 
+    def is_train(self):
+        return self.curr_buf.is_train()
+
     def append(self, exp):
         if not self.overfit_to_short_term:
             self.curr_buf.append(exp)
@@ -149,7 +152,7 @@ class ReplayBuffer:
 
     def get(self, start, length=1, device='cpu'):
         if start < 0:
-            start = len(self) - abs(start)
+            start = len(self) - abs(start)  # index from end with negative start
         if self.overfit_to_short_term:
             return list(itertools.islice(self.replay_buffers.short_term_mem, start, start + length))
         if not (0 <= start < self.length):

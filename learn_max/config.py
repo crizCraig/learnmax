@@ -101,6 +101,7 @@ def add_model_specific_args(arg_parser: argparse.ArgumentParser, ) -> argparse.A
     arg_parser.add_argument('--gpt_batch_size', type=int, help="GPT batch size", default=8)
     arg_parser.add_argument('--gpt_seq_len', type=int, help="sequence length for the model (length of temporal window)", default=40)
     arg_parser.add_argument('--actions_per_batch', type=int, help="avoids overfitting with more data generated between updates", default=1)
+    arg_parser.add_argument('--salience_resume_path', type=str, help="path to salience pickles", default=None)
     return arg_parser
 
 

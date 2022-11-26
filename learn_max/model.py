@@ -129,7 +129,8 @@ class LearnMax(pl.LightningModule):
             pin_memory: bool = False,
 
             # Salience
-            non_internal_salience: bool = False,  # whether to use internal signals for salience
+            use_internal_salience: bool = True,  # whether to use internal signals for salience
+            salience_resume_path: str = None,  # path to salience pickles dir
     ):
         """
         Maximizing learning by predicting interesting actions
@@ -198,6 +199,7 @@ class LearnMax(pl.LightningModule):
         self.actions_per_batch = actions_per_batch
         self.data_dir = data_dir
         self.total_steps = 0
+        self.total_training_steps = 0
         self.total_rewards = []
         self.total_episode_steps = []
 
@@ -210,7 +212,9 @@ class LearnMax(pl.LightningModule):
         self.should_viz_predict_trajectory = should_viz_predict_trajectory
 
         # Salience
-        self.non_internal_salience = non_internal_salience
+        self.use_internal_salience = use_internal_salience
+        self.internal_salience_update_freq = self.gpt_seq_len // 2
+        self.salience_resume_path = salience_resume_path
 
         self.pin_memory = pin_memory
         self.num_workers = num_workers
@@ -353,7 +357,9 @@ class LearnMax(pl.LightningModule):
         self.episode_reward = 0
 
         # Replay buffers (test and train)
-        short_term_mem_length = 1000 if self.should_overfit_gpt else self.gpt_seq_len * 5
+        short_term_mem_length = (
+            1000 if self.should_overfit_gpt else self.gpt_seq_len * self.gpt_batch_size
+        )
         frames_per_file = max(self.dvq_batch_size,
                               self.gpt_seq_len * self.gpt_batch_size + self.get_num_extra_seq_samples())
         self.replay_buffers = ReplayBuffers(env_id=self.env_id, short_term_mem_max_length=short_term_mem_length,
@@ -361,7 +367,7 @@ class LearnMax(pl.LightningModule):
                                             train_to_test_collection_ratio=train_to_test_collection_ratio,
                                             # Get a full val batch when training starts
                                             frames_per_file=frames_per_file)
-        self.salience_store = SalienceStore(self.replay_buffers, gpt_seq_len)
+        self.salience_store = SalienceStore(self.replay_buffers, gpt_seq_len, salience_resume_path)
         self.train_buf = self.replay_buffers.train_buf
         self.test_buf = self.replay_buffers.test_buf
         self.recent_experience = self.replay_buffers.short_term_mem
@@ -491,6 +497,7 @@ class LearnMax(pl.LightningModule):
         action, predicted_trajectory = self.agent.get_action(self.agent_state, self.device)
         next_state, reward, done, info = self.env.step(action[0])
         self.episode_steps += 1
+        self.total_steps += 1
         self.episode_reward += reward
         next_agent_state = self.get_agent_state(next_state)
         exp = Experience(state=self.agent_state, action=action[0], reward=reward, done=done,
@@ -499,6 +506,16 @@ class LearnMax(pl.LightningModule):
         self.replay_buffers.append(exp)
 
         self.predicted_trajectory_buffer.append(predicted_trajectory)
+
+        if (
+                self.use_internal_salience and
+                self.replay_buffers.is_train() and
+                self.total_steps % 2 * self.internal_salience_update_freq == 0  # TODO: parameterize this 2? It's the minimum for sequence diff so...
+        ):
+            # Use internal signals (e.g. logits) for salience
+            # start_detect = time.time()
+            self.detect_salience()
+            # log.info(f'Salience detection took {time.time() - start_detect} seconds')
 
         # Creates new AgentState from same next_state as above so replay_i is correct
         self.agent_state = self.get_agent_state(next_state)
@@ -513,13 +530,19 @@ class LearnMax(pl.LightningModule):
             self.episode_steps = 0
             self.episode_reward = 0
 
+    @no_train
     def detect_salience(self):
         two_sequence_size = 2 * self.gpt.frames_in_sequence_window
-        assert self.replay_buffers.train_buf.frames_per_file >= two_sequence_size, \
+        assert len(self.replay_buffers.short_term_mem) >= two_sequence_size, \
             'Not enough contiguous experience to detect salience'
-        actions, just_died, look_back, z_q_embed, z_q_ind, replay_ind = self.get_recent_experience(
-            max_size=2 * self.gpt.frames_in_sequence_window,
-            train_only=True)
+        (actions,
+         just_died,
+         look_back,
+         z_q_embed,
+         z_q_ind,
+         replay_ind,
+         ) = self.get_recent_experience(
+            max_size=2 * self.gpt.frames_in_sequence_window, train_only=True)
         # TODO: Try feeding in longer sequences? We'll get more efficient use of windows in detect_salience, but
         #   have more potential overlap between steps when weights may not have changed much.
         if look_back >= 2 * self.gpt.frames_in_sequence_window:
@@ -530,10 +553,10 @@ class LearnMax(pl.LightningModule):
             saliences = self.gpt.detect_salience(actions, z_q_ind, z_q_embed, replay_ind)
             if saliences:
                 self.salience_store.add(saliences, self.dvq.decoder, self.device)
-            salient_replay_ind = [s['replay_ind'] for s in saliences]
-            FiS = self.gpt.frames_in_sequence_window
-            if salient_replay_ind:
-                self.viz_salience(FiS, salient_replay_ind)
+                salient_replay_ind = [s['replay_ind'] for s in saliences]
+                FiS = self.gpt.frames_in_sequence_window
+                if salient_replay_ind:
+                    self.viz_salience(FiS, salient_replay_ind)
 
     def viz_salience(self, FiS, salient_replay_i):
         os.makedirs(f'{ROOT_DIR}/images/viz_salience', exist_ok=True)
@@ -564,7 +587,7 @@ class LearnMax(pl.LightningModule):
         actions, agent_states, dones, new_states, rewards, states, indices = (None, None, None, None, None, None, None)
 
         while True:
-            if self.total_steps == 0 or 'OVERFIT' not in os.environ:
+            if self.total_training_steps == 0 or 'OVERFIT' not in os.environ:
                 # TODO: Move this tuple into a @dataclass
                 (states,
                  actions,
@@ -583,7 +606,7 @@ class LearnMax(pl.LightningModule):
                 agent_state = self.agent_states_to_dict(agent_states[idx])
                 yield states[idx], actions[idx], rewards[idx], dones[idx], new_states[idx], agent_state
 
-            self.total_steps += 1
+            self.total_training_steps += 1
 
             # if self.total_steps % 1000 == 0:
             #     from guppy import hpy
@@ -591,7 +614,7 @@ class LearnMax(pl.LightningModule):
             #     print('heap stats', h.heap())
 
             # Simulates epochs
-            if self.total_steps % self.batches_per_epoch == 0:
+            if self.total_training_steps % self.batches_per_epoch == 0:
                 break
 
     def validation_batch_gen(self, ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -805,9 +828,6 @@ class LearnMax(pl.LightningModule):
             else:
                 gpt_ind, actions = self.gpt.get_batch_vars(batch)
                 gpt_ret = self.gpt.training_step(batch=(gpt_ind, actions), batch_idx=batch_idx)
-                if not self.non_internal_salience:
-                    # Use internal signals (e.g. logits) for salience
-                    self.detect_salience()
             self.gpt.global_step = self.global_step
 
             # Visualization steps
@@ -878,7 +898,7 @@ class LearnMax(pl.LightningModule):
             'lightning/episode_steps': self.total_episode_steps[-1] if self.total_episode_steps else 0,
         })
 
-        wandb_log({'loss/train': loss}, self.global_step)
+        wandb_log({'loss/train': loss})
 
         wandb_check_flush(batch_idx)
 
@@ -897,7 +917,7 @@ class LearnMax(pl.LightningModule):
                 gpt_ind, actions = self.gpt.get_batch_vars(batch)
                 gpt_ret = self.gpt.validation_step(batch=(gpt_ind, actions), batch_idx=batch_idx)
             loss = gpt_ret['loss']
-            wandb_log({'loss/test': loss}, self.global_step)
+            wandb_log({'loss/test': loss})
             log.info(f'Validation loss {loss}, batch length {len(batch)}')
             self.log_dict({'lightning/val_loss': loss})
         else:
@@ -1145,7 +1165,7 @@ class LearnMax(pl.LightningModule):
         filename = f'{folder}/viz_gpt_e_{self.current_epoch}_b_{batch_idx}{postfix}.png'
         log.info(f'Saving gpt viz to {filename}')
         im.save(filename)
-        # wandb_log({'train/gpt-viz': [wandb.Image(im)]}, self.global_step)  # Just save locally
+        # wandb_log({'train/gpt-viz': [wandb.Image(im)]})  # Just save locally
 
             # fig1 = plt.figure(figsize=(num_imgs_per_row, 1))
             # ax1 = fig1.add_subplot(111)
@@ -1449,6 +1469,7 @@ class LearnMax(pl.LightningModule):
 
         totals = [0.1, 1.1, 0.8, 0.6]
 
+        Algo steps:
         * take the transformer's input sequence of z embeddings and softmax entropy as input to tree search
           (note that entropy is the proxy we are using for uncertainty)
         * we are predicting action-states, so given state s0, predict num_actions * num_z
@@ -1629,7 +1650,7 @@ class LearnMax(pl.LightningModule):
         For subsequent levels, the batch will represent different possible futures
         For ALL levels, only the last action in the window matters
 
-        TODO: Find salient events in this search:
+        TODO: Find salient events in this search: Done???
             Look for when sets of high prob (2x random?) reachable states (not action_states) change significantly.
             So instead of just jumping up and down and coming back to the same set of reachable states over 4-5 (num_levels)
             actions, moving right allows reaching the ladder state or the falling states or the ground states.
@@ -1724,9 +1745,9 @@ class LearnMax(pl.LightningModule):
             if should_log_wandb:
                 # Log p(s|a)
                 max_p_s_given_a = probs.max(dim=-1)
-                wandb_log({f'max p(s|a)/max_a': max_p_s_given_a.values.max()}, self.global_step)
-                wandb_log({f'max p(s|a)/mean_a': max_p_s_given_a.values.mean()}, self.global_step)
-                wandb_log({f'max p(s|a)/min_a': max_p_s_given_a.values.min()}, self.global_step)
+                wandb_log({f'max p(s|a)/max_a': max_p_s_given_a.values.max()})
+                wandb_log({f'max p(s|a)/mean_a': max_p_s_given_a.values.mean()})
+                wandb_log({f'max p(s|a)/min_a': max_p_s_given_a.values.min()})
 
             # TODO: Use bayes to verify logit normalization across states = actions
 
@@ -1734,9 +1755,9 @@ class LearnMax(pl.LightningModule):
             entropy = -torch.sum(probs * torch.log(probs), dim=-1)
 
             if should_log_wandb:
-                wandb_log({f'entropy/action min': entropy.min()}, self.global_step)
-                wandb_log({f'entropy/action mean': entropy.mean()}, self.global_step)
-                wandb_log({f'entropy/action max': entropy.max()}, self.global_step)
+                wandb_log({f'entropy/action min': entropy.min()})
+                wandb_log({f'entropy/action mean': entropy.mean()})
+                wandb_log({f'entropy/action max': entropy.max()})
 
             # Add entropy gathered thus far in branches to path entropy of most recent action
             entropy_total = entropy_branches[:, -1]  # Summed along the way so last index has total
@@ -1756,9 +1777,9 @@ class LearnMax(pl.LightningModule):
             actions, action_entropy_path, actions_flat = topk_interesting(entropy_total, k=beam_width,
                                                                           rand_half='RAND_HALF' in os.environ)
             if should_log_wandb:
-                wandb_log({f'entropy/traj min': action_entropy_path.min()}, self.global_step)
-                wandb_log({f'entropy/traj mean': action_entropy_path.mean()}, self.global_step)
-                wandb_log({f'entropy/traj max': action_entropy_path.max()}, self.global_step)
+                wandb_log({f'entropy/traj min': action_entropy_path.min()})
+                wandb_log({f'entropy/traj mean': action_entropy_path.mean()})
+                wandb_log({f'entropy/traj max': action_entropy_path.max()})
             action_states = get_action_states(logits, actions_flat)
 
             # Branch out by copying beginning of path for each new action state and appending new action state to end
@@ -1886,9 +1907,9 @@ class LearnMax(pl.LightningModule):
         """
         probs = F.softmax(logits, dim=-1)  # Probability of action given resulting state
         max_p_a_given_rs = probs.max(dim=-1)  # Max prob action for each state
-        wandb_log({f'max p(a|rs)/max_rs': max_p_a_given_rs.values.max()}, self.global_step)
-        wandb_log({f'max p(a|rs)/mean_rs': max_p_a_given_rs.values.mean()}, self.global_step)
-        wandb_log({f'max p(a|rs)/min_rs': max_p_a_given_rs.values.min()}, self.global_step)
+        wandb_log({f'max p(a|rs)/max_rs': max_p_a_given_rs.values.max()})
+        wandb_log({f'max p(a|rs)/mean_rs': max_p_a_given_rs.values.mean()})
+        wandb_log({f'max p(a|rs)/min_rs': max_p_a_given_rs.values.min()})
 
     # Perform gradient clipping on gradients associated with gpt (optimizer_idx=1)
     # def configure_gradient_clipping(self, optimizer, optimizer_idx, gradient_clip_val, gradient_clip_algorithm):

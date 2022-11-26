@@ -168,16 +168,16 @@ class VQVAE(dvq_module):
             # Includes gpt block size in shape, flatten first two dimensions
             x = x.view(x.shape[0] * x.shape[1], x.shape[2], x.shape[3], x.shape[4])
         x, x_hat, z_q_emb, z_q_flat, latent_loss, recon_loss, dvq_loss, z_q_ind = self.forward(x)
-        wandb_log({'dvq_val_recon_loss': recon_loss}, self.global_step)
-        wandb_log({'dvq_val_latent_loss': latent_loss}, self.global_step)
+        wandb_log({'dvq_val_recon_loss': recon_loss})
+        wandb_log({'dvq_val_latent_loss': latent_loss})
 
         # debugging: cluster perplexity. when perplexity == num_embeddings then all clusters are used exactly equally
         encodings = F.one_hot(z_q_ind, self.quantizer.n_embed).float().reshape(-1, self.quantizer.n_embed)
         avg_probs = encodings.mean(0)
         perplexity = (-(avg_probs * torch.log(avg_probs + 1e-10)).sum()).exp()
         cluster_use = torch.sum(avg_probs > 0)
-        wandb_log({'dvq_val_perplexity': perplexity}, self.global_step)
-        wandb_log({'dvq_val_cluster_use': cluster_use}, self.global_step)
+        wandb_log({'dvq_val_perplexity': perplexity})
+        wandb_log({'dvq_val_cluster_use': cluster_use})
         return dvq_loss, recon_loss, latent_loss, x_hat, z_q_ind, z_q_flat
 
     def configure_optimizers(self):

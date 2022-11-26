@@ -221,7 +221,7 @@ def _wandb_log_closure():
     # allows quickly seeing initial fast-changing metrics in wandb
     freq = 1
 
-    def append(msg_dict, global_step=None):
+    def _wandb_log(msg_dict):
         nonlocal accum
         for k in msg_dict:
             accum[k].append(msg_dict[k])
@@ -238,9 +238,9 @@ def _wandb_log_closure():
             accum.clear()
             return True
         except Exception as e:
-            log.error(f'Error logging to wandb {e}')
+            _wandb_log.error(f'Error logging to wandb {e}')
         return False
-    return append, check_flush
+    return _wandb_log, check_flush
 
 
 wandb_log, wandb_check_flush = _wandb_log_closure()
@@ -406,10 +406,10 @@ def torch_random_choice(tensor, salient_k):
     return samples, idx
 
 
-def viz_experiences(experiences, folder, dvq_decoder, device):
+def viz_experiences(experiences, folder, dvq_decoder, device, file_prefix=''):
     for i, x in enumerate(experiences):
         imo = viz_experience(x, dvq_decoder, device)
-        filename = f'{folder}/{str(i).zfill(9)}.png'
+        filename = f'{folder}/{file_prefix+ str(i).zfill(9)}.png'
         imo.save(filename)
 
 

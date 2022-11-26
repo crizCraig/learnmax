@@ -9,6 +9,7 @@ from torch import nn
 
 from learn_max.dvq.model.quantize import VQVAEQuantize
 from learn_max.mingpt.utils import add_action_and_delim_ind
+from learn_max.utils import wandb_log
 
 
 @torch.no_grad()
@@ -19,6 +20,8 @@ def detect_salience(actions, z_q_ind, z_q_emb, replay_ind, seq_len, frames_in_se
     Compare subsequent sequences of length frames_in_sequence_window. If the patch-wise difference
     is greater than the 90th percentile of previously seen data (approximated by a t-digest), then return the
     index at the end of the first sequence.
+
+    Expect either logits or use_emb, not both or neither (xor)
     """
     # Representation hierarchy is batch, sequences, frames, patches, logits
     # Sum the whole sequence of logits in order to get a description of what happened in the sequence
@@ -29,6 +32,9 @@ def detect_salience(actions, z_q_ind, z_q_emb, replay_ind, seq_len, frames_in_se
     FiS = frames_in_sequence_window
     TiF = state_tokens_in_frame if logits is None else tokens_in_frame  # actions part of state with logits (FINE)
     S = FiS * TiF
+
+    if logits is None and use_emb is False:
+        raise RuntimeError('Int (encoder cluster centroid) mode not supported')
 
     # Deterministically squash saliency, i.e. not relative to current batch
     # z_q_ind /= (S * Z / 50)
@@ -158,12 +164,19 @@ def detect_salience(actions, z_q_ind, z_q_emb, replay_ind, seq_len, frames_in_se
 
     salience = salience.detach().cpu().numpy()
     ret = []
-    if tdigest.n > min_reservoir:  # Get a good population before sampling top percentile
+    if tdigest.n > min_reservoir:  # Get a big pool before sampling top percentile
         for i, s in enumerate(salience):
+            # TODO: Test tdigest 10pct, 90pct with random numbers, should not increase!!!
+            tdigest_50pct = tdigest.percentile(50)
+            tdigest_90pct = tdigest.percentile(90)
+            wandb_log({'salience/salience_candidate': s})
+            wandb_log({'salience/tdigest_min': tdigest.percentile(0)})
+            wandb_log({'salience/tdigest_50pct': tdigest_50pct})
+            wandb_log({'salience/tdigest_90pct': tdigest_90pct})
             if 'LEAST_SALIENT' in os.environ:
-                is_salient = s < tdigest.percentile(10)
+                is_salient = s < tdigest_50pct
             else:
-                is_salient = s > tdigest.percentile(90)
+                is_salient = s > tdigest_90pct
             if is_salient:
                 # TODO: We should append more than one frame for the event so that we can more
                 #   easily detect duplicate salient events. This as the middle frame may be different
