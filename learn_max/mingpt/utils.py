@@ -50,7 +50,9 @@ def sample(model, x, steps, temperature=1.0, sample=False, top_k=None):
 
 
 def get_num_embeddings(num_state_embeddings, num_actions):
-    return num_state_embeddings + num_actions + 1  # actions + 1 for frame delimiter
+    # TODO: Add 1 token for salience level
+    ret = num_state_embeddings + num_actions + 1  # actions + 1 for frame delimiter
+    return ret
 
 
 def get_action_and_delim_emb(actions, z_q_ind, z_q_emb, num_state_embeddings, num_actions, tokens_in_frame):

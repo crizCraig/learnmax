@@ -276,7 +276,8 @@ class DecayLR(pl.Callback):
             g['lr'] = t
 
 def cli_main():
-    # TODO: Delete this. Run VQVAE through its parent LearnMax now
+    # Note this is for training the dvq by itself on CIFAR. To train for learnmax,
+    # use learnmax.cli_main().
     pl.seed_everything(1337)
 
     # -------------------------------------------------------------------------

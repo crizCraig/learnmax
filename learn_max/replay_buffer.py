@@ -12,6 +12,12 @@ from learn_max.agent import AgentState
 from learn_max.constants import ROOT_DIR, RUN_ID, DATE_STR
 from loguru import logger as log
 
+@dataclass
+class SalientExperience:
+    cluster_index: int
+    replay_index: int = None
+    split: str = None  # TODO: Add level
+
 
 @dataclass
 class Experience:
@@ -38,15 +44,18 @@ class Experience:
 
 
 class ReplayBuffers:
-    def __init__(self,
-                 env_id,
-                 short_term_mem_max_length,
-                 data_dir=None,
-                 frames_per_file=200,
-                 train_to_test_collection_ratio=10,
-                 max_lru_size=100,
-                 overfit_to_short_term=False,
-                 verbose=True, ):
+    def __init__(
+            self,
+            env_id,
+            short_term_mem_max_length,
+            data_dir=None,
+            frames_per_file=200,
+            train_to_test_collection_ratio=10,
+            max_lru_size=100,
+            overfit_to_short_term=False,
+            verbose=True,
+            salience_level=0
+    ):
         """
         Disk backed (through torch.save()) replay buffer that moves experiences off-GPU to increase size
          and get better catastrophic forgetting avoidance with
@@ -75,6 +84,7 @@ class ReplayBuffers:
         self.frames_per_file = frames_per_file
         self.overfit_to_short_term = overfit_to_short_term
         self.verbose = verbose
+        self.salience_level = salience_level
         if verbose and overfit_to_short_term:
             log.warning('Overfitting to short term mem')
 
@@ -85,10 +95,10 @@ class ReplayBuffers:
         self.train_to_test_collection_ratio = train_to_test_collection_ratio  # Episodes to train vs test on
         self.flush_i = 0  # Number of all replay buffers' flushes to disk
         self.total_length = 0  # Count of experiences in all buffers
-        root_data_dir = ROOT_DIR + '/data'
+        root_data_dir = f'{ROOT_DIR}/data/replay_buff'
         os.makedirs(root_data_dir, exist_ok=True)
         if data_dir is None:
-            data_dir = f'{root_data_dir}/replay_buff_{DATE_STR}_r-{RUN_ID}_env-{env_id}'
+            data_dir = f'{root_data_dir}/d_{DATE_STR}_r-{RUN_ID}_env-{env_id}/lvl_{salience_level}'
             os.makedirs(data_dir)
         else:
             raise NotImplementedError('Need to get replay_index from last episode_end_i and fill files of buffers')
@@ -107,7 +117,7 @@ class ReplayBuffers:
         if not self.overfit_to_short_term:
             self.curr_buf.append(exp)
         self.short_term_mem.append(exp)
-        if exp.done:
+        if self.salience_level == 0 and exp.done:
             self.episode_i += 1
         if self.curr_buf.just_flushed:
             self.flush_i += 1
@@ -135,6 +145,7 @@ class ReplayBuffer:
     def __init__(self, split, replay_buffers, data_dir, max_lru_size):
         self.split = split  # train or test
         self.replay_buffers = replay_buffers
+        self.salience_level = replay_buffers.salience_level
         self.frames_per_file = replay_buffers.frames_per_file
         self.overfit_to_short_term = replay_buffers.overfit_to_short_term
         self._flush_buf = []
@@ -190,8 +201,10 @@ class ReplayBuffer:
 
     def append(self, exp):
         assert exp.replay_index is None
-        exp.state.split = 1 if self.is_test() else 0
-        exp.new_state.split = exp.state.split
+        split = 'test' if self.is_test() else 'train'
+        if self.salience_level == 0:
+            exp.state.split = split
+            exp.new_state.split = split
         exp.split = self.split
         exp.replay_index = self.length
         self._flush_buf.append(exp)
@@ -244,12 +257,6 @@ class ReplayBuffer:
 
     def _get_filename(self, append_i, mode):
         return f'{self.data_dir}/replay_buffer_{mode}_{str(int(append_i)).zfill(12)}.pt'
-
-    def _cache(self, episode):
-        # TODO: if already in linked list, delete and add to end
-        # TODO: Add to end of linked list and to map
-        # TODO: Delete from beginning of linked list (and map) if full
-        pass
 
 
 class LRU:

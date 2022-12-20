@@ -7,13 +7,16 @@ import torch
 from tdigest import TDigest
 from torch import nn
 
+from loguru import logger as log
+
 from learn_max.dvq.model.quantize import VQVAEQuantize
-from learn_max.mingpt.utils import add_action_and_delim_ind
+from learn_max.mingpt.utils import add_action_and_delim_ind, get_num_embeddings
 from learn_max.utils import wandb_log
 
 
 @torch.no_grad()
-def detect_salience(actions, z_q_ind, z_q_emb, replay_ind, seq_len, frames_in_sequence_window, state_tokens_in_frame,
+def detect_salience(actions, z_q_ind, z_q_emb, replay_ind, seq_len,
+                    frames_in_sequence_window, state_tokens_in_frame,
                     tokens_in_frame, num_state_embeddings, num_actions, tdigest, min_reservoir=1000,
                     use_emb=False, logits=None):
     """
@@ -22,6 +25,8 @@ def detect_salience(actions, z_q_ind, z_q_emb, replay_ind, seq_len, frames_in_se
     index at the end of the first sequence.
 
     Expect either logits or use_emb, not both or neither (xor)
+
+    @param logits: Allows detecting a big change in the predicted future not just the current observed state
     """
     # Representation hierarchy is batch, sequences, frames, patches, logits
     # Sum the whole sequence of logits in order to get a description of what happened in the sequence
@@ -56,7 +61,9 @@ def detect_salience(actions, z_q_ind, z_q_emb, replay_ind, seq_len, frames_in_se
     # Note: Input sequences needs to be sampled sequentially for this to work.
     # Slide the window across the batch and check for salience in train. Salience can pop up here
     #   when it didn't in realtime due to changing weights/logits
-    B, _FiS, H, W, E = z_q_emb.shape
+    B, _FiS, H, W = z_q_ind.shape
+    if use_emb:
+        E = z_q_emb.shape[-1]
     L = None
     z_q_ind = z_q_ind.reshape(B, _FiS, H * W)
 
@@ -261,12 +268,7 @@ def _test_detect_salience(num_sequences=2, use_emb=False):
     embedding_size = 30
     batch_size = 1
     # num_input_embeddings = get_num_embeddings(num_state_embeddings, num_actions)
-    z_q_emb = -1 + 2 * torch.rand(
-        batch_size,
-        num_sequences * frames_in_sequence_window,
-        patch_width,
-        patch_width,
-        embedding_size)
+
     z_q_ind = torch.randint(
         low=0,
         high=num_state_embeddings,
@@ -274,6 +276,24 @@ def _test_detect_salience(num_sequences=2, use_emb=False):
               num_sequences * frames_in_sequence_window,
               patch_width,
               patch_width))
+    if use_emb:
+        logits = None
+        z_q_emb = -1 + 2 * torch.rand(
+            batch_size,
+            num_sequences * frames_in_sequence_window,
+            patch_width,
+            patch_width,
+            embedding_size)
+    else:
+        z_q_emb = None
+        logits = -1 + 2 * torch.rand(
+            batch_size,
+            num_sequences * frames_in_sequence_window,  # 2 * 8
+            tokens_in_frame,
+            get_num_embeddings(num_state_embeddings, num_actions)
+        )
+    # Logit shape: B, _FiS, state_tokens_in_frame, L (263???)  1,16,123,263
+
     replay_ind = torch.arange(0, num_frames).unsqueeze(0)
     seq_len = frames_in_sequence_window * state_tokens_in_frame
     tdigest = TDigest()
@@ -282,12 +302,14 @@ def _test_detect_salience(num_sequences=2, use_emb=False):
         # Fill up with zeroes
         # actions, z_q_ind, z_q_emb, replay_ind, seq_len, frames_in_sequence_window, tokens_in_frame,
         #                     state_tokens_in_frame, num_state_embeddings, num_actions, tdigest,
-        detect_salience(actions, 0 * z_q_ind, 0 * z_q_emb, replay_ind, seq_len, frames_in_sequence_window,
+        zero_z_q_emb = torch.zeros_like(z_q_emb) if use_emb else None
+        zero_logits = torch.zeros_like(logits) if not use_emb else None
+        detect_salience(actions, 0 * z_q_ind, zero_z_q_emb, replay_ind, seq_len, frames_in_sequence_window,
                         state_tokens_in_frame, tokens_in_frame, num_state_embeddings, num_actions, tdigest,
-                        min_reservoir=min_reservoir, use_emb=use_emb)
+                        min_reservoir=min_reservoir, use_emb=use_emb, logits=zero_logits)
     ret = detect_salience(actions, z_q_ind, z_q_emb, replay_ind, seq_len, frames_in_sequence_window,
                           state_tokens_in_frame, tokens_in_frame, num_state_embeddings, num_actions, tdigest,
-                          min_reservoir=min_reservoir, use_emb=use_emb,)
+                          min_reservoir=min_reservoir, use_emb=use_emb, logits=logits,)
     assert len(ret) == num_frames - 2 * frames_in_sequence_window + 1, 'Two sequences slid across input'
     return ret
 
@@ -318,9 +340,9 @@ def test_all():
     start = time.time()
     test_3_sequences_emb()
     test_2_sequences_emb()
-    test_3_sequences()
+    # test_3_sequences()
     test_2_sequences()
-    print(f'Tested salience detection in {round(1e3*(time.time() - start))}ms')
+    log.success(f'Tested salience detection in {round(1e3*(time.time() - start))}ms')
 
 
 def test_emb():

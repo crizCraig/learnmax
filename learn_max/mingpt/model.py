@@ -132,6 +132,8 @@ class GPT(nn.Module):
         self.is_single_token2 = is_single_token2
         self.batch_size = batch_size
         self.frames_in_sequence_window = frames_in_sequence_window
+        self.sequences_per_salient_event = 2
+        self.frames_in_salient_event = self.frames_in_sequence_window * self.sequences_per_salient_event
         self.state_tokens_in_frame = state_tokens_in_frame
         self.tokens_in_frame = tokens_in_frame
 
@@ -147,7 +149,12 @@ class GPT(nn.Module):
         embedding_dim = input_embedding_dim  # + action_embedding_dim
         # self.dvq_proj = nn.Linear(input_embedding_dim, embedding_dim)
         assert embedding_dim % n_head == 0, f'Embedding len {embedding_dim} not evenly divisible by number of heads {n_head}'
-        self.tok_emb = nn.Embedding(num_input_embeddings, input_embedding_dim)  # This should be num of z_q_emb,
+
+        # self.action_embedding = nn.Embedding(num_actions, action_embedding_dim)
+
+        # This should be num of z_q_emb
+        self.tok_emb = nn.Embedding(num_input_embeddings, input_embedding_dim)
+        self.tok_emb_salience_levels = []  # TODO: Add to this as we cluster new salience levels
 
         # block_size is the length of the model's context window in time
         if is_single_token2:
@@ -172,9 +179,10 @@ class GPT(nn.Module):
         # decoder: at the end one more layernorm and decode the answers
         self.ln_f = nn.LayerNorm(out_embedding_dim)
         self.logit_p_head = nn.Linear(out_embedding_dim, output_size, bias=False)  # no need for extra bias due to one in ln_f
+        self.salient_logit_heads = []  # TODO: Add to this as we cluster new salience levels
 
         # TODO: Remove or change to deviation over longer timescale - we want to know how the entropy of the
-        #   probs changes over time so that, in the case of an aleotoric process like a slot machine, we see that
+        #   probs changes over time so that, in the case of an aleatoric process like a slot machine, we see that
         #   while there may be patterns in recent data, the system over long stretches is random. The deviation head
         #   just predicts instantaneous changes to probability and so does not do this.
         self.deviation_head = nn.Linear(out_embedding_dim, output_size, bias=False)   # mean deviation
@@ -196,13 +204,8 @@ class GPT(nn.Module):
 
         self.global_step = 0
 
-        # Consider ddsketch to reduce error since we're interested in long tail salience
-        # https://blog.acolyer.org/2019/09/06/ddsketch/
-        self.tdigest = TDigest()
-        self.salience_reservoir_n = 0
-
         # Track most recent maxlen batches of logits so we can normalize logits for salience detection
-        logit_sum_len = 10
+        logit_sum_len = 100  # TODO: consider increasing to get better normalization
         self.logit_dq_sum = collections.deque(maxlen=logit_sum_len)
         self.logit_dq_numel = collections.deque(maxlen=logit_sum_len)
         self.logit_dq_std = collections.deque(maxlen=logit_sum_len)
@@ -315,13 +318,25 @@ class GPT(nn.Module):
             print('trajectories: ', len(self.trajectory_counts))
             print('max_trajectory_count: ', self.max_trajectory_count)
 
-    def forward(self, *args):
+    def forward(self, *args, salience_level=0):
         if self.is_single_token2:
             embed, z_q_ind, actions = args
             return self.single_token_forward(actions, embed, z_q_ind)
+        elif salience_level != 0:
+            # TODO: Create embedding for salience level context token and put in tokens
+            # TODO: Create embedding for goal token and put in tokens
+            # TODO: Put this in train_batch_gen of learnmax so that you can
+            #  mix salience levels in a forward
+            if len(self.tok_emb_salience_levels) < salience_level:
+                self.tok_emb_salience_levels.append(nn.Embedding(2**14, self.embedding_dim))
+            # No need for delim token because each token represents a unique timestep
+            # TODO: Add position token
         else:
             z_q_ind, actions = args
+
+            # TODO: Create embedding for goal token and put in tokens
             z_q_ind = self.add_action_and_delim(actions, z_q_ind)
+
             B, FiS, TiF = z_q_ind.size()  # batch, frames in sequence, tokens in frame
             assert TiF == self.tokens_in_frame
             assert TiF * FiS <= self.seq_len, 'Cannot forward, model sequence length is exhausted.'
@@ -339,70 +354,54 @@ class GPT(nn.Module):
             x = self.blocks(x)
             x = self.ln_f(x)
             logits = self.logit_p_head(x)
-            expected_deviation = self.deviation_head(
-                x)  # Uses mean deviation instead of standard deviation https://stats.stackexchange.com/q/81986/18187
+
+            # Uses mean deviation instead of standard deviation
+            # https://stats.stackexchange.com/q/81986/18187
+            expected_deviation = self.deviation_head(x)
+
             wandb_log({'train/logits_std': logits.std()})
 
             return logits, expected_deviation
 
-    def detect_salience(self, actions, z_q_ind, z_q_emb, replay_ind, use_logits=True):
+    def get_salience_logits(self, actions, z_q_ind, z_q_emb, replay_ind):
         """
-
+        Get logits for z_q_ind and actions
         @param actions:
         @param z_q_ind:
         @param z_q_emb:
         @param replay_ind:
-        @param use_logits: Allows detecting a big change in the predicted future not just the current observed state
+
             For example, if I open a door, there are lots of new possibilities.
         @return:
         """
-        def get_logits():
-            """Get logits for z_q_ind and actions"""
-            _, S, H, W = z_q_ind.shape
-            # Break forward up into multiple self.frames_in_sequence_window tensors
-            z_q_ind_f = z_q_ind.reshape(S//self.frames_in_sequence_window, -1, H*W)
-            actions_f = actions.reshape(S//self.frames_in_sequence_window, -1)
-            logits, expected_deviation = self.forward(z_q_ind_f, actions_f)
-            # TODO:
-
-            # Normalize logits - These need to be normalized by dividing by the average of recent logits,
-            #   that way we can compare old saliences to new ones even when logits increase over time.
-            #   Thinking the increasing logits could be from GELU activations where activations are
-            #   increasingly surpassing the zero cuttoff.
-            #   Since the data in a minibatch is sequential, we need to average multiple minibatches
-            #   to reduce correlation and determine a more global salience.
+        _, S, H, W = z_q_ind.shape
+        # Break forward up into multiple self.frames_in_sequence_window tensors
+        z_q_ind_f = z_q_ind.reshape(S//self.frames_in_sequence_window, -1, H*W)
+        actions_f = actions.reshape(S//self.frames_in_sequence_window, -1)
+        logits, expected_deviation = self.forward(z_q_ind_f, actions_f)
+        # Normalize logits - These need to be normalized by dividing by the average of recent logits,
+        #   that way we can compare old saliences to new ones even when logits increase over time.
+        #   Thinking the increasing logits could be from GELU activations where activations are
+        #   increasingly surpassing the zero cuttoff.
+        #   Since the data in a minibatch is sequential, we need to average multiple minibatches
+        #   to reduce correlation and determine a more global salience.
+        SHOULD_NORMALIZE = False
+        if SHOULD_NORMALIZE:
             self.logit_dq_sum.append(float(logits.sum()))
             self.logit_dq_numel.append(float(logits.numel()))
             self.logit_dq_std.append(float(logits.std()))
-            if len(self.logit_dq_std) < 10:
+            if len(self.logit_dq_std) < self.logit_dq_std.maxlen:
                 return None  # need to bootstrap more std()
             avg_recent = sum(self.logit_dq_sum) / sum(self.logit_dq_numel)
             if len(self.logit_dq_sum) == 1:
                 assert np.isclose(float(logits.mean()), avg_recent)
             ret = (logits - avg_recent) / np.mean(self.logit_dq_std)  # z-normalize
-            assert ret.std() < 1E10, 'Logit variance is blowing up'
-            wandb_log({'salience/logits_u': logits.mean(), 'salience/logits_std': logits.std()})
+        else:
+            ret = logits
+        assert ret.std() < 1E10, 'Logit variance is blowing up'
+        wandb_log({'salience/logits_u': logits.mean(), 'salience/logits_std': logits.std()})
 
-            return ret   # W, (H*W+a+d) * FiS, E
-
-        if use_logits:
-            logits = get_logits()
-            if logits is None:
-                return
-        return detect_salience(actions=actions,
-                               z_q_ind=z_q_ind,
-                               z_q_emb=z_q_emb,
-                               replay_ind=replay_ind,
-                               seq_len=self.seq_len,
-                               frames_in_sequence_window=self.frames_in_sequence_window,
-                               tokens_in_frame=self.tokens_in_frame,
-                               state_tokens_in_frame=self.state_tokens_in_frame,
-                               num_state_embeddings=self.num_state_embeddings,
-                               num_actions=self.num_actions,
-                               tdigest=self.tdigest,
-                               use_emb=False, logits=logits,
-                               # use_emb=True, logits=None,
-                               )
+        return ret   # W, (H*W+a+d) * FiS, E
 
     def single_token_forward(self, actions, embed, idx):
         # if self.should_input_embed:
@@ -662,6 +661,7 @@ class GPT(nn.Module):
             return z_q_ind, actions
 
     def add_action_and_delim(self, actions, z_q_ind):
-        return add_action_and_delim_ind(actions, z_q_ind, self.num_state_embeddings, self.num_actions, self.tokens_in_frame)
-
-
+        return add_action_and_delim_ind(
+            actions, z_q_ind, self.num_state_embeddings, self.num_actions,
+            self.tokens_in_frame
+        )

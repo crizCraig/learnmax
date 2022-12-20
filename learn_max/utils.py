@@ -5,8 +5,6 @@ from datetime import datetime
 from functools import wraps
 from typing import List
 
-from einops import rearrange
-from loguru import logger as log
 import torch
 import numpy as np
 import wandb
@@ -14,7 +12,7 @@ from numpy import array
 from torch import nn
 from PIL import Image
 
-from learn_max.constants import DATE_FMT, WANDB_MAX_LOG_PERIOD
+from learn_max.constants import DATE_FMT, WANDB_MAX_LOG_PERIOD, ROOT_DIR, RUN_ID
 
 
 def topk_interesting(entropy, k, rand_half=False):
@@ -409,7 +407,7 @@ def torch_random_choice(tensor, salient_k):
 def viz_experiences(experiences, folder, dvq_decoder, device, file_prefix=''):
     for i, x in enumerate(experiences):
         imo = viz_experience(x, dvq_decoder, device)
-        filename = f'{folder}/{file_prefix+ str(i).zfill(9)}.png'
+        filename = f'{folder}/{file_prefix + str(i).zfill(9)}.png'
         imo.save(filename)
 
 
@@ -437,6 +435,19 @@ def viz_experience(x, dvq_decoder, device):
     imo = Image.fromarray(np.uint8(np.concatenate((im, imz), axis=0) * 255))
     return imo
 
+
+def viz_salience(FiS, salient_replay_i, replay_buffers, dvq_decoder, device, file_prefix=''):
+    os.makedirs(f'{ROOT_DIR}/images/viz_salience', exist_ok=True)
+    folder_prefix = f'{ROOT_DIR}/images/viz_salience/{get_date_str()}_r_{RUN_ID}'
+    for replay_i in salient_replay_i:
+        folder = f'{folder_prefix}_i_{int(replay_i)}'
+        os.makedirs(folder, exist_ok=True)
+        print('Saving salience to ' + folder)
+        # Use train_buf as we are sampling only from train w. train_only
+        # TODO: Use viz_experiences and get all replay_i instead of this loop
+        # Visualize a movie around the index
+        viz_experiences(replay_buffers.train_buf.get(start=replay_i - FiS + 1, length=FiS * 2), folder,
+                        dvq_decoder, device, file_prefix=file_prefix)
 
 if __name__ == '__main__':
     test_get_state()
