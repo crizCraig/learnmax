@@ -114,8 +114,8 @@ class SalienceLevel:
             salient_event = repeats[0]
             # TODO: Go back through replay buffer and find all experiences
             #  that are salient events and save them for training
-            self.replay_buffers.append(
-                # TODO: Add cluster points (core points) to salient experience
+            self.replay_buffers.append(  # At least salience level 1
+                # TODO: Add cluster points (core points) to salient experience (not just cluster index)
                 #   so that we can generalize to similar salient events (e.g. opening a new door
                 #   is thought to be promising for learning because previous doors have been)
                 SalientExperience(cluster_index=salient_event.cluster_index)
@@ -124,12 +124,14 @@ class SalienceLevel:
         if len(self.unclustered_points) % 10 == 0:
             log.info(f'Percentage of points needed to cluster: '
                      f'{100 * progress:.2f}%')
-        ret = defaultdict(bool)
+        ret = {'new_salience_level': False}
         if self.kdtree is not None:
             log.warning('Skipping clustering as we do not have stable clustering implemented')
         elif progress >= 1:
+            # TODO: Require fewer points for clusterings after the first
             self.cluster(dvq_decoder, device)
             ret['new_salience_level'] = True
+        ret['repeats'] = repeats
         return ret
 
     def detect_repeats(self, FiS, device, dvq_decoder, replay_buffers, saliences):

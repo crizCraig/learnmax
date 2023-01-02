@@ -10,14 +10,15 @@ from torch import nn
 from loguru import logger as log
 
 from learn_max.dvq.model.quantize import VQVAEQuantize
-from learn_max.mingpt.utils import add_action_and_delim_ind, get_num_embeddings
+from learn_max.mingpt.utils import get_num_output_embeddings
 from learn_max.utils import wandb_log
 
 
 @torch.no_grad()
 def detect_salience(actions, z_q_ind, z_q_emb, replay_ind, seq_len,
                     frames_in_sequence_window, state_tokens_in_frame,
-                    tokens_in_frame, num_state_embeddings, num_actions, tdigest, min_reservoir=1000,
+                    tokens_in_frame, num_state_embeddings, num_actions,
+                    tdigest, min_reservoir=1000,
                     use_emb=False, logits=None):
     """
     Compare subsequent sequences of length frames_in_sequence_window. If the patch-wise difference
@@ -290,7 +291,7 @@ def _test_detect_salience(num_sequences=2, use_emb=False):
             batch_size,
             num_sequences * frames_in_sequence_window,  # 2 * 8
             tokens_in_frame,
-            get_num_embeddings(num_state_embeddings, num_actions)
+            get_num_output_embeddings(num_state_embeddings, num_actions)
         )
     # Logit shape: B, _FiS, state_tokens_in_frame, L (263???)  1,16,123,263
 

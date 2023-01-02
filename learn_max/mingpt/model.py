@@ -19,7 +19,7 @@ from tdigest import TDigest
 from torch.nn import functional as F
 
 from learn_max.constants import ACC_LOG_PERIOD
-from learn_max.mingpt.utils import add_action_and_delim_ind
+from learn_max.mingpt.utils import add_non_sensory_tokens
 from learn_max.salience.detect_salience import detect_salience
 from learn_max.utils import accuracy, wandb_log, sa2as
 
@@ -133,7 +133,10 @@ class GPT(nn.Module):
         self.batch_size = batch_size
         self.frames_in_sequence_window = frames_in_sequence_window
         self.sequences_per_salient_event = 2
-        self.frames_in_salient_event = self.frames_in_sequence_window * self.sequences_per_salient_event
+        self.frames_in_salient_event = (
+            self.frames_in_sequence_window * self.sequences_per_salient_event
+        )
+        assert self.frames_in_salient_event > 0
         self.state_tokens_in_frame = state_tokens_in_frame
         self.tokens_in_frame = tokens_in_frame
 
@@ -318,29 +321,20 @@ class GPT(nn.Module):
             print('trajectories: ', len(self.trajectory_counts))
             print('max_trajectory_count: ', self.max_trajectory_count)
 
-    def forward(self, *args, salience_level=0):
+    def forward(self, *args):
         if self.is_single_token2:
             embed, z_q_ind, actions = args
             return self.single_token_forward(actions, embed, z_q_ind)
-        elif salience_level != 0:
-            # TODO: Create embedding for salience level context token and put in tokens
-            # TODO: Create embedding for goal token and put in tokens
-            # TODO: Put this in train_batch_gen of learnmax so that you can
-            #  mix salience levels in a forward
-            if len(self.tok_emb_salience_levels) < salience_level:
-                self.tok_emb_salience_levels.append(nn.Embedding(2**14, self.embedding_dim))
-            # No need for delim token because each token represents a unique timestep
-            # TODO: Add position token
         else:
-            z_q_ind, actions = args
+            z_q_ind, actions, salience_levels = args
 
-            # TODO: Create embedding for goal token and put in tokens
-            z_q_ind = self.add_action_and_delim(actions, z_q_ind)
+            # TODO: Create embedding for goal token and concatenate with other tokens
+            tok_ind = self.add_non_sensory_tokens(actions, z_q_ind, salience_levels)
 
-            B, FiS, TiF = z_q_ind.size()  # batch, frames in sequence, tokens in frame
+            B, FiS, TiF = tok_ind.size()  # batch, frames in sequence, tokens in frame
             assert TiF == self.tokens_in_frame
             assert TiF * FiS <= self.seq_len, 'Cannot forward, model sequence length is exhausted.'
-            token_embed = self.tok_emb(z_q_ind)  # each input token index maps to a (learnable) vector
+            token_embed = self.tok_emb(tok_ind)  # each input token index maps to a (learnable) vector
             assert FiS <= self.frames_in_sequence_window
             assert TiF <= self.tokens_in_frame
 
@@ -446,7 +440,7 @@ class GPT(nn.Module):
             target_idx = self.s_i_to_as_i(next_idx, a_next)
             logits, expected_deviation = self.forward(embed, z_q_ind, a)  # B, S
         else:
-            z_q_ind, actions = batch
+            z_q_ind, actions, salience_levels = batch
             B, FiS, H, W = z_q_ind.shape
             TiF = H * W
             assert TiF <= self.tokens_in_frame  # delim and action not added yet
@@ -456,14 +450,14 @@ class GPT(nn.Module):
                     'Not filling block size in train will result in untrained latter positions.'
             # Shift targets by one patch
             # target_idx = z_q_ind[:,1:,:]
-            target_idx = self.add_action_and_delim(actions, z_q_ind)
+            target_idx = self.add_non_sensory_tokens(actions, z_q_ind, salience_levels)
             assert target_idx.shape[-1] == self.tokens_in_frame
             target_idx = target_idx.reshape(B, -1)[:, 1:-(target_idx.shape[-1] - 1)]
             # TODO: Figure out patch target
 
             z_q_ind = z_q_ind[:,:-1,:]  # Remove extra frame from end we included for targets
             actions = actions[:,:-1]
-            logits, expected_deviation = self.forward(z_q_ind, actions)
+            logits, expected_deviation = self.forward(z_q_ind, actions, salience_levels)
 
 
         # Calculate mean deviation loss for uncertainty ----------------------
@@ -626,16 +620,16 @@ class GPT(nn.Module):
 
     def get_batch_vars(self, batch):
         # TODO: Just put everything in agent_state, next_agent_state dicts
-        if len(batch) == 6:
+        if len(batch) == 7:
             # Has agent state and indices
-            states, actions, rewards, dones, states_next, agent_state = batch
+            (states, actions, rewards, dones, states_next, agent_state, salience_levels) = batch
         else:
             raise NotImplementedError('Need to update this if we want to train on text again')
             # Text (i.e. not atari)
             actions = None  # This is for text so no action TODO: remove
             x, y = batch  # hate that i have to do this here in the model
 
-        # TODO: Delete below once testing dvq training again
+        # TODO: Delete once testing dvq training again
         z_q_ind = torch.stack([a['dvq_z_q_ind'] for a in agent_state])
         z_q_flat = torch.stack([a['dvq_z_q_flat'] for a in agent_state])
 
@@ -658,10 +652,11 @@ class GPT(nn.Module):
             #   separation between actions and states and delimiters. For training, we can mask out the non-action
             #   outputs when predicting actions, non-state when predicting states, and non-delim when predicting delim
             #   parts of a sequence.
-            return z_q_ind, actions
+            return z_q_ind, actions, salience_levels
 
-    def add_action_and_delim(self, actions, z_q_ind):
-        return add_action_and_delim_ind(
+    def add_non_sensory_tokens(self, actions, z_q_ind, salience_levels):
+        # Actions, delimiter, and salience
+        return add_non_sensory_tokens(
             actions, z_q_ind, self.num_state_embeddings, self.num_actions,
-            self.tokens_in_frame
+            self.tokens_in_frame, salience_levels
         )

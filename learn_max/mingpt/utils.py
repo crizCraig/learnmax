@@ -49,9 +49,14 @@ def sample(model, x, steps, temperature=1.0, sample=False, top_k=None):
     return x
 
 
-def get_num_embeddings(num_state_embeddings, num_actions):
-    # TODO: Add 1 token for salience level
-    ret = num_state_embeddings + num_actions + 1  # actions + 1 for frame delimiter
+def get_num_output_embeddings(num_state_embeddings, num_actions):
+    """
+    Number of embeddings for token types: state, action, and delim
+
+    Adding more embeddings for salient tokens is done in the model
+    """
+    DELIM_TOKEN_TYPES = 1
+    ret = num_state_embeddings + num_actions + DELIM_TOKEN_TYPES
     return ret
 
 
@@ -63,7 +68,8 @@ def get_action_and_delim_emb(actions, z_q_ind, z_q_emb, num_state_embeddings, nu
     return ret
 
 
-def add_action_and_delim_ind(actions, z_q_ind, num_state_embeddings, num_actions, tokens_in_frame):
+def add_non_sensory_tokens(actions, z_q_ind, num_state_embeddings, num_actions,
+                           tokens_in_frame, salience_levels):
     device = z_q_ind.device
     if len(z_q_ind.shape) == 3:
         B, S, TiF = z_q_ind.shape  # batch, sequence-frames, tokens-in-frame
@@ -73,17 +79,32 @@ def add_action_and_delim_ind(actions, z_q_ind, num_state_embeddings, num_actions
     else:
         raise RuntimeError('Unexpected z_q_ind shape')
     # E = self.embedding_dim
-    delim_ind = num_state_embeddings + num_actions  # After state patches and action token
+
     # Not using flat with patches as patches convey within-image info
     # flat_delim = self.tok_emb(torch.tensor(delim_ind).to(device))
     # flat_delim = flat_delim.repeat(B * S, 1)
     # z_q_flat = z_q_flat.reshape(B * S, H * W * E)
     # z_q_flat = torch.cat((z_q_flat, flat_delim), 1).reshape(B, S, H * W * E + E)
-    ind_delim = torch.tensor(delim_ind).to(device)  # add new cluster for delim
-    ind_delim = ind_delim.repeat(B * S, 1)
-    action_z_q_ind = actions + num_state_embeddings
+
+
+
+    action_z_q_ind = num_state_embeddings + actions
     action_z_q_ind = action_z_q_ind.reshape(B * S, 1)
     z_q_ind = z_q_ind.reshape(B * S, TiF)
-    z_q_ind = torch.cat((z_q_ind, action_z_q_ind, ind_delim), -1)
+
+    # After state patches and action token, delim token
+    # is the same index for every frame
+    DELIM_IND = num_state_embeddings + num_actions
+    # index for delim to be fed into token embedding
+    ind_delim = torch.tensor(DELIM_IND).to(device)
+    ind_delim = ind_delim.repeat(B * S, 1)
+
+    salience_ind = salience_levels.repeat_interleave(S)
+    salience_ind.unsqueeze_(1)
+
+    z_q_ind = torch.cat((z_q_ind, action_z_q_ind, ind_delim, salience_ind), -1)
     z_q_ind = z_q_ind.reshape(B, S, tokens_in_frame)
+
+    assert z_q_ind.shape[-1] == tokens_in_frame
+
     return z_q_ind
