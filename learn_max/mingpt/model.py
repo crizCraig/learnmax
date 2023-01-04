@@ -455,8 +455,11 @@ class GPT(nn.Module):
             target_idx = target_idx.reshape(B, -1)[:, 1:-(target_idx.shape[-1] - 1)]
             # TODO: Figure out patch target
 
-            z_q_ind = z_q_ind[:,:-1,:]  # Remove extra frame from end we included for targets
+            # Remove extra frame from end we included for targets
+            z_q_ind = z_q_ind[:,:-1,:]
             actions = actions[:,:-1]
+            salience_levels = salience_levels[:,:-1]
+
             logits, expected_deviation = self.forward(z_q_ind, actions, salience_levels)
 
 

@@ -99,10 +99,9 @@ def add_non_sensory_tokens(actions, z_q_ind, num_state_embeddings, num_actions,
     ind_delim = torch.tensor(DELIM_IND).to(device)
     ind_delim = ind_delim.repeat(B * S, 1)
 
-    salience_ind = salience_levels.repeat_interleave(S)
-    salience_ind.unsqueeze_(1)
+    salience_levels = salience_levels.reshape(B * S, 1)
 
-    z_q_ind = torch.cat((z_q_ind, action_z_q_ind, ind_delim, salience_ind), -1)
+    z_q_ind = torch.cat((z_q_ind, action_z_q_ind, ind_delim, salience_levels), -1)
     z_q_ind = z_q_ind.reshape(B, S, tokens_in_frame)
 
     assert z_q_ind.shape[-1] == tokens_in_frame

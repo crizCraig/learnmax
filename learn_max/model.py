@@ -752,7 +752,7 @@ class LearnMax(pl.LightningModule):
                     start_indices=start_indices,
                     seq_len=self.gpt_seq_len,
                 )
-                # TODO: Add salience level in sample_from_replay_buf() and remove in _get_gpt_train_batch
+                # TODO: Add salience level in sample_from_replay_buf(+) and remove in _get_gpt_train_batch
                 if ret is None:
                     yield from self._yield_empty_validation_batch()
                 else:
@@ -826,10 +826,6 @@ class LearnMax(pl.LightningModule):
                 )
                 if sample is not None:
                     # if this contains full sequences
-
-                    # TODO: Add salience levels in sample_from_replay_buf() so validation gets it too
-                    sample.append([[level] * len(sample[0])])
-
                     assert len(sample[1].shape) == 2  # action shape should be (batch, seq_len)
                     items_remaining -= np.prod(sample[1].shape)  # use num actions as proxy for num frames
                     samples.append(sample)
@@ -842,7 +838,6 @@ class LearnMax(pl.LightningModule):
 
         # Salience level 0 should always have >= 1 full sequence
         assert sensor_sample is not None
-        sensor_sample += [[0] * len(sensor_sample[0])]  # level = 0
         samples.append(sensor_sample)
 
         assert len(samples[-1][1].shape) == 2  # action shape should be (batch, seq_len)
@@ -922,7 +917,7 @@ class LearnMax(pl.LightningModule):
             return None
 
         (states, actions, rewards, dones, new_states, agent_states,
-         next_agent_states) = samples
+         next_agent_states, salience_levels) = samples
         replay_ind = start_indices
         return [
             states,
@@ -933,6 +928,7 @@ class LearnMax(pl.LightningModule):
             agent_states,
             next_agent_states,
             replay_ind,
+            salience_levels,
         ]
 
     def get_num_extra_seq_samples(self):
@@ -988,6 +984,7 @@ class LearnMax(pl.LightningModule):
         ret_dones = []
         ret_next_states = []
         ret_next_agent_states = []
+        ret_salience_levels = []
         for start in start_indices:
             # We don't pad with -100 for last index as we make sure to
             # sample early enough in the buffer to get full sequences
@@ -1002,6 +999,7 @@ class LearnMax(pl.LightningModule):
             ret_dones.append(dones)
             ret_next_states.append([ags.state for ags in next_agent_states])
             ret_next_agent_states.append(next_agent_states)
+            ret_salience_levels.append([buffer.salience_level] * len(exps))
         # TODO: Speed this up with numba?
         # TODO: Just put everything in the agent_states and next_agent_states dict's
 
@@ -1013,6 +1011,7 @@ class LearnMax(pl.LightningModule):
             torch.stack([torch.cat(rs) for rs in ret_next_states]),
             ret_agent_states,
             ret_next_agent_states,
+            ret_salience_levels,
         )
         return ret
 
