@@ -113,11 +113,16 @@ class ReplayBuffers:
     def is_train(self):
         return self.curr_buf.is_train()
 
+    def is_sensory(self):
+        assert self.salience_level is not None
+        assert self.salience_level >= 0
+        return self.salience_level == 0
+
     def append(self, exp):
         if not self.overfit_to_short_term:
             self.curr_buf.append(exp)
         self.short_term_mem.append(exp)
-        if self.salience_level == 0 and exp.done:
+        if self.is_sensory() and exp.done:
             self.episode_i += 1
         if self.curr_buf.just_flushed:
             self.flush_i += 1
@@ -193,16 +198,19 @@ class ReplayBuffer:
             exps += self.get(start + len(exps), length - len(exps), device)
         return exps
 
-    @staticmethod
-    def exps_to_device(exps, device):
-        for exp in exps:
-            exp.state.to_(device)
-            exp.new_state.to_(device)
+    def exps_to_device(self, exps, device):
+        if self.is_sensory():
+            # Non-sensory (SalientExperiences) assumed to be
+            # already on CPU
+            # TODO: Check that non-sensory exps are on CPU
+            for exp in exps:
+                exp.state.to_(device)
+                exp.new_state.to_(device)
 
     def append(self, exp):
         assert exp.replay_index is None
         split = 'test' if self.is_test() else 'train'
-        if self.salience_level == 0:
+        if self.is_sensory():
             exp.state.split = split
             exp.new_state.split = split
         exp.split = self.split
@@ -220,6 +228,9 @@ class ReplayBuffer:
 
     def is_train(self):
         return self.split == 'train'
+
+    def is_sensory(self):
+        return self.salience_level == 0
 
     def _flush(self):
         exps = [e.__dict__ for e in self._flush_buf]

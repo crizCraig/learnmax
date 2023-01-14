@@ -21,7 +21,7 @@ from torch.nn import functional as F
 from learn_max.constants import ACC_LOG_PERIOD
 from learn_max.mingpt.utils import add_non_sensory_tokens
 from learn_max.salience.detect_salience import detect_salience
-from learn_max.utils import accuracy, wandb_log, sa2as
+from learn_max.utils import accuracy, wandb_log, sa2as, GptBatch
 
 
 class CausalSelfAttention(nn.Module):
@@ -623,30 +623,32 @@ class GPT(nn.Module):
 
     def get_batch_vars(self, batch):
         # TODO: Just put everything in agent_state, next_agent_state dicts
-        if len(batch) == 7:
+        if isinstance(batch, dict):
+            gpt_batch = GptBatch(**batch)
+            z_q_ind = gpt_batch.gpt_ind
+            actions = gpt_batch.actions
+            salience_levels = gpt_batch.salience_levels
+        elif len(batch) == 7:
             # Has agent state and indices
-            (states, actions, rewards, dones, states_next, agent_state, salience_levels) = batch
+            (states, actions, rewards, dones, states_next, salience_levels, agent_states) = batch
+            z_q_ind = torch.stack([a['dvq_z_q_ind'] for a in agent_states])
+            z_q_ind = z_q_ind.transpose(1, 0)
         else:
             raise NotImplementedError('Need to update this if we want to train on text again')
             # Text (i.e. not atari)
             actions = None  # This is for text so no action TODO: remove
             x, y = batch  # hate that i have to do this here in the model
 
-        # TODO: Delete once testing dvq training again
-        z_q_ind = torch.stack([a['dvq_z_q_ind'] for a in agent_state])
-        z_q_flat = torch.stack([a['dvq_z_q_flat'] for a in agent_state])
-
         if self.is_single_token2:
+            # Lightning collate does an annoying transpose on lists of dicts using zip() that switches B and S,
+            # so permute from S,B => B,S
+            z_q_flat = torch.stack([a['dvq_z_q_flat'] for a in agent_states])
             a_x, a_y, gpt_x, z_q_ind_x, z_q_ind_y = sa2as(z_q_flat, z_q_ind, actions)
-            ret = [gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y, states, agent_state]
+            ret = [gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y, states, agent_states]
             return ret
         else:
             z_q_ind.squeeze_(2)
-            z_q_flat.squeeze_(2)
-
-            # Lightning collate does an annoying transpose on lists of dicts using zip() that switches B and S,
-            # so permute from S,B => B,S
-            z_q_ind = z_q_ind.permute(1, 0, 2, 3)
+            # z_q_flat.squeeze_(2)
             # z_q_flat = z_q_flat.permute(1, 0, 2, 3, 4)
 
             # We don't really use z_q_flat in GPT anymore. We just need an extra cluster for the delim in z_q_ind.

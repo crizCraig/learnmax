@@ -6,7 +6,8 @@ from typing import List, Tuple
 
 import numpy as np
 import torch
-from torch import nn
+
+from learn_max.utils import dataclass_no_none_dict
 
 
 @dataclass
@@ -24,20 +25,14 @@ class AgentState:
     gpt_logits: torch.Tensor = None
     split: torch.tensor = 0  # 0 for train 1 for test
 
-    def dict(self):
-        d = self.__dict__
-        ret = {}
-        for k in d:
-            if d[k] is not None:
-                # Lightning doesn't want these
-                ret[k] = d[k]
-        return ret
-
     def to_(self, device):
         for field in dataclasses.fields(self):
             val = getattr(self, field.name)
             if torch.is_tensor(val):
                 setattr(self, field.name, val.to(device))
+
+    def dict(self):
+        return dataclass_no_none_dict(self)
 
 
 class LearnMaxAgent:

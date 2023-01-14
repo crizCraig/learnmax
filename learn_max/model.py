@@ -5,6 +5,7 @@ import sys
 import time
 from collections import deque, defaultdict
 from copy import copy
+from dataclasses import dataclass
 from typing import Tuple, List, Optional
 
 import cv2
@@ -39,7 +40,7 @@ from learn_max.replay_buffer import ReplayBuffers, Experience
 from learn_max.salience.detect_salience import detect_salience
 from learn_max.salience.salience import SalienceLevel, salience_level_factory
 from learn_max.utils import topk_interesting, _init_weights, get_date_str, get_action_states, \
-    wandb_log, no_train, wandb_check_flush, best_effort, viz_experiences, viz_salience
+    wandb_log, no_train, wandb_check_flush, best_effort, viz_experiences, viz_salience, GptBatch, dataclass_to_dict
 from learn_max.constants import (SAVE_DIR, SEED, DEBUGGING, DATE_STR,
                                  ROOT_DIR, RUN_ID, WANDB_MAX_LOG_PERIOD,
                                  ACC_LOG_PERIOD, MAX_NUM_SALIENCE_LEVELS)
@@ -663,37 +664,18 @@ class LearnMax(pl.LightningModule):
         Returns:
             yields tuple containing  state, action, reward, done, next_state, and agent_state dict.
         """
-
         episode_reward = 0
         episode_steps = 0
-
         # self.profile_cuda_usage_tensors()
 
-        (
-            actions,
-            agent_states,
-            dones,
-            new_states,
-            rewards,
-            states,
-            indices,
-            salience_levels,
-        ) = (None, None, None, None, None, None, None, None)
+        if not self.should_train_gpt:
+            raise RuntimeError('Need to reimplement dvq training')
 
+        gpt_batch = None
         while True:
             if self.total_training_steps == 0 or 'OVERFIT' not in os.environ:
                 # TODO: Move this tuple into a @dataclass
-                (
-                    states,
-                    actions,
-                    rewards,
-                    dones,
-                    new_states,
-                    agent_states,
-                    next_agent_states,
-                    indices,
-                    salience_levels,
-                ) = self._take_action_and_sample_batch(episode_reward, episode_steps)
+                gpt_batch = self._take_action_and_sample_batch(episode_reward, episode_steps)
                 # TODO: Add salience context token to all transformer training
                 # TODO: Create embedding for goal token and concatenate with other tokens
                 # TODO: Determine if we have enough salient events to train on at each level
@@ -702,22 +684,26 @@ class LearnMax(pl.LightningModule):
                 # TODO: Once we overfit to high level salience, try to sample randomly from all
                 #   levels:
                 #   https://excalidraw.com/#json=xEaCRq4tsmJiRCeoPPdCV,OiyAEfgHyNf2kYZ1S9dMXA
-            if dones is None:
-                log.error('dones is None, what is going on??? - trying to continue')
-                time.sleep(5)
-                continue
-            for idx, _ in enumerate(dones):
+            # if gpt_batch is None:
+            #     log.error('gpt_batch is None, what is going on??? - trying to continue')
+            #     time.sleep(5)
+            #     continue
+            for idx, _ in enumerate(gpt_batch.gpt_ind):
                 # Lightning wants tensors, numpy arrays, numbers, dicts or lists in batch
-                agent_state = self.agent_states_to_dict(agent_states[idx])
-                yield (
-                    states[idx],
-                    actions[idx],
-                    rewards[idx],
-                    dones[idx],
-                    new_states[idx],
-                    agent_state,
-                    salience_levels[idx],
-                )
+                if not self.is_single_token2:
+                    yield gpt_batch[idx].dict()
+                else:
+                    raise NotImplementedError('Need to reimplement single token training')
+                    agent_state = dataclass_to_dict(agent_states[idx], AgentState)
+                    yield (
+                        states[idx],
+                        actions[idx],
+                        rewards[idx],
+                        dones[idx],
+                        new_states[idx],
+                        salience_levels[idx],
+                        agent_state,
+                    )
 
             self.total_training_steps += 1
 
@@ -752,32 +738,29 @@ class LearnMax(pl.LightningModule):
                     start_indices=start_indices,
                     seq_len=self.gpt_seq_len,
                 )
-                # TODO: Add salience level in sample_from_replay_buf(+) and remove in _get_gpt_train_batch
                 if ret is None:
                     yield from self._yield_empty_validation_batch()
                 else:
-                    (states, actions, rewards, dones, new_states, agent_states,
-                     next_agent_states, salience_levels) = ret
+                    (states, actions, rewards, dones, new_states, salience_levels,
+                     agent_states, next_agent_states,) = ret
                     for idx, _ in enumerate(dones):
                         # Lightning wants tensors, numpy arrays, numbers, dicts or lists in batch
-                        agent_state = self.agent_states_to_dict(agent_states[idx])
-                        yield (states[idx], actions[idx], rewards[idx], dones[idx], new_states[idx],
-                               agent_state, salience_levels)
+                        yield (
+                            states[idx],
+                            actions[idx],
+                            rewards[idx],
+                            dones[idx],
+                            new_states[idx],
+                            salience_levels[idx],
+                            dataclass_to_dict(agent_states[idx], AgentState),
+                        )
 
     @staticmethod
     def _yield_empty_validation_batch():
         log.warning('Generating empty validation data! Val stats will be wrong. '
                     'Make sure you fill test_buf with at least one gpt block before calling')
 
-        yield (torch.tensor(0), torch.tensor(0), torch.tensor(0), torch.tensor(0),
-               torch.tensor(0), torch.tensor(0), torch.tensor(0))
-
-    def agent_states_to_dict(self, thing):
-        if isinstance(thing, AgentState):
-            return thing.dict()
-        if isinstance(thing[0], AgentState):
-            # agents_states only has a batch dimension, not window size
-            return [_.dict() for _ in thing]
+        yield GptBatch.dict()
 
     def _take_action_and_sample_batch(self, episode_reward, episode_steps):
         for a_i in range(self.actions_per_batch):
@@ -791,21 +774,10 @@ class LearnMax(pl.LightningModule):
         return ret
 
     def _get_gpt_train_batch(self):
-        """
-        Returns:
-            states,
-            actions,
-            rewards,
-            dones,
-            new_states,
-            agent_states,
-            next_agent_states,
-            replay_ind,
-            salience_levels,
-        """
+        """ Returns: gpt_batch """
         if len(self.train_buf) < (self.gpt_seq_len * self.gpt_batch_size):
             log.info('Train buff not full enough to run a batch yet, skipping')
-            return None, None, None, [], None, None, None, None
+            return GptBatch().empty()
         # Sample sequentially from replay buffer
         # If training GPT, we need to return the dvq state indexes as well to be used in on_train_batch_end
         #   in lr_decay _, y = batch
@@ -814,57 +786,38 @@ class LearnMax(pl.LightningModule):
         seq_len = self.gpt_seq_len + num_extra_seq_items  # frames in sequence
         sample_size = self.gpt_batch_size * seq_len
         items_remaining = sample_size
-        samples = []
+        ret_gpt_batch = GptBatch(seq_len=seq_len)
+
+        def append(_gpt_batch):
+            n = len(_gpt_batch.salience_levels)
+            assert n % seq_len == 0
+            nonlocal items_remaining
+            items_remaining -= n
+            ret_gpt_batch.append(_gpt_batch)
+
         for level in self.salience_levels:
             buf = level.replay_buffers.train_buf
             level_sample_size = min(items_remaining, len(buf))
             if level_sample_size >= self.gpt_seq_len:
-                sample = self.sample_from_replay_buf(
+                gpt_batch = self.sample_from_replay_buf(
                     buf,
                     seq_len,
                     level_sample_size
                 )
-                if sample is not None:
+                if gpt_batch is not None:
                     # if this contains full sequences
-                    assert len(sample[1].shape) == 2  # action shape should be (batch, seq_len)
-                    items_remaining -= np.prod(sample[1].shape)  # use num actions as proxy for num frames
-                    samples.append(sample)
+                    append(gpt_batch)
 
-        sensor_sample = self.sample_from_replay_buf(
+        sensor_gpt_batch = self.sample_from_replay_buf(
             self.replay_buffers.train_buf,
             seq_len,
             items_remaining,
         )
-
         # Salience level 0 should always have >= 1 full sequence
-        assert sensor_sample is not None
-        samples.append(sensor_sample)
+        assert sensor_gpt_batch is not None
+        append(sensor_gpt_batch)
 
-        assert len(samples[-1][1].shape) == 2  # action shape should be (batch, seq_len)
-        items_remaining -= np.prod(samples[-1][1].shape)  # use num actions as proxy for num frames
-        assert items_remaining == 0
-
-        states = torch.cat(tuple(r[0] for r in samples))
-        actions = np.concatenate(tuple(r[1] for r in samples))
-        rewards = np.concatenate(tuple(r[2] for r in samples))
-        dones = np.concatenate(tuple(r[3] for r in samples))
-        new_states = torch.cat(tuple(r[4] for r in samples))
-        agent_states = tuple(np.concatenate(tuple(r[5] for r in samples)))
-        next_agent_states = tuple(np.concatenate(tuple(r[6] for r in samples)))
-        replay_ind = np.concatenate(tuple(r[7] for r in samples))
-        salience_levels = tuple(np.concatenate(tuple(r[8] for r in samples)))
-
-        return (
-            states,
-            actions,
-            rewards,
-            dones,
-            new_states,
-            agent_states,
-            next_agent_states,
-            replay_ind,
-            salience_levels,
-        )
+        return ret_gpt_batch
 
     def _get_dvq_train_batch(self):
         # Sample single states randomly from replay buffer
@@ -894,42 +847,27 @@ class LearnMax(pl.LightningModule):
         return ret
 
     def sample_from_replay_buf(self, replay_buf, seq_len, sample_size):
-        start_range = np.arange(len(replay_buf) - sample_size)
-        # TODO: Allow non-sequential (random) sequence sampling for more IID training.
-        #  In fact, we don't need sequential sampling here at all anymore as salience
-        #  detection is now done in step by sampling from short term mem.
-
+        start_range = np.arange(len(replay_buf) - sample_size + 1)
         # Sample sequential start indices
-        # TODO: Just do one get() from replay buffer with entire sequential batch
         start_idx = np.random.choice(start_range, 1, replace=False)[0]
         start_indices = np.arange(start=start_idx,
-                                  stop=start_idx + sample_size - seq_len,
+                                  stop=start_idx + sample_size - seq_len + 1,
                                   step=self.gpt_seq_len)
         if 'ALWAYS_SAMPLE_LATEST' in os.environ:
             start_indices[0] = start_range[-1]
 
-        samples = self.sample_sequential(
+        # TODO: Allow non-sequential (random) sequence sampling for more IID training.
+        #  In fact, we don't need sequential sampling here at all anymore as salience
+        #  detection is now done in step by sampling from short term mem.
+        gpt_batch = self.sample_sequential(
             buffer=replay_buf,
             start_indices=start_indices,
             seq_len=seq_len,
         )
-        if samples is None:
+        if gpt_batch is None:
             return None
 
-        (states, actions, rewards, dones, new_states, agent_states,
-         next_agent_states, salience_levels) = samples
-        replay_ind = start_indices
-        return [
-            states,
-            actions,
-            rewards,
-            dones,
-            new_states,
-            agent_states,
-            next_agent_states,
-            replay_ind,
-            salience_levels,
-        ]
+        return gpt_batch
 
     def get_num_extra_seq_samples(self):
         if self.is_single_token2:
@@ -977,41 +915,71 @@ class LearnMax(pl.LightningModule):
 
     def sample_sequential(self, buffer, start_indices, seq_len):
         """Get batch size X gpt_seq_len windows for GPT"""
+        if self.is_single_token2:
+            raise NotImplementedError('Single token2 sampling not implemented')
+        if not self.should_train_gpt:
+            raise NotImplementedError('Need to reimplement dvq training')
+        exps = buffer.get(
+            start_indices[0],
+            seq_len * len(start_indices),
+            device=self.device
+        )
+        if len(exps) % seq_len != 0:
+            # Avoid partial batches
+            return None
+        salience_level = torch.tensor([buffer.salience_level])
+        salience_levels = torch.repeat_interleave(salience_level, len(exps))
+        if buffer.is_sensory():
+            gpt_ind = torch.stack([exp.state.dvq_z_q_ind for exp in exps])
+            actions = torch.tensor([exp.action for exp in exps])
+        else:
+            gpt_ind = torch.stack([exp.cluster_ind for exp in exps])
+            actions = torch.repeat_interleave(torch.tensor([0]), len(exps))
+        ret = GptBatch(
+            gpt_ind=gpt_ind,
+            actions=actions,
+            salience_levels=salience_levels
+        )
+        return ret
+
+
+    def sample_sequential_sensory(self, buffer, seq_len, start_indices):
         ret_states = []
         ret_agent_states = []
         ret_actions = []
         ret_rewards = []
         ret_dones = []
         ret_next_states = []
-        ret_next_agent_states = []
         ret_salience_levels = []
+        ret_next_agent_states = []
+
         for start in start_indices:
             # We don't pad with -100 for last index as we make sure to
             # sample early enough in the buffer to get full sequences
             exps = buffer.get(start, seq_len, device=self.device)
             if len(exps) < seq_len:
                 return None
+
             agent_states, actions, rewards, dones, next_agent_states, replay_indexes, splits = zip(*exps)
             ret_states.append([ags.state for ags in agent_states])
             ret_agent_states.append(agent_states)
             ret_actions.append(actions)
             ret_rewards.append(rewards)
             ret_dones.append(dones)
+            ret_salience_levels.append(torch.tensor([buffer.salience_level] * len(exps)))
             ret_next_states.append([ags.state for ags in next_agent_states])
             ret_next_agent_states.append(next_agent_states)
-            ret_salience_levels.append([buffer.salience_level] * len(exps))
         # TODO: Speed this up with numba?
         # TODO: Just put everything in the agent_states and next_agent_states dict's
-
         ret = (
             torch.stack([torch.cat(rs) for rs in ret_states]),
             np.array(ret_actions),
             np.array(ret_rewards, dtype=np.float32),
             np.array(ret_dones, dtype=bool),
             torch.stack([torch.cat(rs) for rs in ret_next_states]),
+            torch.stack(ret_salience_levels),
             ret_agent_states,
             ret_next_agent_states,
-            ret_salience_levels,
         )
         return ret
 
@@ -1147,7 +1115,10 @@ class LearnMax(pl.LightningModule):
                 gpt_ret = self.gpt.validation_step(batch=(gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y), batch_idx=batch_idx)
             else:
                 gpt_ind, actions, salience_levels = self.gpt.get_batch_vars(batch)
-                gpt_ret = self.gpt.validation_step(batch=(gpt_ind, actions), batch_idx=batch_idx)
+                gpt_ret = self.gpt.validation_step(
+                    batch=(gpt_ind, actions, salience_levels),
+                    batch_idx=batch_idx
+                )
             loss = gpt_ret['loss']
             wandb_log({'loss/test': loss})
             log.info(f'Validation loss {loss}, batch length {len(batch)}')
@@ -2413,6 +2384,8 @@ def get_image_from_state(state, folder, i, should_save=True):
         filename = f'{folder}/{str(i).zfill(9)}.png'
         im.save(filename)
     return im
+
+
 
 
 if __name__ == '__main__':

@@ -1,6 +1,7 @@
 import collections
 import os
 import traceback
+from dataclasses import dataclass
 from datetime import datetime
 from functools import wraps
 from typing import List
@@ -448,6 +449,72 @@ def viz_salience(FiS, salient_replay_i, replay_buffers, dvq_decoder, device, fil
         # Visualize a movie around the index
         viz_experiences(replay_buffers.train_buf.get(start=replay_i - FiS + 1, length=FiS * 2), folder,
                         dvq_decoder, device, file_prefix=file_prefix)
+
+
+def dataclass_to_dict(thing, dataclass):
+    if isinstance(thing, dataclass):
+        return thing.dict()
+    if isinstance(thing[0], dataclass):
+        # agents_states only has a batch dimension, not window size
+        return [_.dict() for _ in thing]
+
+
+@dataclass
+class GptBatch:
+    gpt_ind: torch.Tensor = None
+    actions: torch.Tensor = None
+    salience_levels: torch.Tensor = None
+    seq_len: int = None
+
+    def dict(self):
+        return dataclass_no_none_dict(self)
+
+    def empty(self):
+        self.gpt_ind = torch.tensor([0])
+        self.actions = torch.tensor([0])
+        self.salience_levels = torch.tensor([0])
+        self.seq_len = 0
+
+    def __getitem__(self, item):
+        return GptBatch(
+            gpt_ind=self.gpt_ind[item],
+            actions=self.actions[item],
+            salience_levels=self.salience_levels[item],
+            seq_len=self.seq_len
+        )
+
+    def append(self, other):
+        # Join gpt_ind, actions, salience_levels
+        if self.gpt_ind is None:
+            self.gpt_ind = other.gpt_ind
+            self.actions = other.actions
+            self.salience_levels = other.salience_levels
+        else:
+            assert self.actions is not None
+            assert self.salience_levels is not None
+            self.gpt_ind = torch.stack((self.gpt_ind, other.gpt_ind))
+            self.actions = torch.stack((self.actions, other.actions))
+            self.salience_levels = torch.stack((
+                self.salience_levels,
+                other.salience_levels),
+                dim=1
+            )
+        self.gpt_ind = self.gpt_ind.view(
+            -1, self.seq_len, *self.gpt_ind.shape[2:]
+        )
+        self.actions = self.actions.view(-1, self.seq_len)
+        self.salience_levels = self.salience_levels.view(-1, self.seq_len)
+
+
+
+def dataclass_no_none_dict(obj):
+    d = obj.__dict__
+    ret = {}
+    for k in d:
+        if d[k] is not None:
+            # Lightning doesn't want None's
+            ret[k] = d[k]
+    return ret
 
 if __name__ == '__main__':
     test_get_state()
