@@ -19,7 +19,7 @@ from tdigest import TDigest
 from torch.nn import functional as F
 
 from learn_max.constants import ACC_LOG_PERIOD
-from learn_max.mingpt.utils import add_non_sensory_tokens
+from learn_max.mingpt.utils import add_non_state_tokens
 from learn_max.salience.detect_salience import detect_salience
 from learn_max.utils import accuracy, wandb_log, sa2as, GptBatch
 
@@ -326,10 +326,15 @@ class GPT(nn.Module):
             embed, z_q_ind, actions = args
             return self.single_token_forward(actions, embed, z_q_ind)
         else:
-            z_q_ind, actions, salience_levels = args
+            z_q_ind, actions, salient_event_ind, salience_level_ind = args
 
             # TODO: Create embedding for goal token and concatenate with other tokens
-            tok_ind = self.add_non_sensory_tokens(actions, z_q_ind, salience_levels)
+            tok_ind = self.add_non_state_tokens(
+                z_q_ind,
+                actions,
+                salient_event_ind,
+                salience_level_ind
+            )
 
             B, FiS, TiF = tok_ind.size()  # batch, frames in sequence, tokens in frame
             assert TiF == self.tokens_in_frame
@@ -347,7 +352,9 @@ class GPT(nn.Module):
             x = self.drop(x)
             x = self.blocks(x)
             x = self.ln_f(x)
+            # Not currently used, but could be useful (YAGNI?)
             logits = self.logit_p_head(x)
+
 
             # Uses mean deviation instead of standard deviation
             # https://stats.stackexchange.com/q/81986/18187
@@ -440,7 +447,10 @@ class GPT(nn.Module):
             target_idx = self.s_i_to_as_i(next_idx, a_next)
             logits, expected_deviation = self.forward(embed, z_q_ind, a)  # B, S
         else:
-            z_q_ind, actions, salience_levels = batch
+            z_q_ind = batch.z_q_ind
+            actions = batch.actions
+            salient_event_ind = batch.salient_event_ind
+            salience_level_ind = batch.salience_level_ind
             B, FiS, H, W = z_q_ind.shape
             TiF = H * W
             assert TiF <= self.tokens_in_frame  # delim and action not added yet
@@ -450,17 +460,20 @@ class GPT(nn.Module):
                     'Not filling block size in train will result in untrained latter positions.'
             # Shift targets by one patch
             # target_idx = z_q_ind[:,1:,:]
-            target_idx = self.add_non_sensory_tokens(actions, z_q_ind, salience_levels)
+            target_idx = self.add_non_state_tokens(
+                z_q_ind, actions, salient_event_ind, salience_level_ind
+            )
             assert target_idx.shape[-1] == self.tokens_in_frame
             target_idx = target_idx.reshape(B, -1)[:, 1:-(target_idx.shape[-1] - 1)]
-            # TODO: Figure out patch target
 
             # Remove extra frame from end we included for targets
             z_q_ind = z_q_ind[:,:-1,:]
             actions = actions[:,:-1]
-            salience_levels = salience_levels[:,:-1]
+            salience_level_ind = salience_level_ind[:,:-1]
 
-            logits, expected_deviation = self.forward(z_q_ind, actions, salience_levels)
+            logits, expected_deviation = self.forward(
+                z_q_ind, actions, salient_event_ind, salience_level_ind
+            )
 
 
         # Calculate mean deviation loss for uncertainty ----------------------
@@ -474,12 +487,10 @@ class GPT(nn.Module):
         wandb_log({'entropy/action-state': entropy.mean()})
         wandb_log({'probs_std': probs.std()})
 
-        # Use last position's logits as this is what we use for auto-regression / prediction (i.e. throwout
-        #   most of the window generated with causal mask)
-        #   Followup: Surprisingly makes little difference to accuracy
-        last_logits = logits[:, -1, :]
-        last_targets = target_idx[:, -1]
-        acc = self.accuracy(last_logits, last_targets, split)
+        # Accuracy includes all sequence steps due to casual mask training
+        acc = self.accuracy(
+            logits.view(-1, logits.shape[-1]), target_idx.reshape(-1), split
+        )
         if batch_idx % ACC_LOG_PERIOD == 0:
             log.info(f'Top x {split} prediction accuracy {acc}')
         p_diff = (one_hot - probs).abs()  # actual deviation
@@ -621,16 +632,21 @@ class GPT(nn.Module):
     def test_step(self, *args, **kwargs):
         return self.step_('test', *args, **kwargs)
 
-    def get_batch_vars(self, batch):
+    def get_batch(self, batch):
         # TODO: Just put everything in agent_state, next_agent_state dicts
         if isinstance(batch, dict):
-            gpt_batch = GptBatch(**batch)
-            z_q_ind = gpt_batch.gpt_ind
-            actions = gpt_batch.actions
-            salience_levels = gpt_batch.salience_levels
+            return GptBatch(**batch)
         elif len(batch) == 7:
             # Has agent state and indices
-            (states, actions, rewards, dones, states_next, salience_levels, agent_states) = batch
+            (
+                states,
+                actions,
+                rewards,
+                dones,
+                states_next,
+                salience_level_ind,
+                agent_states
+            ) = batch
             z_q_ind = torch.stack([a['dvq_z_q_ind'] for a in agent_states])
             z_q_ind = z_q_ind.transpose(1, 0)
         else:
@@ -646,22 +662,33 @@ class GPT(nn.Module):
             a_x, a_y, gpt_x, z_q_ind_x, z_q_ind_y = sa2as(z_q_flat, z_q_ind, actions)
             ret = [gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y, states, agent_states]
             return ret
-        else:
-            z_q_ind.squeeze_(2)
-            # z_q_flat.squeeze_(2)
-            # z_q_flat = z_q_flat.permute(1, 0, 2, 3, 4)
+        # else:
+        #     z_q_ind.squeeze_(2)
+        #     # z_q_flat.squeeze_(2)
+        #     # z_q_flat = z_q_flat.permute(1, 0, 2, 3, 4)
+        #
+        #     # We don't really use z_q_flat in GPT anymore. We just need an extra cluster for the delim in z_q_ind.
+        #     # TODO: (DONE?) We should get the delimiter and action embeddings from the same embedding as tokens, just shift
+        #     #   the indexes. That way, we don't have as much overlap risk between the tensors, i.e. there's better
+        #     #   separation between actions and states and delimiters. For training, we can mask out the non-action
+        #     #   outputs when predicting actions, non-state when predicting states, and non-delim when predicting delim
+        #     #   parts of a sequence.
+        #     return z_q_ind, actions, salient_event_ind, salience_level_ind
 
-            # We don't really use z_q_flat in GPT anymore. We just need an extra cluster for the delim in z_q_ind.
-            # TODO: We should get the delimiter and action embeddings from the same embedding as tokens, just shift
-            #   the indexes. That way, we don't have as much overlap risk between the tensors, i.e. there's better
-            #   separation between actions and states and delimiters. For training, we can mask out the non-action
-            #   outputs when predicting actions, non-state when predicting states, and non-delim when predicting delim
-            #   parts of a sequence.
-            return z_q_ind, actions, salience_levels
-
-    def add_non_sensory_tokens(self, actions, z_q_ind, salience_levels):
+    def add_non_state_tokens(
+            self,
+            z_q_ind,
+            actions,
+            salient_event_ind,
+            salience_level_ind
+    ):
         # Actions, delimiter, and salience
-        return add_non_sensory_tokens(
-            actions, z_q_ind, self.num_state_embeddings, self.num_actions,
-            self.tokens_in_frame, salience_levels
+        return add_non_state_tokens(
+            z_q_ind,
+            actions,
+            self.num_state_embeddings,
+            self.num_actions,
+            self.tokens_in_frame,
+            salient_event_ind,
+            salience_level_ind
         )

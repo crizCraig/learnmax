@@ -5,7 +5,6 @@ import sys
 import time
 from collections import deque, defaultdict
 from copy import copy
-from dataclasses import dataclass
 from typing import Tuple, List, Optional
 
 import cv2
@@ -20,9 +19,9 @@ from PIL import Image
 from gym import Env, ObservationWrapper
 from loguru import logger as log
 from pl_bolts.datamodules import ExperienceSourceDataset
-# from pl_bolts.datamodules.experience_source import Experience
 from pl_bolts.models.rl.common.gym_wrappers import (
-    make_environment, ImageToPyTorch, FireResetEnv, ScaledFloatFrame)
+    make_environment, ImageToPyTorch, FireResetEnv, ScaledFloatFrame
+)
 from pl_bolts.utils import _OPENCV_AVAILABLE
 from pytorch_lightning import seed_everything
 from pytorch_lightning.callbacks import ModelCheckpoint
@@ -51,7 +50,8 @@ from learn_max.viz_predicted_trajectories import get_action_text, get_np_txt_cap
 
 log.remove()
 log.add(sys.stderr, level="INFO")
-log.add('learnmax_log_{time}.log', compression='zip', rotation='10 MB')
+os.makedirs(f'{ROOT_DIR}/logs', exist_ok=True)
+log.add(f'{ROOT_DIR}/logs/learnmax_log_{time}.log', compression='zip', rotation='10 MB')
 
 class LearnMax(pl.LightningModule):
     def __init__(
@@ -688,10 +688,11 @@ class LearnMax(pl.LightningModule):
             #     log.error('gpt_batch is None, what is going on??? - trying to continue')
             #     time.sleep(5)
             #     continue
-            for idx, _ in enumerate(gpt_batch.gpt_ind):
+
+            for idx in range(len(gpt_batch)):
                 # Lightning wants tensors, numpy arrays, numbers, dicts or lists in batch
                 if not self.is_single_token2:
-                    yield gpt_batch[idx].dict()
+                    yield {'gpt_sensor_ind': gpt_batch[idx].dict()}
                 else:
                     raise NotImplementedError('Need to reimplement single token training')
                     agent_state = dataclass_to_dict(agent_states[idx], AgentState)
@@ -716,7 +717,7 @@ class LearnMax(pl.LightningModule):
             if self.total_training_steps % self.batches_per_epoch == 0:
                 break
 
-    def validation_batch_gen(self, ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def validation_batch_gen(self):
         if not self.should_train_gpt:
             log.warning('Validation not implemented for dvq')
             return
@@ -741,19 +742,26 @@ class LearnMax(pl.LightningModule):
                 if ret is None:
                     yield from self._yield_empty_validation_batch()
                 else:
-                    (states, actions, rewards, dones, new_states, salience_levels,
-                     agent_states, next_agent_states,) = ret
-                    for idx, _ in enumerate(dones):
-                        # Lightning wants tensors, numpy arrays, numbers, dicts or lists in batch
-                        yield (
-                            states[idx],
-                            actions[idx],
-                            rewards[idx],
-                            dones[idx],
-                            new_states[idx],
-                            salience_levels[idx],
-                            dataclass_to_dict(agent_states[idx], AgentState),
-                        )
+                    if isinstance(ret, GptBatch):
+                        for idx, _ in enumerate(ret.z_q_ind):
+                            yield ret[idx].dict()
+                    else:
+                        raise TypeError(f'Need to implement GptBatch'
+                                        f' for single token / dvq {type(ret)}')
+                        (states, actions, rewards, dones, new_states, salience_levels,
+                         agent_states, next_agent_states,) = ret
+                        for idx, _ in enumerate(dones):
+                            # Lightning wants tensors, numpy arrays, numbers, dicts or lists in batch
+                            yield (
+                                states[idx],
+                                actions[idx],
+                                rewards[idx],
+                                dones[idx],
+                                new_states[idx],
+                                salience_levels[idx],
+                                dataclass_to_dict(agent_states[idx], AgentState),
+                            )
+
 
     @staticmethod
     def _yield_empty_validation_batch():
@@ -787,9 +795,31 @@ class LearnMax(pl.LightningModule):
         sample_size = self.gpt_batch_size * seq_len
         items_remaining = sample_size
         ret_gpt_batch = GptBatch(seq_len=seq_len)
+        # TODO: Separate sensor and salient batches into different dataclasses
+        """
+        Make the salient batch size equal to the sensor batch size by:
+        - keeping the salient and sensor sequence length the same (8)
+        - making the salient embedding size 255
+        - so num_non_state_sensor_tokens = sum(action 1, salient level 1, delim 1) = 3
+        - and sensor batch_size = 
+             sensorB * (num_img_patches (121) + num_non_state_sensor_tokens (3)) * emb_size (30)
+        - and with num_non_state_salient_tokens (salient_event 1 + salient lvl 1 = 2)
+        - then salient batch_size =  
+             salientB * num_non_state_salient_tokens (2) * emb_size (255) 
+        - Then if we want the salient batch to take equal memory, we can set 
+           sensor batch_size = salient batch_size which gives
+           salientB = sensor batch_size / (num_non_state_salient_tokens (2) * emb_size (255))
+                    = 7 * 124 * 30 / (2 * 255) = 51.05, so could do salientB = 51
+                    So tokens in batch is 51 * 8 * 2 = 816
+                    To get a larger sequence length
+                    25 * S * 2 = 816, S = 16
+        """
+
+        #
+        #
 
         def append(_gpt_batch):
-            n = len(_gpt_batch.salience_levels)
+            n = _gpt_batch.num_steps()
             assert n % seq_len == 0
             nonlocal items_remaining
             items_remaining -= n
@@ -928,17 +958,21 @@ class LearnMax(pl.LightningModule):
             # Avoid partial batches
             return None
         salience_level = torch.tensor([buffer.salience_level])
-        salience_levels = torch.repeat_interleave(salience_level, len(exps))
+        salience_level_ind = torch.repeat_interleave(salience_level, len(exps))
         if buffer.is_sensory():
-            gpt_ind = torch.stack([exp.state.dvq_z_q_ind for exp in exps])
+            z_q_ind = torch.stack([exp.state.dvq_z_q_ind for exp in exps])
             actions = torch.tensor([exp.action for exp in exps])
+            salient_event_ind = None
         else:
-            gpt_ind = torch.stack([exp.cluster_ind for exp in exps])
+            z_q_ind = None
             actions = torch.repeat_interleave(torch.tensor([0]), len(exps))
+            salient_event_ind = torch.tensor(np.stack([exp.cluster_index for exp in exps]))
         ret = GptBatch(
-            gpt_ind=gpt_ind,
+            z_q_ind=z_q_ind,
             actions=actions,
-            salience_levels=salience_levels
+            salient_event_ind=salient_event_ind,
+            salience_level_ind=salience_level_ind,
+            seq_len=seq_len,
         )
         return ret
 
@@ -992,13 +1026,13 @@ class LearnMax(pl.LightningModule):
         else:
             return z_q_ind
 
-    def training_step(self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx):
+    def training_step(self, batch, batch_idx):
         """
         Calculates loss based on the minibatch received
 
         Args:
             batch: current mini batch of replay data
-            _: batch number, not used
+            batch_idx: batch number
 
         Returns:
             Training loss and log metrics
@@ -1020,40 +1054,43 @@ class LearnMax(pl.LightningModule):
                 # For testing that train step and visualize methods produce same output, basically disable dropout
                 self.eval()
             if self.is_single_token2:
-                gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y, s, agent_state = self.gpt.get_batch_vars(batch)
+                gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y, s, agent_state = self.gpt.get_batch(batch)
                 gpt_ret = self.gpt.training_step(batch=(gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y), batch_idx=batch_idx)
             else:
-                gpt_ind, actions, salience_levels = self.gpt.get_batch_vars(batch)
+                # TODO: Use different gpt for salient batches
                 gpt_ret = self.gpt.training_step(
-                    batch=(gpt_ind, actions, salience_levels,),
+                    batch=self.gpt.get_batch(batch),
                     batch_idx=batch_idx,
                 )
             self.gpt.global_step = self.global_step
 
             # Visualization steps
-            if 'ZERO_LR' in os.environ and self.is_single_token2:
-                test_logits, _ = self.gpt.forward(gpt_x, z_q_ind_x, a_x)
-                test_target = self.gpt.s_i_to_as_i(z_q_ind_y, a_x)
-                self.viz_gpt(test_logits, test_target, state=s, batch_idx=79797979)
-                self.viz_simple_predict_trajectory(gpt_x, z_q_ind_x, a_x, gpt_ret, batch_idx)
+            # if 'ZERO_LR' in os.environ and self.is_single_token2:
+            #     test_logits, _ = self.gpt.forward(gpt_x, z_q_ind_x, a_x)
+            #     test_target = self.gpt.s_i_to_as_i(z_q_ind_y, a_x)
+            #     self.viz_gpt(test_logits, test_target, state=s, batch_idx=79797979)
+            #     self.viz_simple_predict_trajectory(gpt_x, z_q_ind_x, a_x, gpt_ret, batch_idx)
+
+            # if (
+            #     self.should_viz_predict_trajectory and
+            #     len(self.recent_experience) >= self.gpt_seq_len and
+            #     batch_idx % self.predicted_trajectories_size == 0 and
+            #     self.is_single_token2  # TODO: Support this by getting gpt_x
+            # ):
+            #     self.viz_simple_predict_trajectory(gpt_x, z_q_ind_x, a_x, gpt_ret, batch_idx)
 
             if (
-                self.should_viz_predict_trajectory and
-                len(self.recent_experience) >= self.gpt_seq_len and
-                batch_idx % self.predicted_trajectories_size == 0 and
-                self.is_single_token2  # TODO: Support this by getting gpt_x
-            ):
-                self.viz_simple_predict_trajectory(gpt_x, z_q_ind_x, a_x, gpt_ret, batch_idx)
-            if batch_idx % self.predicted_trajectories_size == 0 \
-                    and self.is_single_token2:  # TODO: Support patch based by getting `s`
-                self.viz_gpt(gpt_ret['logits'], gpt_ret['target_idx'], state=s, batch_idx=batch_idx)
+                    batch_idx % self.predicted_trajectories_size == 0 and
+                    self.is_single_token2
+            ):  # TODO: Support patch based by getting `s`
+            #     self.viz_gpt(gpt_ret['logits'], gpt_ret['target_idx'], state=s, batch_idx=batch_idx)
 
                 # Also try this in a no_train
                 # test_logits, _ = self.gpt.forward(gpt_x, z_q_ind_x, a_x)
                 # test_target = self.gpt.s_i_to_as_i(z_q_ind_y, a_x)
                 # self.viz_gpt(test_logits, test_target, state=s, batch_idx=batch_idx, postfix='_forward_only')
-
                 self.viz_movie(batch_idx)
+
             if self.global_step == 0:
                 # TODO: Make sure to call again if we update clusters as visualizing predicted trajectories
                 #   uses the cluster images
@@ -1111,13 +1148,12 @@ class LearnMax(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         if self.should_train_gpt:
             if self.is_single_token2:
-                gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y, s, agent_state, indices = self.gpt.get_batch_vars(batch)
+                gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y, s, agent_state, indices = self.gpt.get_batch(batch)
                 gpt_ret = self.gpt.validation_step(batch=(gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y), batch_idx=batch_idx)
             else:
-                gpt_ind, actions, salience_levels = self.gpt.get_batch_vars(batch)
+                gpt_batch = self.gpt.get_batch(batch)
                 gpt_ret = self.gpt.validation_step(
-                    batch=(gpt_ind, actions, salience_levels),
-                    batch_idx=batch_idx
+                    batch=gpt_batch, batch_idx=batch_idx
                 )
             loss = gpt_ret['loss']
             wandb_log({'loss/test': loss})

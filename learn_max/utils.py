@@ -458,53 +458,113 @@ def dataclass_to_dict(thing, dataclass):
         # agents_states only has a batch dimension, not window size
         return [_.dict() for _ in thing]
 
-
+# TODO: Create GptBatchSensor and GptBatchSalient
 @dataclass
 class GptBatch:
-    gpt_ind: torch.Tensor = None
+    z_q_ind: torch.Tensor = None
     actions: torch.Tensor = None
-    salience_levels: torch.Tensor = None
+    salient_event_ind: torch.Tensor = None
+    salience_level_ind: torch.Tensor = None
     seq_len: int = None
 
+    def __post_init__(self):
+        self._ensure_shape()
+
     def dict(self):
-        return dataclass_no_none_dict(self)
+        ret = dataclass_no_none_dict(self)
+        ret['type'] = type(self).__name__
 
     def empty(self):
-        self.gpt_ind = torch.tensor([0])
+        self.z_q_ind = torch.tensor([0])
         self.actions = torch.tensor([0])
-        self.salience_levels = torch.tensor([0])
+        self.salient_event_ind = torch.tensor([0])
+        self.salience_level_ind = torch.tensor([0])
         self.seq_len = 0
 
-    def __getitem__(self, item):
-        return GptBatch(
-            gpt_ind=self.gpt_ind[item],
-            actions=self.actions[item],
-            salience_levels=self.salience_levels[item],
+    def __getitem__(self, batch_idx):
+        if self.salient_event_ind is not None:
+            salient_event_ind = self.salient_event_ind[batch_idx]
+        else:
+            salient_event_ind = None
+        ret = GptBatch(
+            z_q_ind=self.z_q_ind[batch_idx],
+            actions=self.actions[batch_idx],
+            salient_event_ind=salient_event_ind,
+            salience_level_ind=self.salience_level_ind[batch_idx],
             seq_len=self.seq_len
         )
+        ret.z_q_ind.squeeze_(0)
+        if salient_event_ind is not None:
+            ret.salient_event_ind.squeeze_(0)
+        ret.actions.squeeze_(0)
+        ret.salience_level_ind.squeeze_(0)
+        return ret
 
     def append(self, other):
-        # Join gpt_ind, actions, salience_levels
-        if self.gpt_ind is None:
-            self.gpt_ind = other.gpt_ind
+        if self.z_q_ind is None:
+            assert self.actions is None
+            assert self.salient_event_ind is None
+            assert self.salience_level_ind is None
+            self.z_q_ind = other.z_q_ind
             self.actions = other.actions
-            self.salience_levels = other.salience_levels
+            self.salient_event_ind = other.salient_event_ind
+            self.salience_level_ind = other.salience_level_ind
         else:
-            assert self.actions is not None
-            assert self.salience_levels is not None
-            self.gpt_ind = torch.stack((self.gpt_ind, other.gpt_ind))
+            assert None not in (
+                self.actions, self.salient_event_ind, self.salience_level_ind
+            )
+            self.z_q_ind = torch.stack((self.z_q_ind, other.z_q_ind))
             self.actions = torch.stack((self.actions, other.actions))
-            self.salience_levels = torch.stack((
-                self.salience_levels,
-                other.salience_levels),
+            self.salient_event_ind = torch.stack(
+                (self.salient_event_ind, other.salient_event_ind)
+            )
+            self.salience_level_ind = torch.stack((
+                self.salience_level_ind,
+                other.salience_level_ind),
                 dim=1
             )
-        self.gpt_ind = self.gpt_ind.view(
-            -1, self.seq_len, *self.gpt_ind.shape[2:]
-        )
-        self.actions = self.actions.view(-1, self.seq_len)
-        self.salience_levels = self.salience_levels.view(-1, self.seq_len)
 
+        self._ensure_shape()
+
+    def _ensure_shape(self):
+        if self.z_q_ind is not None:
+            assert None not in (self.actions, self.salience_level_ind)
+            a_shp = self.actions.shape
+            if len(a_shp) == 1:
+                if a_shp[0] != self.seq_len:
+                    # We have multiple samples/sequences,
+                    # add sequence dimension (and batch if needed)
+                    self._reshape_multi_sequence(a_shp)
+                else:
+                    # Add batch dimension as 1 if missing
+                    self._reshape_single_sequence()
+
+    def _reshape_single_sequence(self):
+        self.z_q_ind = self.z_q_ind.unsqueeze(0)
+        self.actions = self.actions.unsqueeze(0)
+        if self.salient_event_ind is not None:
+            self.salient_event_ind = self.salient_event_ind.unsqueeze(0)
+        self.salience_level_ind = self.salience_level_ind.unsqueeze(0)
+
+    def _reshape_multi_sequence(self, a_shp):
+        assert len(self.salience_level_ind.shape) == 1
+        assert self.z_q_ind.shape[0] == a_shp[0]
+        self.actions = self.actions.view(-1, self.seq_len)
+        self.z_q_ind = self.z_q_ind.view(
+            -1, self.seq_len, *self.z_q_ind.shape[-2:]
+        )
+        if self.salient_event_ind is not None:
+            self.salient_event_ind = self.salient_event_ind.view(
+                -1, self.seq_len
+            )
+        self.salience_level_ind = self.salience_level_ind.view(-1, self.seq_len)
+
+    def num_steps(self):
+        return len(self.salience_level_ind.view(-1))
+
+    def __len__(self):
+        # We always have salience_level_ind
+        return len(self.salience_level_ind)
 
 
 def dataclass_no_none_dict(obj):

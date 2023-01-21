@@ -3,6 +3,8 @@ import numpy as np
 import torch
 from torch.nn import functional as F
 
+from learn_max.constants import MAX_NUM_SALIENCE_LEVELS
+
 
 def set_seed(seed):
     random.seed(seed)
@@ -68,8 +70,15 @@ def get_action_and_delim_emb(actions, z_q_ind, z_q_emb, num_state_embeddings, nu
     return ret
 
 
-def add_non_sensory_tokens(actions, z_q_ind, num_state_embeddings, num_actions,
-                           tokens_in_frame, salience_levels):
+def add_non_state_tokens(
+        z_q_ind,
+        actions,
+        num_state_embeddings,
+        num_actions,
+        tokens_in_frame,
+        salient_event_ind,
+        salience_level_ind,
+):
     device = z_q_ind.device
     if len(z_q_ind.shape) == 3:
         B, S, TiF = z_q_ind.shape  # batch, sequence-frames, tokens-in-frame
@@ -86,24 +95,36 @@ def add_non_sensory_tokens(actions, z_q_ind, num_state_embeddings, num_actions,
     # z_q_flat = z_q_flat.reshape(B * S, H * W * E)
     # z_q_flat = torch.cat((z_q_flat, flat_delim), 1).reshape(B, S, H * W * E + E)
 
+    salience_level_ind = salience_level_ind.reshape(B * S, 1)
+
+    # Keep sensory and non-sensory tokens separate
+    if salient_event_ind is None:
+        action_z_q_ind = num_state_embeddings + actions
+        action_z_q_ind = action_z_q_ind.reshape(B * S, 1)
+        z_q_ind = z_q_ind.reshape(B * S, TiF)
+
+        # After state patches and action token, delim token
+        # is the same index for every frame
+        delim_ind = num_state_embeddings + num_actions
+
+        # index for delim to be fed into token embedding
+        ind_delim = torch.tensor(delim_ind).to(device)
+        ind_delim = ind_delim.repeat(B * S, 1)
+        salience_level_ind += delim_ind  # avoid overlap with image patch indices
+        gpt_ind = torch.cat(
+            (z_q_ind, action_z_q_ind, salience_level_ind, ind_delim),
+            -1,
+        )
+        gpt_ind = gpt_ind.reshape(B, S, tokens_in_frame)
+    else:
+        # TODO: Add index delim if poor salient prediction accuracy
+        # We use a separate transformer for salient events, so don't need to worry about
+        # overlap with image patch indices
+        salient_event_ind += MAX_NUM_SALIENCE_LEVELS  # Don't overlap
+        gpt_ind = torch.cat((salient_event_ind, salience_level_ind,), -1)
 
 
-    action_z_q_ind = num_state_embeddings + actions
-    action_z_q_ind = action_z_q_ind.reshape(B * S, 1)
-    z_q_ind = z_q_ind.reshape(B * S, TiF)
 
-    # After state patches and action token, delim token
-    # is the same index for every frame
-    DELIM_IND = num_state_embeddings + num_actions
-    # index for delim to be fed into token embedding
-    ind_delim = torch.tensor(DELIM_IND).to(device)
-    ind_delim = ind_delim.repeat(B * S, 1)
+    assert gpt_ind.shape[-1] == tokens_in_frame
 
-    salience_levels = salience_levels.reshape(B * S, 1)
-
-    z_q_ind = torch.cat((z_q_ind, action_z_q_ind, ind_delim, salience_levels), -1)
-    z_q_ind = z_q_ind.reshape(B, S, tokens_in_frame)
-
-    assert z_q_ind.shape[-1] == tokens_in_frame
-
-    return z_q_ind
+    return gpt_ind

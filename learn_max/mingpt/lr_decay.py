@@ -2,6 +2,7 @@ import math
 import os
 
 import pytorch_lightning as pl
+from loguru import logger as log
 
 class GptWarmupCosineLearningRateDecay(pl.Callback):
     """
@@ -20,14 +21,19 @@ class GptWarmupCosineLearningRateDecay(pl.Callback):
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx=None):
         if pl_module.is_single_token2:
-            a_x, a_y, gpt_x, z_q_ind_x, z_q_ind_y = pl_module.gpt.get_batch_vars(batch)
+            a_x, a_y, gpt_x, z_q_ind_x, z_q_ind_y = pl_module.gpt.get_batch(batch)
             ind = z_q_ind_y
         else:
-            z_q_ind, actions, salience_levels = pl_module.gpt.get_batch_vars(batch)
-            ind = z_q_ind
+            gpt_batch = pl_module.gpt.get_batch(batch)
+            ind = gpt_batch.z_q_ind
+            # TODO: Consider gpt_batch.salient_event_ind as well?
         self.tokens += (ind >= 0).sum()  # y == -100 is "ignore", so don't count these (-100 is Karpathy artifact, no longer needed really. always is ind.numel())
         if self.tokens < self.warmup_tokens:
             # linear warmup
+            log.success(
+                f'WARMUP: {self.tokens} / {self.warmup_tokens} - ' +
+                f'If too late consider adding salient event ind tokens'
+            )
             lr_mult = float(self.tokens) / float(max(1, self.warmup_tokens))
         else:
             # followed by cosine learning rate decay
