@@ -9,7 +9,7 @@ train_to_test_collection_ratio = 10
 
 def get_model_args():
     args = get_blank_model_args()
-    args.gpt_batch_size = 7
+    args.gpt_batch_size = 7  # sequences per sensor batch
     args.gpt_seq_len = 8  # 10 gives OOM
     args.single_token2 = False
     args.viz_predict_trajectory = True
@@ -19,7 +19,8 @@ def get_model_args():
     args.salience_resume_path = '/home/a/src/learnmax/pickles/2022.12.17_17:45:07.646449/salience_store/lvl_1'
     args.salience_use_logits = False
     args.num_state_embeddings = 256  # 6 actions plus 1 delim => 263
-    args.embedding_dim = 30
+    args.sensor_embedding_dim = 30
+    args.salient_embedding_dim = 256
 
     # Overfit args
     args.should_overfit_gpt = False

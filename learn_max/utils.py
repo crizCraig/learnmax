@@ -1,6 +1,8 @@
 import collections
 import os
+import time
 import traceback
+from abc import abstractmethod, ABC
 from dataclasses import dataclass
 from datetime import datetime
 from functools import wraps
@@ -12,6 +14,7 @@ import wandb
 from numpy import array
 from torch import nn
 from PIL import Image
+from loguru import logger as log
 
 from learn_max.constants import DATE_FMT, WANDB_MAX_LOG_PERIOD, ROOT_DIR, RUN_ID
 
@@ -459,72 +462,83 @@ def dataclass_to_dict(thing, dataclass):
         return [_.dict() for _ in thing]
 
 # TODO: Create GptBatchSensor and GptBatchSalient
+
 @dataclass
-class GptBatch:
-    z_q_ind: torch.Tensor = None
-    actions: torch.Tensor = None
-    salient_event_ind: torch.Tensor = None
+class GptBatchBase:
     salience_level_ind: torch.Tensor = None
     seq_len: int = None
+    type: str = None
+
 
     def __post_init__(self):
+        self.type = type(self).__name__
         self._ensure_shape()
+
+    @abstractmethod
+    def _ensure_shape(self):
+
+        pass
 
     def dict(self):
         ret = dataclass_no_none_dict(self)
-        ret['type'] = type(self).__name__
+        return ret
 
-    def empty(self):
-        self.z_q_ind = torch.tensor([0])
-        self.actions = torch.tensor([0])
-        self.salient_event_ind = torch.tensor([0])
+    def _empty_(self):
         self.salience_level_ind = torch.tensor([0])
         self.seq_len = 0
 
-    def __getitem__(self, batch_idx):
-        if self.salient_event_ind is not None:
-            salient_event_ind = self.salient_event_ind[batch_idx]
-        else:
-            salient_event_ind = None
-        ret = GptBatch(
-            z_q_ind=self.z_q_ind[batch_idx],
-            actions=self.actions[batch_idx],
-            salient_event_ind=salient_event_ind,
-            salience_level_ind=self.salience_level_ind[batch_idx],
+    def __getitem__(self, batch_idx) -> dict:
+        ret = dict(
+            salience_level_ind=self.salience_level_ind[batch_idx].squeeze_(0),
             seq_len=self.seq_len
         )
-        ret.z_q_ind.squeeze_(0)
-        if salient_event_ind is not None:
-            ret.salient_event_ind.squeeze_(0)
-        ret.actions.squeeze_(0)
-        ret.salience_level_ind.squeeze_(0)
+        ret['type'] = type(self).__name__
         return ret
 
-    def append(self, other):
-        if self.z_q_ind is None:
-            assert self.actions is None
-            assert self.salient_event_ind is None
-            assert self.salience_level_ind is None
-            self.z_q_ind = other.z_q_ind
-            self.actions = other.actions
-            self.salient_event_ind = other.salient_event_ind
-            self.salience_level_ind = other.salience_level_ind
-        else:
-            assert None not in (
-                self.actions, self.salient_event_ind, self.salience_level_ind
-            )
-            self.z_q_ind = torch.stack((self.z_q_ind, other.z_q_ind))
-            self.actions = torch.stack((self.actions, other.actions))
-            self.salient_event_ind = torch.stack(
-                (self.salient_event_ind, other.salient_event_ind)
-            )
-            self.salience_level_ind = torch.stack((
-                self.salience_level_ind,
-                other.salience_level_ind),
-                dim=1
-            )
+    def _reshape_single_sequence(self):
+        self._reshape_single_sequence_hook()
+        self.salience_level_ind = self.salience_level_ind.unsqueeze(0)
 
-        self._ensure_shape()
+    def _reshape_multi_sequence(self, a_shp):
+        self._reshape_multi_sequence_hook(a_shp)
+        assert len(self.salience_level_ind.shape) == 1
+        self.salience_level_ind = self.salience_level_ind.view(-1, self.seq_len)
+
+    def num_steps(self):
+        return len(self.salience_level_ind.view(-1))
+
+    def __len__(self):
+        # We always have salience_level_ind
+        return len(self.salience_level_ind)
+
+    # Hooks
+    def _reshape_single_sequence_hook(self):
+        pass
+
+    def _reshape_multi_sequence_hook(self):
+        pass
+
+
+@dataclass
+class GptSensorBatch(GptBatchBase):
+    z_q_ind: torch.Tensor = None
+    actions: torch.Tensor = None
+
+    def empty_(self):
+        super()._empty_()
+        self.z_q_ind = torch.tensor([0])
+        self.actions = torch.tensor([0])
+
+    def _reshape_single_sequence_hook(self):
+        self.z_q_ind = self.z_q_ind.unsqueeze(0)
+        self.actions = self.actions.unsqueeze(0)
+
+    def _reshape_multi_sequence_hook(self, a_shp):
+        assert self.z_q_ind.shape[0] == a_shp[0]
+        self.actions = self.actions.view(-1, self.seq_len)
+        self.z_q_ind = self.z_q_ind.view(
+            -1, self.seq_len, *self.z_q_ind.shape[-2:]
+        )
 
     def _ensure_shape(self):
         if self.z_q_ind is not None:
@@ -539,33 +553,41 @@ class GptBatch:
                     # Add batch dimension as 1 if missing
                     self._reshape_single_sequence()
 
-    def _reshape_single_sequence(self):
-        self.z_q_ind = self.z_q_ind.unsqueeze(0)
-        self.actions = self.actions.unsqueeze(0)
-        if self.salient_event_ind is not None:
-            self.salient_event_ind = self.salient_event_ind.unsqueeze(0)
-        self.salience_level_ind = self.salience_level_ind.unsqueeze(0)
-
-    def _reshape_multi_sequence(self, a_shp):
-        assert len(self.salience_level_ind.shape) == 1
-        assert self.z_q_ind.shape[0] == a_shp[0]
-        self.actions = self.actions.view(-1, self.seq_len)
-        self.z_q_ind = self.z_q_ind.view(
-            -1, self.seq_len, *self.z_q_ind.shape[-2:]
+    def __getitem__(self, batch_idx) -> dict:
+        ret = dict(
+            z_q_ind=self.z_q_ind[batch_idx],
+            actions=self.actions[batch_idx],
+            **super().__getitem__(batch_idx),
         )
-        if self.salient_event_ind is not None:
-            self.salient_event_ind = self.salient_event_ind.view(
-                -1, self.seq_len
-            )
-        self.salience_level_ind = self.salience_level_ind.view(-1, self.seq_len)
+        return ret
 
-    def num_steps(self):
-        return len(self.salience_level_ind.view(-1))
 
-    def __len__(self):
-        # We always have salience_level_ind
-        return len(self.salience_level_ind)
+@dataclass
+class GptSalientBatch(GptBatchBase):
+    salient_event_ind: torch.Tensor = None
 
+    def __getitem__(self, batch_idx) -> dict:
+        ret = dict(
+            salient_event_ind=self.salient_event_ind[batch_idx].squeeze_(0),
+            **super().__getitem__(batch_idx),
+        )
+        return ret
+
+    def _reshape_single_sequence_hook(self):
+        self.salient_event_ind = self.salient_event_ind.unsqueeze(0)
+
+    def _reshape_multi_sequence_hook(self, a_shp):
+        self.salient_event_ind = self.salient_event_ind.view(-1, self.seq_len)
+
+    def empty_(self):
+        self.salient_event_ind = torch.tensor([0])
+        super()._empty_()
+
+
+GPT_BATCH_TYPE_MAP = {
+    GptSensorBatch.__name__: GptSensorBatch,
+    GptSalientBatch.__name__: GptSalientBatch,
+}
 
 def dataclass_no_none_dict(obj):
     d = obj.__dict__
@@ -576,6 +598,35 @@ def dataclass_no_none_dict(obj):
             ret[k] = d[k]
     return ret
 
-if __name__ == '__main__':
-    test_get_state()
+def test_gpt_batch():
+    sensor_batch = GptSensorBatch()
+    sensor_batch.empty_()
+    x = sensor_batch[0]
+    assert x['salience_level_ind'] is not None
+    assert x['actions'] is not None
+    assert x['z_q_ind'] is not None
+    assert x['seq_len'] is not None
+    assert len(x['salience_level_ind'].shape) == 0
+    assert len(x['actions'].shape) == 0
+    assert len(x['z_q_ind'].shape) == 0
+
+
+    salient_batch = GptSalientBatch()
+    salient_batch.empty_()
+    y = salient_batch[0]
+    assert y['salient_event_ind'] is not None
+    assert y['salience_level_ind'] is not None
+    assert y['seq_len'] is not None
+    assert len(y['salience_level_ind'].shape) == 0
+    assert len(y['salient_event_ind'].shape) == 0
+
+def run_tests():
+    start = time.time()
     test_topk_interesting()
+    test_gpt_batch()
+    log.success(f'Import tests passed in {int((time.time() - start) * 1000)}ms')
+
+run_tests()
+
+if __name__ == '__main__':
+    test_gpt_batch()

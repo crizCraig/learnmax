@@ -15,13 +15,17 @@ import numpy as np
 import torch
 import torch.nn as nn
 from loguru import logger as log
-from tdigest import TDigest
 from torch.nn import functional as F
 
 from learn_max.constants import ACC_LOG_PERIOD
 from learn_max.mingpt.utils import add_non_state_tokens
-from learn_max.salience.detect_salience import detect_salience
-from learn_max.utils import accuracy, wandb_log, sa2as, GptBatch
+from learn_max.utils import (
+    accuracy,
+    wandb_log,
+    sa2as,
+    GPT_BATCH_TYPE_MAP,
+    GptSalientBatch,
+)
 
 
 class CausalSelfAttention(nn.Module):
@@ -125,20 +129,22 @@ class GPT(nn.Module):
                  is_single_token2: bool = False,  # whether there's one token per image
                  state_tokens_in_frame: int = None,  # number of state tokens (i.e. not action or delimeter) in frame
                  tokens_in_frame: int = None,  # number of tokens per frame (1 in single token)
+                 tokens_in_salient_step: int = None,  # number of tokens per salient step
                  batch_size: int = None,
                  ):
         super().__init__()
         self.output_size = output_size
         self.is_single_token2 = is_single_token2
         self.batch_size = batch_size
-        self.frames_in_sequence_window = frames_in_sequence_window
+        self.steps_in_sequence_window = frames_in_sequence_window
         self.sequences_per_salient_event = 2
         self.frames_in_salient_event = (
-            self.frames_in_sequence_window * self.sequences_per_salient_event
+                self.steps_in_sequence_window * self.sequences_per_salient_event
         )
         assert self.frames_in_salient_event > 0
         self.state_tokens_in_frame = state_tokens_in_frame
         self.tokens_in_frame = tokens_in_frame
+        self.tokens_in_salient_step = tokens_in_salient_step
 
         # save these for optimizer init later
         self.learning_rate = learning_rate
@@ -148,7 +154,7 @@ class GPT(nn.Module):
         # input embedding stem: drop(content + position)
         #  Eventually:
         #     content = prev_salient + next_salient + dvq_token + learned_token + action_token
-        action_embedding_dim = 100
+        # action_embedding_dim = 100
         embedding_dim = input_embedding_dim  # + action_embedding_dim
         # self.dvq_proj = nn.Linear(input_embedding_dim, embedding_dim)
         assert embedding_dim % n_head == 0, f'Embedding len {embedding_dim} not evenly divisible by number of heads {n_head}'
@@ -161,14 +167,16 @@ class GPT(nn.Module):
 
         # block_size is the length of the model's context window in time
         if is_single_token2:
-            seq_len = frames_in_sequence_window
+            tokens_in_seq = frames_in_sequence_window
         else:
-            seq_len = tokens_in_frame * frames_in_sequence_window
-            # Queue to store history of combined recent states for determining salience
-            self.saliency_q = deque(maxlen=seq_len)
-        self.pos_emb = nn.Parameter(torch.zeros(1, seq_len, embedding_dim))
-        self.patch_pos_emb = nn.Parameter(torch.zeros(1, tokens_in_frame, embedding_dim))
-        self.frame_pos_emb = nn.Parameter(torch.zeros(1, frames_in_sequence_window, tokens_in_frame, embedding_dim))
+            tokens_in_seq = tokens_in_frame * frames_in_sequence_window
+        self.pos_emb = nn.Parameter(torch.zeros(1, tokens_in_seq, embedding_dim))
+        self.patch_pos_emb = nn.Parameter(
+            torch.zeros(1, tokens_in_frame, embedding_dim)
+        )
+        self.frame_pos_emb = nn.Parameter(
+            torch.zeros(1, frames_in_sequence_window, tokens_in_frame, embedding_dim)
+        )
 
         # Only for single token, tok_emb does actions and delim otherwise
         self.act_emb = nn.Embedding(num_actions, input_embedding_dim)
@@ -176,7 +184,9 @@ class GPT(nn.Module):
 
         self.drop = nn.Dropout(embd_pdrop)
         # deep transformer: just a sequence of transformer blocks
-        self.blocks, _, out_dims = self.init_blocks(attn_pdrop, seq_len, embedding_dim, n_head, n_layer, resid_pdrop)
+        self.blocks, _, out_dims = self.init_blocks(
+            attn_pdrop, tokens_in_seq, embedding_dim, n_head, n_layer, resid_pdrop
+        )
         out_embedding_dim = out_dims[-1]
 
         # decoder: at the end one more layernorm and decode the answers
@@ -192,7 +202,7 @@ class GPT(nn.Module):
 
         self.target_idx = torch.arange(output_size)
 
-        self.seq_len = seq_len
+        self.tok_in_seq = tokens_in_seq
         self.apply(self._init_weights)
 
         self.iter = 0
@@ -244,7 +254,7 @@ class GPT(nn.Module):
         return embedding_dim
 
     def get_block_size(self):
-        return self.seq_len
+        return self.tok_in_seq
 
     def _init_weights(self, module):
         """
@@ -338,9 +348,9 @@ class GPT(nn.Module):
 
             B, FiS, TiF = tok_ind.size()  # batch, frames in sequence, tokens in frame
             assert TiF == self.tokens_in_frame
-            assert TiF * FiS <= self.seq_len, 'Cannot forward, model sequence length is exhausted.'
+            assert TiF * FiS <= self.tok_in_seq, 'Cannot forward, model sequence length is exhausted.'
             token_embed = self.tok_emb(tok_ind)  # each input token index maps to a (learnable) vector
-            assert FiS <= self.frames_in_sequence_window
+            assert FiS <= self.steps_in_sequence_window
             assert TiF <= self.tokens_in_frame
 
             # map frame and patch positions to a learnable vector
@@ -377,8 +387,8 @@ class GPT(nn.Module):
         """
         _, S, H, W = z_q_ind.shape
         # Break forward up into multiple self.frames_in_sequence_window tensors
-        z_q_ind_f = z_q_ind.reshape(S//self.frames_in_sequence_window, -1, H*W)
-        actions_f = actions.reshape(S//self.frames_in_sequence_window, -1)
+        z_q_ind_f = z_q_ind.reshape(S // self.steps_in_sequence_window, -1, H * W)
+        actions_f = actions.reshape(S // self.steps_in_sequence_window, -1)
         logits, expected_deviation = self.forward(z_q_ind_f, actions_f)
         # Normalize logits - These need to be normalized by dividing by the average of recent logits,
         #   that way we can compare old saliences to new ones even when logits increase over time.
@@ -411,7 +421,7 @@ class GPT(nn.Module):
         #     b, t = idx_or_embed.size()
         #     embed = None
         b, t, e = embed.size()
-        assert t <= self.seq_len, "Cannot forward, model block size is exhausted."
+        assert t <= self.tok_in_seq, "Cannot forward, model block size is exhausted."
         # forward the GPT model
         token_embed = self.tok_emb(idx)  # each input token index maps to a (learnable) vector
         position_embed = self.pos_emb[:, :t, :]  # each position maps to a (learnable) vector
@@ -441,7 +451,7 @@ class GPT(nn.Module):
         if self.is_single_token2:
             embed, z_q_ind, next_idx, a, a_next = batch  # gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y
             if split == 'train':
-                assert embed.size()[1] == self.seq_len, \
+                assert embed.size()[1] == self.tok_in_seq, \
                     'Not filling block size in train will result in untrained latter positions.'
 
             target_idx = self.s_i_to_as_i(next_idx, a_next)
@@ -449,14 +459,16 @@ class GPT(nn.Module):
         else:
             z_q_ind = batch.z_q_ind
             actions = batch.actions
-            salient_event_ind = batch.salient_event_ind
+            salient_event_ind = (
+                batch.salient_event_ind if isinstance(batch, GptSalientBatch) else None
+            )
             salience_level_ind = batch.salience_level_ind
             B, FiS, H, W = z_q_ind.shape
             TiF = H * W
             assert TiF <= self.tokens_in_frame  # delim and action not added yet
             z_q_ind = z_q_ind.reshape(B, FiS, TiF)
             if split == 'train':
-                assert FiS * TiF >= self.seq_len, \
+                assert FiS * TiF >= self.tok_in_seq, \
                     'Not filling block size in train will result in untrained latter positions.'
             # Shift targets by one patch
             # target_idx = z_q_ind[:,1:,:]
@@ -635,8 +647,10 @@ class GPT(nn.Module):
     def get_batch(self, batch):
         # TODO: Just put everything in agent_state, next_agent_state dicts
         if isinstance(batch, dict):
-            return GptBatch(**batch)
+            batch_type = batch['type'][0]  # All same type
+            return GPT_BATCH_TYPE_MAP[batch_type](**batch)
         elif len(batch) == 7:
+            # TODO: We should be able to delete this now that we have GptBatch
             # Has agent state and indices
             (
                 states,
