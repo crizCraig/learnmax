@@ -2,7 +2,7 @@ import os
 
 from learn_max.config import get_blank_model_args, get_blank_train_args
 from learn_max.model import cli_main
-from learn_max.salience.salience import SalientEvent  # TODO: Move to pickle import module as these accumulate
+from learn_max.salience.salience import SalientCluster  # TODO: Move to pickle import module as these accumulate
 
 train_to_test_collection_ratio = 10
 

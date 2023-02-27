@@ -6,17 +6,34 @@ import os
 import shutil
 from collections import deque, OrderedDict
 from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
 import torch
 
 from learn_max.agent import AgentState
-from learn_max.constants import ROOT_DIR, RUN_ID, DATE_STR
+from learn_max.constants import ROOT_DIR, RUN_ID, DATE_STR, DEFAULT_MAX_LRU_SIZE, REPLAY_FILE_PREFIX
 from loguru import logger as log
+
 
 @dataclass
 class SalientExperience:
-    cluster_index: int
     replay_index: int = None
-    split: str = None  # TODO: Add level
+    below_replay_index: int = None
+    patch_diff: np.ndarray = None
+    seq_len: int = None
+    dist: float = None
+    split: str = None
+    level: int = None
+    cluster_index: int = None
+
+    # From cluster. NOTE: There's currently
+    # no fully qualified path to the replay buffer these came from
+    # So if you do a salience_resume_path, the link to the original
+    # lvl 0 cluster will be gone. The below_repaly_index however,
+    # will still be from the same run as the replay_index, so these
+    # can be assumed to be in the same parent folder.
+    below_replay_indexes: int = None
 
 
 @dataclass
@@ -51,7 +68,7 @@ class ReplayBuffers:
             data_dir=None,
             frames_per_file=200,
             train_to_test_collection_ratio=10,
-            max_lru_size=100,
+            max_lru_size=DEFAULT_MAX_LRU_SIZE,
             overfit_to_short_term=False,
             verbose=True,
             salience_level=0
@@ -101,13 +118,32 @@ class ReplayBuffers:
             data_dir = f'{root_data_dir}/d_{DATE_STR}_r-{RUN_ID}_env-{env_id}/lvl_{salience_level}'
             os.makedirs(data_dir)
         else:
+            # Also note that resuming should deal with branching. So we should copy the
+            # old replay buffer or deal with logical branching and a virtual replay
+            # index space to map to original buffer.
             raise NotImplementedError('Need to get replay_index from last episode_end_i and fill files of buffers')
         log.info(f'Saving replay buffer to {data_dir}')
         self.data_dir = data_dir
         self.test_dir = data_dir + '/test'
         self.train_dir = data_dir + '/train'
-        self.test_buf = ReplayBuffer('test', self, self.test_dir, max_lru_size=max_lru_size)
-        self.train_buf = ReplayBuffer('train', self, self.train_dir, max_lru_size=max_lru_size)
+        self.test_buf = ReplayBuffer(
+            split='test',
+            replay_buffers=self,
+            data_dir=self.test_dir,
+            frames_per_file=self.frames_per_file,
+            env_id=self.env_id,
+            salience_level=self.salience_level,
+            max_lru_size=max_lru_size,
+        )
+        self.train_buf = ReplayBuffer(
+            split='train',
+            replay_buffers=self,
+            data_dir=self.train_dir,
+            frames_per_file=self.frames_per_file,
+            env_id=self.env_id,
+            salience_level=self.salience_level,
+            max_lru_size=max_lru_size,
+        )
         self.curr_buf = self.test_buf  # Fill test buff first
 
     def is_train(self):
@@ -124,7 +160,7 @@ class ReplayBuffers:
         self.short_term_mem.append(exp)
         if self.is_sensory() and exp.done:
             self.episode_i += 1
-        if self.curr_buf.just_flushed:
+        if self.curr_buf._just_flushed:
             self.flush_i += 1
             # We fill the test_buff to start, so that we have some data, which makes the pattern weird at first.
             # Say you have 3 exp's per file and train to test is 2, then the pattern for the first 9 exp's would be
@@ -134,8 +170,8 @@ class ReplayBuffers:
             # test  0,1,2|6,7,8     vs rest of training pattern   # test  6,7,8|
             # train 3,4,5|9,10,11                                 # train 0,1,2|3,4,5|9,10,11
             # So they are the same except for 0,1,2.
-
-            if (self.flush_i % (self.train_to_test_collection_ratio + 1)) == self.train_to_test_collection_ratio:
+            new_train = self.flush_i % (self.train_to_test_collection_ratio + 1)
+            if new_train == self.train_to_test_collection_ratio:
                 self.curr_buf = self.test_buf
             else:
                 self.curr_buf = self.train_buf
@@ -147,19 +183,49 @@ class ReplayBuffers:
 
 
 class ReplayBuffer:
-    def __init__(self, split, replay_buffers, data_dir, max_lru_size):
+    def __init__(
+        self,
+        split,
+        data_dir,
+        frames_per_file,
+        env_id,
+        salience_level,
+        replay_buffers=None,
+        read_only=False,
+        length=0,
+        max_lru_size=DEFAULT_MAX_LRU_SIZE,
+    ):
         self.split = split  # train or test
         self.replay_buffers = replay_buffers
-        self.salience_level = replay_buffers.salience_level
-        self.frames_per_file = replay_buffers.frames_per_file
-        self.overfit_to_short_term = replay_buffers.overfit_to_short_term
-        self._flush_buf = []
-        self.length = 0
+        self.env_id = env_id
+        self.salience_level = salience_level
+        self.overfit_to_short_term = False
+
+        if read_only:
+            assert (
+                replay_buffers is None
+            ), 'ReplayBuffers serialization is not implemented yet'
+        else:
+            assert replay_buffers is not None
+            assert not read_only
+            self.overfit_to_short_term = replay_buffers.overfit_to_short_term
+        self.read_only = read_only
         self.data_dir = data_dir
         self.files = sorted(glob.glob(self.data_dir + '/*.pt'))
+        self.length = length
         os.makedirs(self.data_dir, exist_ok=True)
-        self.lru = LRU(max_size=max_lru_size)
-        self.just_flushed = False
+        self.max_lru_size = max_lru_size
+        self.lru = self.create_lru()
+
+        self._just_flushed = False
+        self._flush_buf = []
+        self._frames_per_file = frames_per_file
+
+    def create_lru(self):
+        if getattr(self, 'max_lru_size', None) is None:
+            self.max_lru_size = DEFAULT_MAX_LRU_SIZE
+        self.lru = LRU(max_size=self.max_lru_size)
+        return self.lru
 
     def __len__(self):
         if self.overfit_to_short_term:
@@ -173,11 +239,11 @@ class ReplayBuffer:
             return list(itertools.islice(self.replay_buffers.short_term_mem, start, start + length))
         if not (0 <= start < self.length):
             return []
-        file_i = start // self.frames_per_file
-        k = start - file_i * self.frames_per_file
+        file_i = start // self._frames_per_file
+        k = start - file_i * self._frames_per_file
         if not (file_i < len(self.files)):
             if file_i == len(self.files):
-                # Requested frames are recent and have not been flushed,
+                # Requested frames are recent and have not been persisted,
                 # assumed to be on device
                 exps = self._flush_buf[k:k+length]
                 self.exps_to_device(exps, device)
@@ -185,7 +251,9 @@ class ReplayBuffer:
             raise NotImplementedError('Unforeseen index error, should have returned empty list')
         block = self._load(start)
         exps = block['exps'][k:k+length]
-        exps = [Experience(**exp) for exp in exps]
+        exp_cls = Experience if self.is_sensory() else SalientExperience
+
+        exps = [exp_cls(**exp) for exp in exps]
 
         # Make a copy so when lightning transfers to GPU for train_batch,
         # we don't keep a reference to that GPU mem here and keep it from being garbage collected,
@@ -208,6 +276,7 @@ class ReplayBuffer:
                 exp.new_state.to_(device)
 
     def append(self, exp):
+        assert not self.read_only, 'Cannot append to read only replay buffer'
         assert exp.replay_index is None
         split = 'test' if self.is_test() else 'train'
         if self.is_sensory():
@@ -216,12 +285,14 @@ class ReplayBuffer:
         exp.split = self.split
         exp.replay_index = self.length
         self._flush_buf.append(exp)
-        if len(self._flush_buf) >= self.frames_per_file:
-            self._flush()
-            self.just_flushed = True
-        else:
-            self.just_flushed = False
         self.length += 1
+        # NOTE: Not threadsafe
+        if len(self._flush_buf) >= self._frames_per_file:
+            self._flush()
+            self._just_flushed = True
+        else:
+            self._just_flushed = False
+
 
     def is_test(self):
         return self.split == 'test'
@@ -233,22 +304,41 @@ class ReplayBuffer:
         return self.salience_level == 0
 
     def _flush(self):
+        # TODO: Consider calling flush => on_disk instead as experiences
+        #  are still in memory
+        assert not self.read_only, 'Cannot flush to read only replay buffer'
         exps = [e.__dict__ for e in self._flush_buf]
-        block = dict(
-            last_append_i=self.length-1,
-            size=len(exps),
-            RUN=RUN_ID,  # Note this can be different from the buffer run id if resuming
-            env_id=self.replay_buffers.env_id,
-            episode_i=self.replay_buffers.episode_i,
-            data_dir=self.data_dir,
-            exps=exps,
-        )
-        self._save(block)
+        self._save_block(exps)
+        self.save_meta()
         self._flush_buf.clear()
         torch.cuda.empty_cache()
         gc.collect()
 
-    def _save(self, block):
+    def save_meta(self):
+        """
+        Save self without LRU and replay_buffers as they're large, are circular,
+        and we save blocks to disk. NOTE: Not threadsafe
+        """
+        lru_save = self.lru
+        parent_save = self.replay_buffers
+        self.lru = None
+        self.replay_buffers = None
+        self.read_only = True
+        torch.save(self, f'{self.data_dir}/meta_{self.split}.pt')
+        self.lru = lru_save
+        self.replay_buffers = parent_save
+        self.read_only = False
+
+    def _save_block(self, exps):
+        block = dict(
+            last_append_i=self.length-1,  # Last step index
+            size=len(exps),
+            RUN=RUN_ID,  # Note this can be different from the buffer run id if resuming
+            env_id=self.env_id,
+            episode_i=self.replay_buffers.episode_i,
+            data_dir=self.data_dir,
+            exps=exps,
+        )
         filename = self._get_filename(self.length, self.split)
         torch.save(block, filename)
         # self.lru.add(filename, block  # Don't add as we want to load into CPU mem from disk without grad_fn etc...
@@ -256,9 +346,14 @@ class ReplayBuffer:
         return filename
 
     def _load(self, replay_index):
-        file_i = replay_index // self.replay_buffers.frames_per_file
-        file_append_i = (file_i + 1) * self.replay_buffers.frames_per_file - 1
-        filename = self._get_filename(file_append_i, self.split)
+        file_i = replay_index // self._frames_per_file
+        last_step = (file_i + 1) * self._frames_per_file
+        filename = self._get_filename(last_step, self.split)
+        if not os.path.exists(filename):
+            log.warning(f'File does not exist: {filename}, checking for old file indexing (minus 1)')
+            filename = self._get_filename(last_step - 1, self.split)
+            assert os.path.exists(filename), f'File does not exist: {filename}'
+            log.success('Found old file indexing, loading')
         ret = self.lru.get(filename)
         if ret is None:
             # Map to CPU so we keep LRU files in system memory and don't fill up GPU
@@ -266,8 +361,8 @@ class ReplayBuffer:
             self.lru.add(filename, ret)
         return ret
 
-    def _get_filename(self, append_i, mode):
-        return f'{self.data_dir}/replay_buffer_{mode}_{str(int(append_i)).zfill(12)}.pt'
+    def _get_filename(self, last_step, mode):
+        return f'{self.data_dir}/{REPLAY_FILE_PREFIX}_{mode}_{str(int(last_step)).zfill(12)}.pt'
 
 
 class LRU:
@@ -289,12 +384,83 @@ class LRU:
         self.mp.move_to_end(key)
         return self.mp[key]
 
+def get_readonly_replay_buf(replay_path):
+    """
+    Get a replay buffer that is read only and can be used to sample from
+
+    We should serialize the replay buffer better so we don't have to load all the files
+
+    @param replay_path: Path to the replay buffer
+
+    @return: Replay buffer
+    """
+    path = Path(replay_path)
+    filenames = list(path.glob(f'{REPLAY_FILE_PREFIX}_*.pt'))
+    meta_path = list(path.glob(f'meta_*.pt'))
+    if len(meta_path) > 0:
+        assert len(meta_path) == 1, 'Multiple meta files found'
+        replay_buffers = torch.load(meta_path[0], map_location='cpu')
+        if replay_buffers.lru is None:
+            replay_buffers.create_lru()
+        else:
+            log.warning('Unexpected: LRU already exists, not creating')
+        return replay_buffers
+    # TODO: Remove code below once meta files are saved for replay buffers you care about
+    log.warning('No meta file found, loading all files, will be extremely slow')
+    exps = []
+    length = 0
+    episode_i = 0
+    frames_per_file = None
+    env_id = None
+    split = path.name
+    level = int(path.parent.name.split('_')[-1])
+    return_exps = False   # Caution, making True will load all exps into memory
+    for filename in filenames:
+        block = torch.load(filename, map_location='cpu')
+        size = block['size']
+        if env_id is None:
+            env_id = block['env_id']
+        else:
+            assert env_id == block['env_id'], 'All files assumed to have same env_id'
+        if frames_per_file is None:
+            frames_per_file = size
+        else:
+            assert frames_per_file == size, 'All files assumed to have same size'
+
+        if return_exps:
+            length = max(length, block['last_append_i'] + 1)
+            episode_i = max(episode_i, block['episode_i'])
+            exps += block['exps']
+        else:
+            last_file = sorted(filenames)[-1]
+            length = int(last_file.stem.split('_')[-1])
+            last_block = torch.load(last_file, map_location='cpu')
+            assert length == last_block['last_append_i'] + 1
+            assert frames_per_file == last_block['size']
+            break  # Infer everything from first / last file
+    replay_buf = ReplayBuffer(
+        split=split,
+        data_dir=replay_path,
+        env_id=env_id,
+        frames_per_file=frames_per_file,
+        salience_level=level,
+        read_only=True,  # We don't want to mix new and old events
+        length=length,
+    )
+    if return_exps:
+        return replay_buf, exps
+    return replay_buf
 
 def test_replay_buffers_sanity():
     log.info('Testing disk-backed replay buffers')
-    replay_buffers = ReplayBuffers(env_id='my_test_env', short_term_mem_max_length=5, frames_per_file=3,
-                                   train_to_test_collection_ratio=2,
-                                   max_lru_size=2, verbose=False)
+    replay_buffers = ReplayBuffers(
+        env_id='my_test_env',
+        short_term_mem_max_length=5,
+        frames_per_file=3,
+        train_to_test_collection_ratio=2,
+        max_lru_size=2,
+        verbose=False,
+    )
     # Flush one file to both train and test buffers
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     for i in range(replay_buffers.frames_per_file * replay_buffers.train_to_test_collection_ratio):
@@ -304,6 +470,8 @@ def test_replay_buffers_sanity():
             reward=i,
             done=False,
             new_state=AgentState()))
+        if replay_buffers.train_buf._just_flushed:
+            test_serialize(replay_buffers.train_buf)
 
     assert replay_buffers.total_length == replay_buffers.frames_per_file * replay_buffers.train_to_test_collection_ratio
     assert replay_buffers.curr_buf.is_test()
@@ -314,6 +482,7 @@ def test_replay_buffers_sanity():
     assert replay_buffers.short_term_mem[0].replay_index == 1
     assert replay_buffers.short_term_mem[1].replay_index == 2
     assert replay_buffers.short_term_mem[2].replay_index == 0
+
 
     # Add one new in-memory (i.e. not flushed) experience to test
     replay_buffers.append(Experience(
@@ -360,11 +529,11 @@ def test_replay_buffers_sanity():
     assert [e.action for e in exps] == [3, 4, 5, 9, 10]
     assert len(replay_buffers.train_buf.files) == 2
     assert len(replay_buffers.test_buf.files) == 2
-    assert [f[-5:-3] for f in replay_buffers.train_buf.files] == ['02', '05']
+    assert [f[-5:-3] for f in replay_buffers.train_buf.files] == ['03', '06']
 
     exps = replay_buffers.train_buf.get(0, 1)
     assert len(exps) == 1
-    assert list(replay_buffers.train_buf.lru.mp.items())[-1][0].endswith('000000000002.pt')
+    assert list(replay_buffers.train_buf.lru.mp.items())[-1][0].endswith('000000000003.pt')
 
     exps = replay_buffers.train_buf.get(0, 100)
     assert len(exps) == len(replay_buffers.train_buf)
@@ -386,15 +555,21 @@ def test_replay_buffers_sanity():
     exps = replay_buffers.train_buf.get(-1)
     assert exps[0].action == 12
 
-    for i in range(replay_buffers.frames_per_file * replay_buffers.train_to_test_collection_ratio):
-        replay_buffers.append(Experience(
-            state=AgentState(state=torch.tensor(0).to(device)),
-            action=replay_buffers.total_length,
-            reward=i,
-            done=False,
-            new_state=AgentState()))
+    for i in range(
+        replay_buffers.frames_per_file
+        * replay_buffers.train_to_test_collection_ratio
+    ):
+        replay_buffers.append(
+            Experience(
+                state=AgentState(state=torch.tensor(0).to(device)),
+                action=replay_buffers.total_length,
+                reward=i,
+                done=False,
+                new_state=AgentState(),
+            )
+        )
 
-    exps = replay_buffers.train_buf.get(-2)  # Load last file into LRU
+    replay_buffers.train_buf.get(-2)  # Load last file into LRU
     lru_keys = list(replay_buffers.train_buf.lru.mp.keys())
     assert lru_keys[0] != first_train_lru_file, 'LRU should overflow'
     assert len(lru_keys) != replay_buffers.train_buf.files
@@ -403,6 +578,17 @@ def test_replay_buffers_sanity():
 
     replay_buffers.delete()  # TODO: Put in tear down fn
     log.info('Done testing disk-backed replay buffers')
+
+
+def test_serialize(expected):
+    read_only_buf = get_readonly_replay_buf(expected.data_dir)
+    assert read_only_buf.read_only
+    assert read_only_buf.split == expected.split
+    assert read_only_buf.data_dir == expected.data_dir
+    assert read_only_buf.env_id == expected.env_id
+    assert read_only_buf._frames_per_file == expected._frames_per_file
+    assert read_only_buf.salience_level == expected.salience_level
+    assert read_only_buf.length == expected.length
 
 
 def test_replay_buffers_overfit():

@@ -76,7 +76,7 @@ def add_non_state_tokens(
         num_state_embeddings,
         num_actions,
         tokens_in_frame,
-        salient_event_ind,
+        salient_cluster_ind,
         salience_level_ind,
 ):
     device = z_q_ind.device
@@ -98,7 +98,7 @@ def add_non_state_tokens(
     salience_level_ind = salience_level_ind.reshape(B * S, 1)
 
     # Keep sensory and non-sensory tokens separate
-    if salient_event_ind is None:
+    if salient_cluster_ind is None:
         action_z_q_ind = num_state_embeddings + actions
         action_z_q_ind = action_z_q_ind.reshape(B * S, 1)
         z_q_ind = z_q_ind.reshape(B * S, TiF)
@@ -120,8 +120,8 @@ def add_non_state_tokens(
         # TODO: Add index delim if poor salient prediction accuracy
         # We use a separate transformer for salient events, so don't need to worry about
         # overlap with image patch indices
-        salient_event_ind += MAX_NUM_SALIENCE_LEVELS  # Don't overlap
-        gpt_ind = torch.cat((salient_event_ind, salience_level_ind,), -1)
+        salient_cluster_ind += MAX_NUM_SALIENCE_LEVELS  # Don't overlap
+        gpt_ind = torch.cat((salient_cluster_ind, salience_level_ind,), -1)
 
 
 

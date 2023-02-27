@@ -26,7 +26,7 @@ class GptWarmupCosineLearningRateDecay(pl.Callback):
         else:
             gpt_batch = pl_module.gpt.get_batch(batch)
             ind = gpt_batch.z_q_ind
-            # TODO: Consider gpt_batch.salient_event_ind as well?
+            # TODO: Consider gpt_batch.salient_cluster_ind as well?
         self.tokens += (ind >= 0).sum()  # y == -100 is "ignore", so don't count these (-100 is Karpathy artifact, no longer needed really. always is ind.numel())
         if self.tokens < self.warmup_tokens:
             # linear warmup

@@ -9,17 +9,29 @@ from torch import nn
 
 from loguru import logger as log
 
+from learn_max.constants import NUM_DIFF_SEQ
 from learn_max.dvq.model.quantize import VQVAEQuantize
 from learn_max.mingpt.utils import get_num_output_embeddings
 from learn_max.utils import wandb_log
 
 
 @torch.no_grad()
-def detect_salience(actions, z_q_ind, z_q_emb, replay_ind, seq_len,
-                    frames_in_sequence_window, state_tokens_in_frame,
-                    tokens_in_frame, num_state_embeddings, num_actions,
-                    tdigest, min_reservoir=1000,
-                    use_emb=False, logits=None):
+def detect_salience(
+    actions,
+    z_q_ind,
+    z_q_emb,
+    replay_ind,
+    seq_len,
+    frames_in_sequence_window,
+    state_tokens_in_frame,
+    tokens_in_frame,
+    num_state_embeddings,
+    num_actions,
+    tdigest,
+    min_reservoir=1000,
+    use_emb=True,
+    logits=None,
+):
     """
     Compare subsequent sequences of length frames_in_sequence_window. If the patch-wise difference
     is greater than the 90th percentile of previously seen data (approximated by a t-digest), then return the
@@ -36,7 +48,8 @@ def detect_salience(actions, z_q_ind, z_q_emb, replay_ind, seq_len,
     # torch.log(logits.sum(axis=-1) - logits.sum(axis=-1).min() + 1e-12).min()
     # logits: 14, 8*123=984, 263
     FiS = frames_in_sequence_window
-    TiF = state_tokens_in_frame if logits is None else tokens_in_frame  # actions part of state with logits (FINE)
+    # actions part of state with logits (FINE)
+    TiF = state_tokens_in_frame if logits is None else tokens_in_frame
     S = FiS * TiF
 
     if logits is None and use_emb is False:
@@ -136,7 +149,7 @@ def detect_salience(actions, z_q_ind, z_q_emb, replay_ind, seq_len,
     #   and if you fed in 24 frames, you'd get 17 windows and 8 salience diffs (47% usage).
     salience = abs(windows[FiS:] - windows[:-FiS])
 
-    assert salience.shape[0] == _FiS - 2 * FiS + 1, 'Two subsequent sequences slid across windows'
+    assert salience.shape[0] == _FiS - NUM_DIFF_SEQ * FiS + 1, 'Two subsequent sequences slid across windows'
 
     # Sum diff across sequence-patches to get total salience for sequence
     salience = salience.reshape(salience.shape[0], -1).sum(axis=-1)
@@ -172,6 +185,9 @@ def detect_salience(actions, z_q_ind, z_q_emb, replay_ind, seq_len,
 
     salience = salience.detach().cpu().numpy()
     ret = []
+    if tdigest.n < min_reservoir and tdigest.n % 100 == 0:
+        # Log reservoir percentage
+        log.info(f'Building reservoir: {tdigest.n / min_reservoir * 100:.2f}%')
     if tdigest.n > min_reservoir:  # Get a big pool before sampling top percentile
         for i, s in enumerate(salience):
             # TODO: Test tdigest 10pct, 90pct with random numbers, should not increase!!!
@@ -186,19 +202,17 @@ def detect_salience(actions, z_q_ind, z_q_emb, replay_ind, seq_len,
             else:
                 is_salient = s > tdigest_90pct
             if is_salient:
-                # TODO: We should append more than one frame for the event so that we can more
-                #   easily detect duplicate salient events. This as the middle frame may be different
-                #   due to slightly different states/actions before and after, but the essential event is
-                #   the same. Also, it will be crucial to find the shortest path to the event in order to
-                #   train lower level actions with the event as the goal context. RL _could_ be used to
-                #   find the shortest path as well once the event is known, esp with a bellman-backup method
-                #   like q-learning.
                 before_salient = windows[i]
                 after_salient = windows[i + FiS]
                 patch_diff = after_salient - before_salient
+
+                # check that recomputing patch diff for top saliences is correct
                 assert patch_diff.abs().sum() == s
-                ret.append(dict(replay_ind=replay_ind[i] + FiS - 1,
-                                patch_diff=patch_diff))
+                ret.append(
+                    # mid_replay_ind is the last index of the first sequence
+                    # TODO: Make this a dataclass instead of a dict
+                    dict(mid_replay_ind=replay_ind[i] + FiS - 1, patch_diff=patch_diff)
+                )
 
     if len(salience) > 0:
         if len(salience) == 1:
@@ -273,10 +287,13 @@ def _test_detect_salience(num_sequences=2, use_emb=False):
     z_q_ind = torch.randint(
         low=0,
         high=num_state_embeddings,
-        size=(batch_size,
-              num_sequences * frames_in_sequence_window,
-              patch_width,
-              patch_width))
+        size=(
+            batch_size,
+            num_sequences * frames_in_sequence_window,
+            patch_width,
+            patch_width,
+        ),
+    )
     if use_emb:
         logits = None
         z_q_emb = -1 + 2 * torch.rand(
@@ -284,14 +301,15 @@ def _test_detect_salience(num_sequences=2, use_emb=False):
             num_sequences * frames_in_sequence_window,
             patch_width,
             patch_width,
-            embedding_size)
+            embedding_size,
+        )
     else:
         z_q_emb = None
         logits = -1 + 2 * torch.rand(
             batch_size,
             num_sequences * frames_in_sequence_window,  # 2 * 8
             tokens_in_frame,
-            get_num_output_embeddings(num_state_embeddings, num_actions)
+            get_num_output_embeddings(num_state_embeddings, num_actions),
         )
     # Logit shape: B, _FiS, state_tokens_in_frame, L (263???)  1,16,123,263
 
@@ -301,38 +319,64 @@ def _test_detect_salience(num_sequences=2, use_emb=False):
     min_reservoir = 10
     for i in range(min_reservoir * 2):
         # Fill up with zeroes
-        # actions, z_q_ind, z_q_emb, replay_ind, seq_len, frames_in_sequence_window, tokens_in_frame,
-        #                     state_tokens_in_frame, num_state_embeddings, num_actions, tdigest,
         zero_z_q_emb = torch.zeros_like(z_q_emb) if use_emb else None
         zero_logits = torch.zeros_like(logits) if not use_emb else None
-        detect_salience(actions, 0 * z_q_ind, zero_z_q_emb, replay_ind, seq_len, frames_in_sequence_window,
-                        state_tokens_in_frame, tokens_in_frame, num_state_embeddings, num_actions, tdigest,
-                        min_reservoir=min_reservoir, use_emb=use_emb, logits=zero_logits)
-    ret = detect_salience(actions, z_q_ind, z_q_emb, replay_ind, seq_len, frames_in_sequence_window,
-                          state_tokens_in_frame, tokens_in_frame, num_state_embeddings, num_actions, tdigest,
-                          min_reservoir=min_reservoir, use_emb=use_emb, logits=logits,)
-    assert len(ret) == num_frames - 2 * frames_in_sequence_window + 1, 'Two sequences slid across input'
+        detect_salience(
+            actions,
+            0 * z_q_ind,
+            zero_z_q_emb,
+            replay_ind,
+            seq_len,
+            frames_in_sequence_window,
+            state_tokens_in_frame,
+            tokens_in_frame,
+            num_state_embeddings,
+            num_actions,
+            tdigest,
+            min_reservoir=min_reservoir,
+            use_emb=use_emb,
+            logits=zero_logits,
+        )
+    ret = detect_salience(
+        actions,
+        z_q_ind,
+        z_q_emb,
+        replay_ind,
+        seq_len,
+        frames_in_sequence_window,
+        state_tokens_in_frame,
+        tokens_in_frame,
+        num_state_embeddings,
+        num_actions,
+        tdigest,
+        min_reservoir=min_reservoir,
+        use_emb=use_emb,
+        logits=logits,
+    )
+    assert (
+        len(ret) == num_frames - 2 * frames_in_sequence_window + 1
+    ), 'Two sequences slid across input'
     return ret
 
 
 def test_2_sequences():
     salience = _test_detect_salience(num_sequences=2)
-    assert salience[0]['replay_ind'] == 7
+    assert salience[0]['mid_replay_ind'] == 7
 
 
 def test_3_sequences():
     salience = _test_detect_salience(num_sequences=3)
-    assert [s['replay_ind'] for s in salience] == [7,8,9,10,11,12,13,14,15]
+    assert [s['mid_replay_ind'] for s in salience] == [7,8,9,10,11,12,13,14,15]
 
 
 def test_2_sequences_emb():
     salience = _test_detect_salience(num_sequences=2, use_emb=True)
-    assert salience[0]['replay_ind'] == 7
+    assert salience[0]['mid_replay_ind'] == 7
 
 
 def test_3_sequences_emb():
     salience = _test_detect_salience(num_sequences=3, use_emb=True)
-    assert [s['replay_ind'] for s in salience] == [7,8,9,10,11,12,13,14,15]
+    assert [s['mid_replay_ind'] for s in salience] == [7,8,9,10,11,12,13,14,15]
 
 
 def test_all():
@@ -341,7 +385,7 @@ def test_all():
     start = time.time()
     test_3_sequences_emb()
     test_2_sequences_emb()
-    # test_3_sequences()
+    test_3_sequences()
     test_2_sequences()
     log.success(f'Tested salience detection in {round(1e3*(time.time() - start))}ms')
 

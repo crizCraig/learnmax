@@ -1,6 +1,7 @@
 import math
 import os
 import pickle
+import sys
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -21,12 +22,12 @@ from learn_max.replay_buffer import ReplayBuffers, SalientExperience
 from learn_max.utils import get_date_str, viz_experiences, viz_salience
 
 
-TEST_PICKLE_FILE = f'{ROOT_DIR}/test_data/exp_replay_i_and_patch_diff_for_salient_events.pickle'
+TEST_PICKLE_FILE = f'{ROOT_DIR}/test_data/exp_replay_i_and_patch_diff_for_salient_clusters.pickle'
 
-class SalientEvent:
+class SalientCluster:
     def __init__(self, points_in_salient_cluster, cluster_index, dbscan):
         """
-        This object helps map the points in original salient event to the cluster index,
+        This object helps map the points in original salient cluster to the cluster index,
         through the dbscan core points. This as core points are used in a KDTree to map unseen points
         back to core points and through this object, the cluster index.
         (See core_point_map in SalienceLevel.)
@@ -37,8 +38,9 @@ class SalientEvent:
             Then see if the distance to that point is less than some percentile of points.
         """
         # percentile distances of all points in cluster
-        points = np.array([p[1]['patch_diff'].cpu().numpy()
-                           for p in points_in_salient_cluster])
+        points = np.array(
+            [p[1]['patch_diff'].cpu().numpy() for p in points_in_salient_cluster]
+        )
         points = points.reshape(points.shape[0], -1)
 
         # TODO: Most points are core points https://en.wikipedia.org/wiki/DBSCAN#Preliminary
@@ -60,16 +62,19 @@ class SalientEvent:
         self.core_sample_points = np.array(self.core_sample_points)
 
         if len(self.core_sample_points) < len(points) and cluster_index != -1:
-            log.success(f'Cluster {cluster_index} has {len(points)} points, '
-                        f'and {len(self.core_sample_points)} core sample points')
+            log.success(
+                f'Cluster {cluster_index} has {len(points)} points, '
+                f'and {len(self.core_sample_points)} core sample points'
+            )
 
         # TODO: Is this just dbscan.core_sample_indices_?
         self.core_sample_i = np.array([i for i in dbscan.core_sample_indices_ if i in index_map])
 
 
         self.cluster_index = cluster_index
-        self.replay_i = np.array([p[1]['replay_ind'].cpu().numpy()
-                                  for p in points_in_salient_cluster])
+        self.mid_replay_i = np.array(
+            [p[1]['mid_replay_ind'].cpu().numpy() for p in points_in_salient_cluster]
+        )
         self.RUN_ID = RUN_ID
         self.DATE_STR = DATE_STR
         # TODO: Store directory that replay buffer was saved to
@@ -83,14 +88,23 @@ class SalienceLevel:
     Keep 5 samples (random? different?) per cluster
     sampling to keep 10k or so 123 * 4B * 10k ~= 5MB of GPU
     """
-    # cluster_points: List[list]  # list of clusters with list of points in cluster sorted by distance from centroid
+
+    # list of clusters with list of points in cluster sorted by distance from centroid
+    # cluster_points: List[list]
     # cluster_centroids: list
-    samples_per_cluster: int = 5  # Number of samples to keep per cluster to avoid running out of mem
+
+    # Number of samples to keep per cluster to avoid running out of mem
+    samples_per_cluster: int = 5
+
     clustered_points: list
     unclustered_points: list
-    max_num_clustered_points: int = 100_000  # Increase to get better salience deduplication at cost of CPU mem
-    clusters: List[SalientEvent]
+
+    # Increase to get better salience deduplication at cost of CPU mem
+    num_points_to_cluster: int = 100_000
+
+    clusters: List[SalientCluster]
     encountered_known_salients: list
+    salience_resume_path: str = None  # Path to resume salience from
 
     def __init__(
         self,
@@ -109,7 +123,7 @@ class SalienceLevel:
         # TODO: Make this a list of kdtrees
         self.kdtree: scipy.spatial.kdtree.KDTree = None
 
-        self.above: SalientEvent = above
+        self.above: SalientCluster = above
 
         # Consider ddsketch to reduce error since we're interested in long tail salience
         # https://blog.acolyer.org/2019/09/06/ddsketch/
@@ -122,6 +136,7 @@ class SalienceLevel:
         self.steps_in_sequence_window = steps_in_sequence_window
 
         if salience_resume_path is not None:
+            self.salience_resume_path = salience_resume_path
             self.load(salience_resume_path)
 
     def __len__(self):
@@ -135,7 +150,7 @@ class SalienceLevel:
         # Move saliences to cpu
         for s in saliences:
             s['patch_diff'] = s['patch_diff'].cpu()
-            s['replay_ind'] = s['replay_ind'].cpu()
+            s['mid_replay_ind'] = s['mid_replay_ind'].cpu()
         self.unclustered_points.extend(saliences)
 
         repeats = self.detect_repeats(
@@ -143,25 +158,41 @@ class SalienceLevel:
         )
         if len(repeats) > 0:
             assert len(repeats) == 1  # TODO: Handle multiple repeats, but right now will always be one
-            salient_event = repeats[0]
+            salient_cluster, salience, dist = repeats[0]
             # TODO: Go back through replay buffer and find all experiences
             #  that are salient events and save them for training
             self.above.replay_buffers.append(  # At least salience level 1
                 # TODO: Add cluster points (core points) to salient experience (not just cluster index)
                 #   so that we can generalize to similar salient events (e.g. opening a new door
                 #   is thought to be promising for learning because previous doors have been)
-                SalientExperience(cluster_index=salient_event.cluster_index)
+                SalientExperience(
+
+                    # Avoid repeating mid_replay_ind by storing salient clusters separately
+                    below_replay_index=salience['mid_replay_ind'],
+
+                    patch_diff=salience['patch_diff'],
+                    dist=dist,
+                    seq_len=self.steps_in_sequence_window,
+                    cluster_index=salient_cluster.cluster_index,
+                    below_replay_indexes=salient_cluster.mid_replay_i,
+                    level=self.level + 1,
+                )
             )
-        progress = len(self.unclustered_points) / (0.1 * self.max_num_clustered_points)
+        progress = len(self.unclustered_points) / (0.1 * self.num_points_to_cluster)
         if len(self.unclustered_points) % 10 == 0:
             log.info(f'Percentage of points needed to cluster: ' f'{100 * progress:.2f}%')
         ret = {'new_salience_level': False}
         if self.kdtree is not None:
             log.warning('Skipping clustering as we do not have stable clustering implemented')
         elif progress >= 1:
-            # TODO: Require fewer points for clusterings after the first
-            self.cluster(dvq_decoder, device)
-            ret['new_salience_level'] = True
+            if self.salience_resume_path is not None:
+                log.warning(
+                    'Skipping clustering as we resumed salience and only cluster once'
+                            + 'currently')
+            else:
+                # TODO: Require fewer points for clusterings after the first
+                self.cluster(dvq_decoder, device)
+                ret['new_salience_level'] = True
         ret['repeats'] = repeats
         return ret
 
@@ -178,38 +209,44 @@ class SalienceLevel:
                 dist, ind = self.kdtree.query(
                     salience['patch_diff'].cpu().numpy().reshape(1, -1)
                 )
-                salient_event = self.core_point_map[ind[0]]
-                if dist < salient_event.distance_percentiles[0.5]:
+                dist = dist[0]
+                ind = ind[0]
+                # TODO: We should capture the actual event, not just the cluster it maps to.
+                #   This would mean calling salient_event, salient_cluster (more appropriate).
+                #   Perhaps SalientExperience should hold the actual below_mid_replay_index in
+                #   addition to the below_mid_replay_indexes in the salient cluster it was closest to.
+                salient_cluster = self.core_point_map[ind]
+                if dist < salient_cluster.distance_percentiles[0.5]:
                     # Here we compare the median distance (50th percentile)
                     # of all points within a cluster to the distance to the closest core point.
                     # This is okay to the extent core points are representative of the cluster.
                     # TODO: ***Try z_q_emb again***  - 10/43 - log this
                     log.success(
-                        f"Found salient event {salient_event.cluster_index} with distance {dist}"
+                        f'Found salient event {salient_cluster.cluster_index} with distance {dist}'
                     )
                     # TODO(salience): Inform parent transformer that new event occurred, store event, and train on
                     #   such events when we have enough data
-                    ret.append(salient_event)
+                    ret.append((salient_cluster, salience, dist))
                     if replay_buffers is not None:
                         # Add salient event to replay buffer
 
                         viz_salience(
                             frames_in_seq,
-                            [int(salience['replay_ind'])],
+                            [int(salience['mid_replay_ind'])],
                             replay_buffers,
                             dvq_decoder,
                             device,
-                            file_prefix=f'dupe_salient_event_{salient_event.cluster_index}_',
+                            file_prefix=f'repeat_salient_exp_for_cluster_{salient_cluster.cluster_index}_',
                         )
                 else:
                     if replay_buffers is not None:
                         viz_salience(
                             frames_in_seq,
-                            [int(salience['replay_ind'])],
+                            [int(salience['mid_replay_ind'])],
                             replay_buffers,
                             dvq_decoder,
                             device,
-                            file_prefix=f'new_salient_event_{salient_event.cluster_index}_',
+                            file_prefix=f'new_salient_exp__closest_was{salient_cluster.cluster_index}_',
                         )
         return ret
 
@@ -239,11 +276,17 @@ class SalienceLevel:
         points = self.clustered_points + self.unclustered_points
         patch_diff = np.array([p['patch_diff'].flatten().detach().cpu().numpy() for p in points]).T
         # patch diff shape: (num_state/action/delim_embeddings, tokens_in_frame)
-        self.kdtree, self.core_point_map = (
-            cluster_patch_diff(patch_diff, self.replay_buffers, points,
-                               self.steps_in_sequence_window, dvq_decoder, device)
+        self.kdtree, self.core_point_map = cluster_patch_diff(
+            patch_diff,
+            self.replay_buffers,
+            points,
+            self.steps_in_sequence_window,
+            dvq_decoder,
+            device,
         )
         self.save()
+
+        # TODO: Some reservoir sampling or just keep the core points?
         self.unclustered_points = []
 
     def load(self, path):
@@ -254,7 +297,7 @@ class SalienceLevel:
         self.tdigest = unpickle(f'{path}/tdigest.pickle')
 
     def save(self):
-        save_dir = f'{PICKLE_DIR}/salience_store/lvl_{self.level}'
+        save_dir = f'{PICKLE_DIR}/salience_store/lvl_{self.level}/{get_date_str()}'
         os.makedirs(save_dir, exist_ok=True)
         pickle_obj(self.kdtree, f'{save_dir}/kdtree.pickle')
         pickle_obj(self.core_point_map, f'{save_dir}/core_point_map.pickle')
@@ -281,9 +324,15 @@ class SalienceLevel:
             ret.append((percentile, avg_dist))
         return ret
 
-def cluster_patch_diff(patch_diff, replay_buffers=None, points=None,
-                       frames_in_sequence_window=None, dvq_decoder=None,
-                       device=None, should_save_clusters=True):
+def cluster_patch_diff(
+    patch_diff,
+    replay_buffers=None,
+    points=None,
+    frames_in_sequence_window=None,
+    dvq_decoder=None,
+    device=None,
+    should_save_clusters=True,
+):
     """
     patch diff (possibility, num_batches) where possibility is flattened logits for all patches,
     i.e. logits * patches... logits are predictions of the next embedding, so we're looking at the biggest differences
@@ -306,27 +355,34 @@ def cluster_patch_diff(patch_diff, replay_buffers=None, points=None,
 
     if replay_buffers is not None:
         viz_salience_clusters(
-            dbscan, replay_buffers, points, patch_diff, frames_in_sequence_window,
-            dvq_decoder, device, should_save_clusters)
+            dbscan,
+            replay_buffers,
+            points,
+            patch_diff,
+            frames_in_sequence_window,
+            dvq_decoder,
+            device,
+            should_save_clusters,
+        )
 
     show_non_consecutive_dupes(dbscan)
     return create_clusters(dbscan, points)
 
 def create_clusters(dbscan, points):
-    salient_events = []
+    salient_clusters = []
     cluster_map = defaultdict(list)
     for i, label in enumerate(dbscan.labels_):
         cluster_map[label].append((i, points[i]))
 
     for cluster, cluster_points in cluster_map.items():
-        salient_events.append(SalientEvent(cluster_points, cluster_index=cluster, dbscan=dbscan))
+        salient_clusters.append(SalientCluster(cluster_points, cluster_index=cluster, dbscan=dbscan))
 
     flat_points = []
     core_point_map = {}  # Maps flattened core points back to their original clusters
-    for se in salient_events:
-        for i, point in enumerate(se.core_sample_points):
+    for sc in salient_clusters:
+        for i, point in enumerate(sc.core_sample_points):
             flat_points.append(point)
-            core_point_map[len(flat_points) - 1] = se  # can just be append on list
+            core_point_map[len(flat_points) - 1] = sc  # can just be append on list
     assert len(core_point_map) == len(flat_points)
     kdtree = KDTree(np.array(flat_points))  # Populate with flat list of core sample i
     return kdtree, core_point_map
@@ -465,6 +521,8 @@ def main():
     # Instantiate SalienceStore
     salience_store = SalienceLevel(1, None, None, None)
     salience_store.kdtree = unpickle('/home/a/src/learnmax/pickles/2022.11.27_11:51:10.663231/kdtree.pickle')
+
+    sys.modules[__name__].SalientEvent = SalientCluster  # Fix rename from when pickle was created
     salience_store.core_point_map = unpickle(
         '/home/a/src/learnmax/pickles/2022.11.27_11:51:10.663231/core_point_map.pickle'
     )
@@ -541,7 +599,7 @@ def pickle_obj(obj, file):
     with open(file, 'wb') as fo:
         pickle.dump(obj, fo)
 
-def test_salient_event():
+def test_salient_cluster():
     """
     Sanity test salient event object
 
@@ -568,14 +626,12 @@ def test_salient_event():
     for i, lb in enumerate(db.labels_):
         if lb == biggest_cluster_i:
             points_biggest_cluster.append((i, points[i]))
-    se = SalientEvent(points_biggest_cluster, 0, db)
+    se = SalientCluster(points_biggest_cluster, 0, db)
     assert len(se.core_sample_i) == len(se.core_sample_points)
     assert len(points) - cluster_count_mp[-1] >= len(db.core_sample_indices_)
     log.success(f'Salient event tests passed in {int((time.time() - start) * 1000)}ms')
 
-test_salient_event()
+test_salient_cluster()
 
 if __name__ == '__main__':
     main()
-
-

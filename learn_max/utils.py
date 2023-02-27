@@ -362,10 +362,10 @@ def no_train(f):
     def wrapper(self, *args, **kwds):
         with torch.no_grad():
             was_training = self.training
-            self.eval()
+            self.eval()  # Put Pytorch module in eval mode (e.g. for Dropout, BatchNorm, etc)
             ret = f(self, *args, **kwds)
             if was_training:
-                self.train()
+                self.train()  # Switch off Pytorch eval mode, back to train mode
         return ret
     return wrapper
 
@@ -407,7 +407,7 @@ def torch_random_choice(tensor, salient_k):
     samples = tensor[idx]
     return samples, idx
 
-
+@torch.no_grad()
 def viz_experiences(experiences, folder, dvq_decoder, device, file_prefix=''):
     for i, x in enumerate(experiences):
         imo = viz_experience(x, dvq_decoder, device)
@@ -415,7 +415,9 @@ def viz_experiences(experiences, folder, dvq_decoder, device, file_prefix=''):
         imo.save(filename)
 
 
-def viz_experience(x, dvq_decoder, device):
+@torch.no_grad()
+def viz_experience(x, dvq_decoder, device, show_actual=True):
+    # TODO: Allow showing just decoded without the actual
     im = x.state.state.squeeze(0).permute(1, 2, 0).detach().cpu().numpy()
     # emb = x.state.dvq_z_q_flat.to(self.device)
     # B, H, W, E = emb.shape
@@ -436,7 +438,10 @@ def viz_experience(x, dvq_decoder, device):
     # imz = imz.reshape(H * HP, W * WP, -1)
 
     imz = imz.detach().cpu().numpy()
-    imo = Image.fromarray(np.uint8(np.concatenate((im, imz), axis=0) * 255))
+    if show_actual:
+        imo = Image.fromarray(np.uint8(np.concatenate((im, imz), axis=1) * 255))
+    else:
+        imo = Image.fromarray(np.uint8(imz * 255))
     return imo
 
 
@@ -476,7 +481,6 @@ class GptBatchBase:
 
     @abstractmethod
     def _ensure_shape(self):
-
         pass
 
     def dict(self):
@@ -564,24 +568,48 @@ class GptSensorBatch(GptBatchBase):
 
 @dataclass
 class GptSalientBatch(GptBatchBase):
-    salient_event_ind: torch.Tensor = None
+    salient_cluster_ind: torch.Tensor = None
 
     def __getitem__(self, batch_idx) -> dict:
         ret = dict(
-            salient_event_ind=self.salient_event_ind[batch_idx].squeeze_(0),
+            salient_cluster_ind=self.salient_cluster_ind[batch_idx].squeeze_(0),
             **super().__getitem__(batch_idx),
         )
         return ret
 
     def _reshape_single_sequence_hook(self):
-        self.salient_event_ind = self.salient_event_ind.unsqueeze(0)
+        self.salient_cluster_ind = self.salient_cluster_ind.unsqueeze(0)
 
     def _reshape_multi_sequence_hook(self, a_shp):
-        self.salient_event_ind = self.salient_event_ind.view(-1, self.seq_len)
+        self.salient_cluster_ind = self.salient_cluster_ind.view(-1, self.seq_len)
 
     def empty_(self):
-        self.salient_event_ind = torch.tensor([0])
+        self.salient_cluster_ind = torch.tensor([0])
         super()._empty_()
+
+
+def horiz_cat_pil(imgs):
+    widths, heights = zip(*(i.size for i in imgs))
+    total_width = sum(widths)
+    max_height = max(heights)
+    new_im = Image.new('RGB', (total_width, max_height))
+    x_offset = 0
+    for im in imgs:
+        new_im.paste(im, (x_offset, 0))
+        x_offset += im.size[0]
+    return new_im
+
+
+def vert_cat_pil(imgs):
+    widths, heights = zip(*(i.size for i in imgs))
+    max_width = max(widths)
+    total_height = sum(heights)
+    new_im = Image.new('RGB', (max_width, total_height))
+    y_offset = 0
+    for im in imgs:
+        new_im.paste(im, (0, y_offset))
+        y_offset += im.size[1]
+    return new_im
 
 
 GPT_BATCH_TYPE_MAP = {
@@ -597,6 +625,19 @@ def dataclass_no_none_dict(obj):
             # Lightning doesn't want None's
             ret[k] = d[k]
     return ret
+
+
+def get_np_txt_caption2(np_img, text, size=70):
+    from PIL import Image, ImageDraw, ImageFont
+    image = Image.new('RGBA', (np_img.shape[0] * 4, np_img.shape[0]), (50, 50, 50))
+    draw = ImageDraw.Draw(image)
+    # Search for your system's own truetype font if this doesn't work, sorry!
+    font = ImageFont.truetype(font='/usr/share/fonts/truetype/ubuntu/Ubuntu-M.ttf', size=size)
+    draw.text((10, 0), text, (200, 200, 200), font=font)
+    img_resized = image.resize((np_img.shape[0], np_img.shape[0] // 5), Image.ANTIALIAS)
+    np_txt = np.array(img_resized)[:, :, :3].transpose(0, 1, 2)
+    return np_txt
+
 
 def test_gpt_batch():
     sensor_batch = GptSensorBatch()
@@ -614,11 +655,11 @@ def test_gpt_batch():
     salient_batch = GptSalientBatch()
     salient_batch.empty_()
     y = salient_batch[0]
-    assert y['salient_event_ind'] is not None
-    assert y['salience_level_ind'] is not None
+    assert y['salient_cluster_ind'] is not None
+    assert y['salient_cluster_ind'] is not None
     assert y['seq_len'] is not None
-    assert len(y['salience_level_ind'].shape) == 0
-    assert len(y['salient_event_ind'].shape) == 0
+    assert len(y['salient_cluster_ind'].shape) == 0
+    assert len(y['salient_cluster_ind'].shape) == 0
 
 def run_tests():
     start = time.time()

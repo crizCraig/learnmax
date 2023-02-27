@@ -137,11 +137,11 @@ class GPT(nn.Module):
         self.is_single_token2 = is_single_token2
         self.batch_size = batch_size
         self.steps_in_sequence_window = frames_in_sequence_window
-        self.sequences_per_salient_event = 2
-        self.frames_in_salient_event = (
-                self.steps_in_sequence_window * self.sequences_per_salient_event
+        self.sequences_per_salient_experience = 2
+        self.frames_in_salient_experience = (
+                self.steps_in_sequence_window * self.sequences_per_salient_experience
         )
-        assert self.frames_in_salient_event > 0
+        assert self.frames_in_salient_experience > 0
         self.state_tokens_in_frame = state_tokens_in_frame
         self.tokens_in_frame = tokens_in_frame
         self.tokens_in_salient_step = tokens_in_salient_step
@@ -336,13 +336,13 @@ class GPT(nn.Module):
             embed, z_q_ind, actions = args
             return self.single_token_forward(actions, embed, z_q_ind)
         else:
-            z_q_ind, actions, salient_event_ind, salience_level_ind = args
+            z_q_ind, actions, salient_cluster_ind, salience_level_ind = args
 
             # TODO: Create embedding for goal token and concatenate with other tokens
             tok_ind = self.add_non_state_tokens(
                 z_q_ind,
                 actions,
-                salient_event_ind,
+                salient_cluster_ind,
                 salience_level_ind
             )
 
@@ -459,8 +459,8 @@ class GPT(nn.Module):
         else:
             z_q_ind = batch.z_q_ind
             actions = batch.actions
-            salient_event_ind = (
-                batch.salient_event_ind if isinstance(batch, GptSalientBatch) else None
+            salient_cluster_ind = (
+                batch.salient_cluster_ind if isinstance(batch, GptSalientBatch) else None
             )
             salience_level_ind = batch.salience_level_ind
             B, FiS, H, W = z_q_ind.shape
@@ -473,7 +473,7 @@ class GPT(nn.Module):
             # Shift targets by one patch
             # target_idx = z_q_ind[:,1:,:]
             target_idx = self.add_non_state_tokens(
-                z_q_ind, actions, salient_event_ind, salience_level_ind
+                z_q_ind, actions, salient_cluster_ind, salience_level_ind
             )
             assert target_idx.shape[-1] == self.tokens_in_frame
             target_idx = target_idx.reshape(B, -1)[:, 1:-(target_idx.shape[-1] - 1)]
@@ -484,7 +484,7 @@ class GPT(nn.Module):
             salience_level_ind = salience_level_ind[:,:-1]
 
             logits, expected_deviation = self.forward(
-                z_q_ind, actions, salient_event_ind, salience_level_ind
+                z_q_ind, actions, salient_cluster_ind, salience_level_ind
             )
 
 
@@ -687,13 +687,13 @@ class GPT(nn.Module):
         #     #   separation between actions and states and delimiters. For training, we can mask out the non-action
         #     #   outputs when predicting actions, non-state when predicting states, and non-delim when predicting delim
         #     #   parts of a sequence.
-        #     return z_q_ind, actions, salient_event_ind, salience_level_ind
+        #     return z_q_ind, actions, salient_cluster_ind, salience_level_ind
 
     def add_non_state_tokens(
             self,
             z_q_ind,
             actions,
-            salient_event_ind,
+            salient_cluster_ind,
             salience_level_ind
     ):
         # Actions, delimiter, and salience
@@ -703,6 +703,6 @@ class GPT(nn.Module):
             self.num_state_embeddings,
             self.num_actions,
             self.tokens_in_frame,
-            salient_event_ind,
+            salient_cluster_ind,
             salience_level_ind
         )

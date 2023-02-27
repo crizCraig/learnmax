@@ -8,7 +8,6 @@ import pygame as pg
 from PIL import Image, ImageDraw, ImageFont
 
 import numpy as np
-from numpy import int32, uint8, uint
 
 main_dir = os.path.split(os.path.abspath(__file__))[0]
 
@@ -138,18 +137,6 @@ def get_np_txt_caption(traj_img, text):
     draw.text((10, 0), text, (0, 0, 0), font=font)
     img_resized = image.resize((traj_img.shape[0], traj_img.shape[0] // 4), Image.ANTIALIAS)
     np_txt = np.array(img_resized)[:, :, :3].transpose(1, 0, 2).T
-    return np_txt
-
-
-def get_np_txt_caption2(traj_img, text, size=70):
-    from PIL import Image, ImageDraw, ImageFont
-    image = Image.new('RGBA', (traj_img.shape[0] * 4, traj_img.shape[0]), (50, 50, 50))
-    draw = ImageDraw.Draw(image)
-    # Search for your system's own truetype font if this doesn't work, sorry!
-    font = ImageFont.truetype(font='/usr/share/fonts/truetype/ubuntu/Ubuntu-M.ttf', size=size)
-    draw.text((10, 0), text, (200, 200, 200), font=font)
-    img_resized = image.resize((traj_img.shape[0], traj_img.shape[0] // 5), Image.ANTIALIAS)
-    np_txt = np.array(img_resized)[:, :, :3].transpose(0, 1, 2)
     return np_txt
 
 

@@ -9,16 +9,18 @@ train_to_test_collection_ratio = 10
 
 def get_model_args():
     args = get_blank_model_args()
-    args.gpt_batch_size = 7
+    args.gpt_batch_size = 7  # sequences per sensor batch
     args.gpt_seq_len = 8  # 10 gives OOM
     args.single_token2 = False
     args.viz_predict_trajectory = True
     args.should_train_gpt = True
     args.dvq_checkpoint = '/home/a/src/learnmax/.lightning/learnmax-learn_max_experiments_bin/37yv98e9/checkpoints/epoch=8-step=85999.ckpt'
-
-    # args.salience_resume_path = '/home/a/src/learnmax/pickles/2022.11.27_11:51:10.663231'
+    # args.viz_salience_replay_path = '/home/a/src/learnmax/data/replay_buff/d_2023-02-16_12:21:44.150524_r-7ZWCVSK0_env-MontezumaRevenge-v0/lvl_1/train'
+    args.viz_salience_replay_path = '/home/a/src/learnmax/data/replay_buff/d_2023-02-24_13:41:58.214093_r-6GFSSW0S_env-MontezumaRevenge-v0/lvl_1/train'
+    args.salience_use_logits = False
     args.num_state_embeddings = 256  # 6 actions plus 1 delim => 263
-    args.embedding_dim = 30
+    args.sensor_embedding_dim = 30
+    args.salient_embedding_dim = 256
 
     # Overfit args
     args.should_overfit_gpt = False

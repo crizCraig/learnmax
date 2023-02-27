@@ -2,7 +2,7 @@ import os
 
 from learn_max.config import get_blank_model_args, get_blank_train_args
 from learn_max.model import cli_main
-from learn_max.salience.salience import SalientEvent  # TODO: Move to pickle import module as these accumulate
+from learn_max.salience.salience import SalientCluster  # TODO: Move to pickle import module as these accumulate
 
 train_to_test_collection_ratio = 10
 
@@ -16,8 +16,7 @@ def get_model_args():
     args.should_train_gpt = True
     args.dvq_checkpoint = '/home/a/src/learnmax/.lightning/learnmax-learn_max_experiments_bin/37yv98e9/checkpoints/epoch=8-step=85999.ckpt'
 
-    args.salience_resume_path = '/home/a/src/learnmax/pickles/2022.12.17_17:45:07.646449/salience_store/lvl_1'
-    args.salience_use_logits = False
+    args.salience_use_logits = False  # logits change so clustering doesn't work over time
     args.num_state_embeddings = 256  # 6 actions plus 1 delim => 263
     args.sensor_embedding_dim = 30
     args.salient_embedding_dim = 256

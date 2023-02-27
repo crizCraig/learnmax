@@ -5,7 +5,8 @@ import sys
 import time
 from collections import deque, defaultdict
 from copy import copy
-from typing import Tuple, List, Optional
+from pathlib import Path
+from typing import Tuple, List, Optional, Iterable
 
 import cv2
 import gym
@@ -34,11 +35,12 @@ from torch.optim.optimizer import Optimizer
 from torch.utils.data import DataLoader
 from torch.nn import functional as F
 
+from learn_max import utils
 from learn_max.config import get_train_args_from_cli, get_model_args_from_cli
 from learn_max.agent import LearnMaxAgent, AgentState
 from learn_max.dvq.model.deepmind_enc_dec import ResBlock
 from learn_max.mingpt.utils import get_num_output_embeddings
-from learn_max.replay_buffer import Experience
+from learn_max.replay_buffer import Experience, ReplayBuffer, get_readonly_replay_buf
 from learn_max.salience.detect_salience import detect_salience
 from learn_max.salience.salience import salience_level_factory
 from learn_max.utils import (
@@ -55,7 +57,7 @@ from learn_max.utils import (
     dataclass_to_dict,
     GptSensorBatch,
     GptSalientBatch,
-    GptBatchBase,
+    GptBatchBase, viz_experience, horiz_cat_pil, vert_cat_pil, get_np_txt_caption2,
 )
 from learn_max.constants import (
     SAVE_DIR,
@@ -66,14 +68,13 @@ from learn_max.constants import (
     RUN_ID,
     WANDB_MAX_LOG_PERIOD,
     ACC_LOG_PERIOD,
-    MAX_NUM_SALIENCE_LEVELS,
+    MAX_NUM_SALIENCE_LEVELS, NUM_DIFF_SEQ,
 )
 from learn_max.dvq.vqvae import VQVAE, DecayLR, DecayTemperature, RampBeta
 from learn_max.mingpt.lr_decay import GptWarmupCosineLearningRateDecay
 from learn_max.mingpt.model import GPT
 from learn_max.viz_predicted_trajectories import (
     get_action_text,
-    get_np_txt_caption2,
 )
 
 log.remove()
@@ -160,7 +161,6 @@ class LearnMax(pl.LightningModule):
         # Dataloader
         pin_memory: bool = False,
         # Salience
-        use_logit_salience: bool = True,  # whether to use internal signals for salience
         salience_resume_path: str = None,  # path to salience pickles dir
         salience_use_logits: bool = False,  # whether to use logits in salience
     ):
@@ -215,7 +215,9 @@ class LearnMax(pl.LightningModule):
         # the "width" of the model (embedding_dim), number of channels in each Transformer
         self.gpt_input_embedding_dim = sensor_embedding_dim
 
-        self.gpt_seq_len = gpt_seq_len  # Size of the temporal window
+        # Steps in input sequence (i.e. frames not patches), so like 8
+        self.gpt_seq_len = gpt_seq_len
+
         self.gpt_batch_size = gpt_batch_size
         self.gpt_n_layer = gpt_n_layer
         self.gpt_n_head = gpt_n_head
@@ -248,8 +250,7 @@ class LearnMax(pl.LightningModule):
         self.should_viz_predict_trajectory = should_viz_predict_trajectory
 
         # Salience
-        self.use_logit_salience = use_logit_salience  # Use internal signals (e.g. logits) for salience
-        self.logit_salience_update_freq = self.gpt_seq_len // 2
+        self.salience_update_freq = self.gpt_seq_len // 2
         self.salience_resume_path = salience_resume_path
         self.salience_use_logits = salience_use_logits
         self.salient_embedding_dim = salient_embedding_dim
@@ -685,13 +686,14 @@ class LearnMax(pl.LightningModule):
 
         self.predicted_trajectory_buffer.append(predicted_trajectory)
 
-        if (
-            self.use_logit_salience
-            and self.replay_buffers.is_train()
-            and self.total_steps % 2 * self.logit_salience_update_freq
-            == 0  # TODO: parameterize this 2? It's the minimum for sequence diff so...
-        ):
+        steps_between_salience_updates = (
+            self.sequences_per_salient_experience * self.salience_update_freq
+        )
 
+        if (
+            self.replay_buffers.is_train()
+            and self.total_steps % steps_between_salience_updates == 0
+        ):
             # start_detect = time.time()
             self.detect_salience()
             # log.info(f'Salience detection took {time.time() - start_detect} seconds')
@@ -715,10 +717,10 @@ class LearnMax(pl.LightningModule):
     def detect_salience(self):
         assert (
             len(self.replay_buffers.short_term_mem)
-            >= self.gpt.frames_in_salient_event
+            >= self.gpt.frames_in_salient_experience
         ), 'Not enough contiguous experience to detect salience'
         recent_exp = self.get_recent_experience(
-            max_size=self.gpt.frames_in_salient_event, train_buff_only=True,
+            max_size=self.gpt.frames_in_salient_experience, train_buff_only=True,
         )
         (
             actions,
@@ -731,8 +733,8 @@ class LearnMax(pl.LightningModule):
         # TODO: Try feeding in longer sequences? We'll get more efficient use of windows in detect_salience, but
         #   have more potential overlap between steps when weights may not have changed much.
 
-        if look_back >= self.gpt.frames_in_salient_event:
-            # We have 2 sequences to use for detecting salience
+        if look_back >= self.gpt.frames_in_salient_experience:
+            # We have at least 2 sequences to use for detecting salience
             # z_q_ind.shape  # batch, frames in sequence, height, width
 
             if self.salience_use_logits:
@@ -768,6 +770,7 @@ class LearnMax(pl.LightningModule):
 
             if saliences:
                 # Add salient event that occurred at level 0, the sensor level
+                # TODO(variable salience): Add to variable level (not just 0)
                 salience_add = self.salience_levels[0].add(
                     saliences,
                     self.dvq.decoder,
@@ -792,12 +795,12 @@ class LearnMax(pl.LightningModule):
                         )
                         self.salience_levels.append(
                             self.get_salience_level(
-                                None, level=len(self.salience_levels) + 1
+                                None, level=len(self.salience_levels)
                             )
                         )
                         # TODO: Handle recursive detection of higher salience levels
 
-                salient_replay_ind = [s['replay_ind'] for s in saliences]
+                salient_replay_ind = [s['mid_replay_ind'] for s in saliences]
                 FiS = self.gpt.steps_in_sequence_window
                 if False and salient_replay_ind:
                     viz_salience(
@@ -972,7 +975,7 @@ class LearnMax(pl.LightningModule):
         - so num_non_state_sensor_tokens = sum(action 1, salient level 1, delim 1) = 3
         - and sensor batch_size = 
              sensorB * (num_img_patches (121) + num_non_state_sensor_tokens (3)) * emb_size (30)
-        - and with num_non_state_salient_tokens (salient_event 1 + salient lvl 1 = 2)
+        - and with num_non_state_salient_tokens (salient_cluster_ind 1 + salient lvl 1 = 2)
         - then salient batch_size =  
              salientB * num_non_state_salient_tokens (2) * emb_size (255) 
         - Then if we want the salient batch to take equal memory, we can set 
@@ -1168,7 +1171,7 @@ class LearnMax(pl.LightningModule):
             )
         else:
             ret = GptSalientBatch(
-                salient_event_ind=torch.tensor(
+                salient_cluster_ind=torch.tensor(
                     np.stack([exp.cluster_index for exp in exps])
                 ),
                 salience_level_ind=salience_level_ind,
@@ -1310,7 +1313,7 @@ class LearnMax(pl.LightningModule):
                 # test_logits, _ = self.gpt.forward(gpt_x, z_q_ind_x, a_x)
                 # test_target = self.gpt.s_i_to_as_i(z_q_ind_y, a_x)
                 # self.viz_gpt(test_logits, test_target, state=s, batch_idx=batch_idx, postfix='_forward_only')
-                self.viz_movie(batch_idx)
+                self.viz_movie(batch_idx, self.test_buf)
 
             if self.global_step == 0:
                 # TODO: Make sure to call again if we update clusters as visualizing predicted trajectories
@@ -1409,6 +1412,30 @@ class LearnMax(pl.LightningModule):
         folder = f'{ROOT_DIR}/images/viz_clusters/{get_date_str()}_r_{RUN_ID}_b_{batch_idx}'
         self._viz_dvq_clusters(folder)
         log.info(f'Wrote dvq clusters to {folder}')
+
+    @no_train
+    def viz_salience_replay_standalone(self, salient_replay_path):
+        """Use salient replay indexes to visualize below-salient events"""
+
+        salient_replay_buf = get_readonly_replay_buf(salient_replay_path)
+        assert salient_replay_buf.salience_level == 1, 'Higher level salience not implemented yet'
+        sensor_replay_path = str(Path(salient_replay_path).parents[1].joinpath('lvl_0') / 'train')
+        sensor_replay_buf = get_readonly_replay_buf(sensor_replay_path)
+
+        salient_exps = salient_replay_buf.get(0, salient_replay_buf.length + 1)  # TODO: +1?
+
+        seq_len = self.gpt_seq_len  # TODO: Store this in replay buffer / exp
+        log.warning(
+            f'Assuming seq_len is {seq_len} for salient exps in {salient_replay_path}'
+        )
+
+        self.viz_salient_events(salient_exps, sensor_replay_buf, seq_len)
+
+        assert (
+            salient_exps[0]['level'] == 1
+        ), 'Need to index through levels down to sensor to support higher than level 1'
+
+
 
     @no_train
     def viz_dvq_clusters_knn_standalone(self):
@@ -1736,14 +1763,19 @@ class LearnMax(pl.LightningModule):
         #   Make sure you're extracting the logits correctly for the image
         #   Look at disappear and teleport images bad clustering cases.
 
+    @no_train
     @best_effort
-    def viz_movie(self, batch_idx):
+    def viz_movie(self, batch_idx, replay_buffer):
+        """Visualize 1000 frames from the replay buffer as a sequence of images"""
         os.makedirs(f'{ROOT_DIR}/images/viz_movie', exist_ok=True)
         folder = f'{ROOT_DIR}/images/viz_movie/{get_date_str()}_r_{RUN_ID}_b_{batch_idx}'
         os.makedirs(folder, exist_ok=True)
 
-        length = min(len(self.test_buf), 1000)
-        experiences = self.test_buf.get(
+        # TODO: If buffer is salient, grab the sensor buffer sequence around the replay_index
+        # and overlay the images, or just use the middle image to represent the salient event
+
+        length = min(len(replay_buffer), 1000)
+        experiences = replay_buffer.get(
             self.test_buf.length - length, length=length, device=self.device
         )
         viz_experiences(experiences, folder, self.dvq.decoder, self.device)
@@ -1894,6 +1926,121 @@ class LearnMax(pl.LightningModule):
         im_name = f'{folder}/viz_simple_predict_trajectory_num_actual_{num_actual}_num_predict_{num_predict}_delay_{delay}.png'
         im.save(im_name)
         print('Saved', im_name)
+
+    @no_train
+    def viz_salient_events(self, salient_exps, sensor_replay_buf, seq_len):
+        parent_dir = f'{ROOT_DIR}/images/viz_salient_events'
+        os.makedirs(parent_dir, exist_ok=True)
+        folder = f'{parent_dir}/{get_date_str()}_r_{RUN_ID}'
+        os.makedirs(folder, exist_ok=True)
+        assert all([exp.seq_len == seq_len for exp in salient_exps])
+
+        stack_full_sequences = True
+        # Break salient_exps into chunks of 10
+        for i in range(0, len(salient_exps), 10):
+            imgs = []
+            for exp in salient_exps[i : i + 10]:
+                img = self.viz_salient_event(
+                    sensor_replay_buf,
+                    [exp.below_replay_index],
+                    seq_len=seq_len,
+                    show_side_by_side=stack_full_sequences,
+                )
+
+                # Add text to bottom of image
+                caption = utils.get_np_txt_caption2(
+                    np.asarray(img), str(int(exp.below_replay_index))
+                )
+
+                img = np.concatenate((img, caption), axis=0)
+
+                # Convert last image to PIL
+                img = Image.fromarray(img)
+
+                imgs.append(img)
+
+            if stack_full_sequences:
+                # Combine sequences vertically
+                seq = vert_cat_pil(imgs)
+            else:
+                # Combine images side by side
+                seq = horiz_cat_pil(imgs)
+
+            # Save image
+            seq.save(f'{folder}/viz_salient_events_seq_len_{seq_len}_{i}.png')
+
+
+    def viz_salient_event(
+        self,
+        sensor_replay_buf: ReplayBuffer,
+        mid_idxs: Iterable,
+        seq_len: int,
+        show_side_by_side: bool,
+    ) -> np.array:
+        """
+        Visualize a salient event in the replay buffer. This is a sequence of frames
+        centered around a particular frame. We display an overlay of combined images
+        on the top row and the central image on the bottom row.
+
+        Args:
+            mid_idxs: The indices of the middle frame of the lower level sequence.
+
+        Returns a numpy array of the image.
+        """
+        # TODO: Do a before and after split of seq_len
+
+        # Get alpha for putalpha and alpha_composite below
+        magic_blending_coeff = 3  # Not sure how compositing works
+        expected_total_imgs = seq_len * NUM_DIFF_SEQ * len(mid_idxs)
+        alpha = int(magic_blending_coeff * 255 // expected_total_imgs)
+        alpha = float(np.clip(alpha, 8, 10))
+
+
+        # TODO: Before and after for salient and show the below_mid_replay_i in image
+
+        total_imgs = 0
+        ret = None
+        for seq_i, mid_i in enumerate(mid_idxs):
+            # Get the surrounding frames
+            start_idx = mid_i - seq_len + 1
+            assert start_idx >= 0
+            assert mid_i + seq_len < len(sensor_replay_buf)
+
+            sensor_exps = sensor_replay_buf.get(start_idx, seq_len * NUM_DIFF_SEQ)
+
+            assert len(sensor_exps) == seq_len * NUM_DIFF_SEQ
+
+            # Decode image with VQVAE
+            imgs = [
+                viz_experience(e, self.dvq.decoder, self.device, show_actual=False)
+                for e in sensor_exps
+            ]
+
+            total_imgs += len(imgs)
+
+            if show_side_by_side:
+                # Show all images side by side
+                side_by_side = horiz_cat_pil(imgs)
+                if ret is None:
+                    ret = side_by_side
+                else:
+                    # vertically stack side by side PIL images
+                    ret = vert_cat_pil([ret, side_by_side])
+            else:
+                # composite images
+                # Add alpha channel
+                [img.putalpha(alpha) for img in imgs]
+
+                # Load the first image in the list
+                if ret is None:
+                    ret = imgs[0]
+
+                for i in range(1, len(imgs)):
+                    ret = Image.alpha_composite(ret, imgs[i])
+
+        assert total_imgs == len(mid_idxs) * seq_len * NUM_DIFF_SEQ
+        log.info(f'Viz #salient events {len(mid_idxs)}, #imgs {total_imgs}')
+        return ret
 
     def save_predicted_trajectories(self, batch_idx):
         """
@@ -2635,14 +2782,15 @@ def cli_main(
         f'{DATE_STR} {" ".join(sys.argv)}\n'
     )
     args = get_model_args_fn()
-    viz_dvq = (
+    viz = bool(
         args.viz_dvq
         or args.viz_all_dvq_clusters
         or args.viz_dvq_clusters_knn
         or args.compress_dvq_clusters
+        or args.viz_salience_replay_path
     )
 
-    if viz_dvq:
+    if viz:
         args.should_train_gpt = False
         args.dvq_enable_kmeans = False
         args.warm_start_size = 100
@@ -2653,25 +2801,24 @@ def cli_main(
         fast_dev_run = False
         log.warning(f'Setting batch size to {args.gpt_batch_size}!')
     else:
-        if viz_dvq:
+        if viz:
             wandb_name = None
         else:
             wandb_name = input('\n\nExperiment name?\n\n')
         wandb_mode = 'online'
         fast_dev_run = False
 
-    learn_max_args = copy(args.__dict__)
-    del learn_max_args['viz_dvq']  # Not for model
-    del learn_max_args['viz_all_dvq_clusters']  # Not for model
-    del learn_max_args['viz_dvq_clusters_knn']  # Not for model
-    del learn_max_args['compress_dvq_clusters']  # Not for model
-    del learn_max_args['checkpoint']  # Not a model property
-    if 'viz_predict_trajectory' in learn_max_args:
-        learn_max_args['should_viz_predict_trajectory'] = learn_max_args[
-            'viz_predict_trajectory'
-        ]
+    lm_args = copy(args.__dict__)  # LearnMax args
+    del lm_args['viz_dvq']  # Not for model
+    del lm_args['viz_all_dvq_clusters']  # Not for model
+    del lm_args['viz_dvq_clusters_knn']  # Not for model
+    del lm_args['viz_salience_replay_path']  # Not for model
+    del lm_args['compress_dvq_clusters']  # Not for model
+    del lm_args['checkpoint']  # Not a model property
+    if 'viz_predict_trajectory' in lm_args:
+        lm_args['should_viz_predict_trajectory'] = lm_args['viz_predict_trajectory']
         # Changed the name for class
-        del learn_max_args['viz_predict_trajectory']
+        del lm_args['viz_predict_trajectory']
 
     if args.checkpoint:
         assert not args.dvq_checkpoint, (
@@ -2679,10 +2826,10 @@ def cli_main(
             + 'set dvq_checkpoint if you want to train gpt from scratch'
         )
         # model = LearnMax.load_from_checkpoint(args.checkpoint)
-        model = LearnMax.load_from_checkpoint(args.checkpoint, **learn_max_args)
+        model = LearnMax.load_from_checkpoint(args.checkpoint, **lm_args)
         # load_pretrained_dvq_and_gpt(args, model)
     else:
-        model = LearnMax(**learn_max_args)
+        model = LearnMax(**lm_args)
 
     if args.dvq_checkpoint:
         assert not args.checkpoint, (
@@ -2699,6 +2846,8 @@ def cli_main(
         return model.viz_dvq_clusters_knn_standalone()
     elif args.compress_dvq_clusters:
         return model.compress_dvq_clusters()
+    elif args.viz_salience_replay_path:
+        return model.viz_salience_replay_standalone(args.viz_salience_replay_path)
     else:
         delattr(args, 'viz_dvq')
         delattr(args, 'viz_all_dvq_clusters')
