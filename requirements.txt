@@ -13,3 +13,5 @@ wandb
 einops
 seaborn
 pandas
+ddsketch
+typing-extensions  # For typing.Self

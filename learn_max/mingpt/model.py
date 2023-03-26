@@ -17,7 +17,7 @@ import torch.nn as nn
 from loguru import logger as log
 from torch.nn import functional as F
 
-from learn_max.constants import ACC_LOG_PERIOD
+from learn_max.constants import ACC_LOG_PERIOD, NUM_DIFF_SALIENT
 from learn_max.mingpt.utils import add_non_state_tokens
 from learn_max.utils import (
     accuracy,
@@ -137,7 +137,7 @@ class GPT(nn.Module):
         self.is_single_token2 = is_single_token2
         self.batch_size = batch_size
         self.steps_in_sequence_window = frames_in_sequence_window
-        self.sequences_per_salient_experience = 2
+        self.sequences_per_salient_experience = NUM_DIFF_SALIENT
         self.frames_in_salient_experience = (
                 self.steps_in_sequence_window * self.sequences_per_salient_experience
         )

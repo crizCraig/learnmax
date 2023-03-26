@@ -1,37 +1,149 @@
 import os
-import random
 import time
+from typing import Optional, List
 
 import numpy as np
 import torch
-from tdigest import TDigest
-from torch import nn
 
 from loguru import logger as log
 
-from learn_max.constants import NUM_DIFF_SEQ
-from learn_max.dvq.model.quantize import VQVAEQuantize
+from learn_max.constants import NUM_DIFF_SALIENT, DEFAULT_MAX_LRU_SIZE, COMBINE_STEPS_ABSTRACT_SEQ, TRAIN, \
+    COMBINE_STEPS_SENSOR_SEQ
 from learn_max.mingpt.utils import get_num_output_embeddings
+from learn_max.percentile_estimator import PercentileEstimator
+from learn_max.replay_buffer import get_readonly_replay_buf, ReplayBuffer, ReplayBuffers, SalientExperience
+from learn_max.salience.salience import SalienceLevel
 from learn_max.utils import wandb_log
 
 
+def create_salience_level_from_replay_buf(
+        replay_buf_path: str
+) -> None:
+    buf: ReplayBuffer = get_readonly_replay_buf(replay_buf_path)
+    bufs: ReplayBuffers = ReplayBuffers(
+        salience_level=buf.salience_level,
+        env_id=buf.env_id,
+        short_term_mem_max_length=1000,  # Short term mem will not be needed
+        steps_per_file=buf.steps_per_file,
+    )
+
+    salience_level: SalienceLevel = SalienceLevel(
+        level=buf.salience_level,
+        replay_buffers=bufs,
+        seq_len=COMBINE_STEPS_ABSTRACT_SEQ,
+    )
+
+    i = 0
+    if buf.salience_level == 0:
+        steps_per_patch_diff = COMBINE_STEPS_ABSTRACT_SEQ * NUM_DIFF_SALIENT
+    else:
+        steps_per_patch_diff = COMBINE_STEPS_SENSOR_SEQ * NUM_DIFF_SALIENT
+    while True:
+        exps = buf.get(i, steps_per_patch_diff)
+        if len(exps) < steps_per_patch_diff:
+            break
+        i += steps_per_patch_diff
+        if buf.salience_level == 0:
+            # TODO: Stack necessary tensors from exps
+            detect_sensory_salience(
+                z_q_ind=z_q_ind,
+                z_q_emb=z_q_embed,
+                replay_ind=replay_ind,
+                frames_in_sequence_window=self.gpt.steps_in_sequence_window,
+                tokens_in_frame=self.gpt.tokens_in_frame,
+                state_tokens_in_frame=self.gpt.state_tokens_in_frame,
+                pct_est=salience_level.pct_est,
+                use_emb=True,
+            )
+        else:
+
+            patch_diffs = torch.stack([exp.patch_diff for exp in exps])  # type: ignore
+
+            # Combine patch and embed dims
+            patch_diffs = patch_diffs.reshape(steps_per_patch_diff, -1)
+
+            patch_diffs.unsqueeze_(0)  # Add batch dim
+            replay_ind = [exp.replay_index for exp in exps]
+
+            # TODO: Return SalientExperience from detect_abstract_salience
+            salient_experience = detect_abstract_salience(
+                level=buf.salience_level,
+                patch_diffs=patch_diffs,
+                replay_ind=replay_ind,  # type: ignore
+                pct_est=salience_level.pct_est,
+                split=buf.split,
+            )
+            if salient_experience is not None:
+                salience_level.add(
+                    [salient_experience], device='cpu', FiS=COMBINE_STEPS_ABSTRACT_SEQ
+                )
+
+    # TODO: Visualize clusters with below_replay_index
+    pass
+
+
 @torch.no_grad()
-def detect_salience(
-    actions,
-    z_q_ind,
-    z_q_emb,
-    replay_ind,
-    seq_len,
-    frames_in_sequence_window,
-    state_tokens_in_frame,
-    tokens_in_frame,
-    num_state_embeddings,
-    num_actions,
-    tdigest,
-    min_reservoir=1000,
-    use_emb=True,
-    logits=None,
-):
+def detect_abstract_salience(
+    level: int,
+    patch_diffs: torch.Tensor,
+    replay_ind: List[int],
+    pct_est: PercentileEstimator,
+    split: str,
+    min_reservoir: int = 100,
+) -> Optional[SalientExperience]:
+    """
+    Rewriting detect_salience without batch inference and logits
+
+    Returns salience and replay index if salience is detected
+    """
+    # Subtract two subsequent patch diffs and take the absolute value
+    # so that differences can be summed into salience.
+    B, S, E = patch_diffs.shape
+    assert B == 1, 'Only real time detection is supported'
+    assert S == 2
+    patch_diff_next = (patch_diffs[:, 1] - patch_diffs[:, 0]).abs()
+
+    salience = patch_diff_next.sum()
+
+    # Check if the difference is greater than the 90th percentile
+    #   of previously seen data with the t-digest.
+    ret = None
+    if pct_est.count < min_reservoir:
+        # Log when percentage increases by 10%
+        if pct_est.count % (min_reservoir // 10) == 0:
+            # Log reservoir percentage
+            log.info(
+                f'Building level {level} reservoir: {round(pct_est.count / min_reservoir * 100)}%'
+            )
+    else:
+        p90 = pct_est.percentile(90)
+        if p90 is not None and salience > p90:
+            ret = SalientExperience(
+                below_replay_index=replay_ind[0],
+                patch_diff=torch.tensor(patch_diff_next),
+                level=level + 1,
+                split=split,
+            )
+    pct_est.add([float(salience)])
+    return ret
+
+
+@torch.no_grad()
+def detect_sensory_salience(
+    # actions: torch.Tensor,
+    z_q_ind: torch.Tensor, # Only used for shape if use_emb is True
+    z_q_emb: Optional[torch.Tensor],
+    replay_ind: torch.Tensor,
+    frames_in_sequence_window: int,
+    state_tokens_in_frame: int,
+    tokens_in_frame: int,
+    # num_state_embeddings: int,
+    # num_actions: int,
+    pct_est: PercentileEstimator,
+    min_reservoir: int = 1000,
+    use_emb: bool = True,
+    logits: Optional[torch.Tensor] = None,
+) -> Optional[List[SalientExperience]]:
     """
     Compare subsequent sequences of length frames_in_sequence_window. If the patch-wise difference
     is greater than the 90th percentile of previously seen data (approximated by a t-digest), then return the
@@ -98,7 +210,7 @@ def detect_salience(
     assert B == 1
 
     if logits is not None:
-        x = x.reshape(B * _FiS * TiF, L)
+        x = x.reshape(B * _FiS * TiF, L)  # type: ignore
     elif use_emb:
         x = x.reshape(B * _FiS * TiF, E)
     else:
@@ -117,6 +229,7 @@ def detect_salience(
     # then new things have happened _spatially_ within the frame, and we DO want to count that.
     # TODO: Remove these redundant if blocks
     if logits is not None:
+        assert L is not None
         windows = windows.reshape(windows.shape[0], L, FiS, TiF)
     elif use_emb:
         windows = windows.reshape(windows.shape[0], E, FiS, TiF)
@@ -147,12 +260,16 @@ def detect_salience(
     #   but if even one more frame is fed in, we'll start utilizing a greater percentage of the windows.
     #   E.g. say you feed in 17 frames, then you'd get 10 windows and 2 salience diffs (20% usage, from 11%),
     #   and if you fed in 24 frames, you'd get 17 windows and 8 salience diffs (47% usage).
-    salience = abs(windows[FiS:] - windows[:-FiS])
+    # TODO: Use the above to more efficiently compute lots saliences by grabbing more than 2 sequences
+    #  from the replay buffer at a time (batch mode). This will be especially useful for offline salience
+    #  detection vs now where it's more real time focused. i.e. throughput over latency.
+    patch_diff = (windows[FiS:] - windows[:-FiS]).abs()
 
-    assert salience.shape[0] == _FiS - NUM_DIFF_SEQ * FiS + 1, 'Two subsequent sequences slid across windows'
+    assert patch_diff.shape[0] == _FiS - NUM_DIFF_SALIENT * FiS + 1, 'Two subsequent sequences slid across windows'
 
     # Sum diff across sequence-patches to get total salience for sequence
-    salience = salience.reshape(salience.shape[0], -1).sum(axis=-1)
+    #  Same as patch_diff.sum() for 2 sequences, but not more
+    salience = patch_diff.reshape(patch_diff.shape[0], -1).sum(axis=-1)  # type: ignore
 
     replay_ind = replay_ind.squeeze(0)
     # assert int(replay_ind[1] - replay_ind[0]) == FiS
@@ -185,42 +302,40 @@ def detect_salience(
 
     salience = salience.detach().cpu().numpy()
     ret = []
-    if tdigest.n < min_reservoir and tdigest.n % 100 == 0:
+    if pct_est.count < min_reservoir and pct_est.count % 100 == 0:
         # Log reservoir percentage
-        log.info(f'Building reservoir: {tdigest.n / min_reservoir * 100:.2f}%')
-    if tdigest.n > min_reservoir:  # Get a big pool before sampling top percentile
+        log.info(f'Building reservoir: {pct_est.count / min_reservoir * 100:.2f}%')
+    elif pct_est.count > min_reservoir:  # Get a big pool before sampling top percentile
         for i, s in enumerate(salience):
-            # TODO: Test tdigest 10pct, 90pct with random numbers, should not increase!!!
-            tdigest_50pct = tdigest.percentile(50)
-            tdigest_90pct = tdigest.percentile(90)
-            wandb_log({'salience/salience_candidate': s})
-            wandb_log({'salience/tdigest_min': tdigest.percentile(0)})
-            wandb_log({'salience/tdigest_50pct': tdigest_50pct})
-            wandb_log({'salience/tdigest_90pct': tdigest_90pct})
+            p50 = pct_est.percentile(50)
+            p90 = pct_est.percentile(90)
+            wandb_log({'salience/salience_candidate': s})  # type: ignore
+            wandb_log({'salience/percentile_min': pct_est.percentile(0)})  # type: ignore
+            wandb_log({'salience/est_p50': p50})  # type: ignore
+            wandb_log({'salience/est_p90': p90})  # type: ignore
             if 'LEAST_SALIENT' in os.environ:
-                is_salient = s < tdigest_50pct
+                is_salient = s < p50
             else:
-                is_salient = s > tdigest_90pct
+                is_salient = s > p90
             if is_salient:
                 before_salient = windows[i]
                 after_salient = windows[i + FiS]
-                patch_diff = after_salient - before_salient
+                patch_diff2 = after_salient - before_salient
 
                 # check that recomputing patch diff for top saliences is correct
-                assert patch_diff.abs().sum() == s
+                assert patch_diff2.abs().sum() == s
                 ret.append(
                     # mid_replay_ind is the last index of the first sequence
-                    # TODO: Make this a dataclass instead of a dict
-                    dict(mid_replay_ind=replay_ind[i] + FiS - 1, patch_diff=patch_diff)
+                    SalientExperience(
+                        below_replay_index=replay_ind[i] + FiS - 1,
+                        patch_diff=patch_diff2,
+                        seq_len=FiS,
+                        level=0,
+                    )
+                    # dict(mid_replay_ind=replay_ind[i] + FiS - 1, patch_diff=patch_diff2)
                 )
 
-    if len(salience) > 0:
-        if len(salience) == 1:
-            tdigest.update(salience[0])
-            if random.random() < 0.01:
-                tdigest.compress()  # Perform tdigest maintenance once in a while
-        else:
-            tdigest.batch_update(salience)  # this always does maintenance
+    pct_est.add(salience)
     # else:
     #     # Approx reservoir sampling probability for set with mean (believe this yields a slight recency bias vs
     #     # sampling one at a time)
@@ -240,7 +355,7 @@ def detect_salience(
     #     samples, idx = torch.topk(salience, salient_k)
     #     for i, sample in enumerate(samples):
 
-    #         self.tdigest.append((replay_ind[idx[i]], sample))
+    #         self.sketch.add(replay_ind[idx[i]], sample))
     #
     #     self.salience_reservoir_n += m
     #
@@ -271,19 +386,73 @@ def detect_salience(
     return ret
 
 
-def _test_detect_salience(num_sequences=2, use_emb=False):
+def _test_detect_salience(
+    num_sequences: int = 2, use_emb: bool = False, level: int = 0
+) -> List[Optional[SalientExperience]]:
+    if level == 0:
+        return _test_detect_sensory_salience(num_sequences, use_emb)
+    elif level == 1:
+        return _test_detect_salience_lvl_1(num_sequences)
+    else:
+        raise ValueError(f'Invalid level: {level}')
+
+def _test_detect_salience_lvl_1(num_sequences: int = 2) -> List[Optional[SalientExperience]]:
+    steps_in_seq = 1
+    batch_size = 1
+    patch_diff_size = 121 * 30  # 11x11 patch diff with 30 embedding size
+    pct_est = PercentileEstimator()
+    min_reservoir_size = 10
+    num_zero_seqs = min_reservoir_size * 2
+    for i in range(num_zero_seqs):
+        # Fill up with zeroes
+        patch_diffs = torch.zeros(
+            batch_size,
+            num_sequences * steps_in_seq,
+            patch_diff_size,
+        )
+        detect_abstract_salience(
+            level=1,
+            patch_diffs=patch_diffs,
+            replay_ind=[i, i+1],
+            pct_est=pct_est,
+            min_reservoir=min_reservoir_size,
+            split=TRAIN,
+        )
+
+    # The patch diff added in SalienceLevel.add() is the
+    # actual diff of Π 8 z_q_emb - Π 8 z_q_emb, not the closest cluster core point
+    # so clusters don't actually come into play for this test.
+    patch_diffs = -1 + 2 * torch.rand(
+        batch_size,
+        num_sequences * steps_in_seq,
+        patch_diff_size,
+    )
+
+    ret = detect_abstract_salience(
+        level=1,
+        patch_diffs=patch_diffs,
+        replay_ind=[num_zero_seqs, num_zero_seqs+1],
+        pct_est=pct_est,
+        min_reservoir=min_reservoir_size,
+        split=TRAIN,
+    )
+    return [ret]
+
+
+def _test_detect_sensory_salience(num_sequences: int, use_emb: bool) -> List[Optional[SalientExperience]]:
     frames_in_sequence_window = 8
     num_actions = 6
     num_frames = frames_in_sequence_window * num_sequences
-    actions = torch.randint(low=0, high=num_actions-1, size=(1, num_frames))
+    # actions = torch.randint(low=0, high=num_actions - 1, size=(1, num_frames))
     num_state_embeddings = 256
-    patch_width = 11
+    patch_width = 11  # same as patch height
     state_tokens_in_frame = 121
-    tokens_in_frame = state_tokens_in_frame + 2  #  + 1 action + 1 delimiter
+    tokens_in_frame = state_tokens_in_frame + 2  # + 1 action + 1 delimiter
     embedding_size = 30
     batch_size = 1
     # num_input_embeddings = get_num_embeddings(num_state_embeddings, num_actions)
-
+    # TODO: test detect salience for level 1 => level 2 where the shape is
+    #  (batch_size, 2, patch_diff dims)
     z_q_ind = torch.randint(
         low=0,
         high=num_state_embeddings,
@@ -312,87 +481,91 @@ def _test_detect_salience(num_sequences=2, use_emb=False):
             get_num_output_embeddings(num_state_embeddings, num_actions),
         )
     # Logit shape: B, _FiS, state_tokens_in_frame, L (263???)  1,16,123,263
-
     replay_ind = torch.arange(0, num_frames).unsqueeze(0)
-    seq_len = frames_in_sequence_window * state_tokens_in_frame
-    tdigest = TDigest()
+    pct_est = PercentileEstimator()
     min_reservoir = 10
     for i in range(min_reservoir * 2):
         # Fill up with zeroes
         zero_z_q_emb = torch.zeros_like(z_q_emb) if use_emb else None
         zero_logits = torch.zeros_like(logits) if not use_emb else None
-        detect_salience(
-            actions,
-            0 * z_q_ind,
-            zero_z_q_emb,
-            replay_ind,
-            seq_len,
-            frames_in_sequence_window,
-            state_tokens_in_frame,
-            tokens_in_frame,
-            num_state_embeddings,
-            num_actions,
-            tdigest,
+        detect_sensory_salience(
+            # actions,
+            z_q_ind=0 * z_q_ind,
+            z_q_emb=zero_z_q_emb,
+            replay_ind=replay_ind,
+            frames_in_sequence_window=frames_in_sequence_window,
+            state_tokens_in_frame=state_tokens_in_frame,
+            tokens_in_frame=tokens_in_frame,
+            # num_state_embeddings,
+            # num_actions,
+            pct_est=pct_est,
             min_reservoir=min_reservoir,
             use_emb=use_emb,
             logits=zero_logits,
         )
-    ret = detect_salience(
-        actions,
-        z_q_ind,
-        z_q_emb,
-        replay_ind,
-        seq_len,
-        frames_in_sequence_window,
-        state_tokens_in_frame,
-        tokens_in_frame,
-        num_state_embeddings,
-        num_actions,
-        tdigest,
+
+    ret = detect_sensory_salience(
+        # actions,
+        z_q_ind=z_q_ind,
+        z_q_emb=z_q_emb,
+        replay_ind=replay_ind,
+        frames_in_sequence_window=frames_in_sequence_window,
+        state_tokens_in_frame=state_tokens_in_frame,
+        tokens_in_frame=tokens_in_frame,
+        # num_state_embeddings,
+        # num_actions,
+        pct_est=pct_est,
         min_reservoir=min_reservoir,
         use_emb=use_emb,
         logits=logits,
     )
     assert (
-        len(ret) == num_frames - 2 * frames_in_sequence_window + 1
+            len(ret) == num_frames - 2 * frames_in_sequence_window + 1
     ), 'Two sequences slid across input'
     return ret
 
 
-def test_2_sequences():
-    salience = _test_detect_salience(num_sequences=2)
-    assert salience[0]['mid_replay_ind'] == 7
-
-
-def test_3_sequences():
-    salience = _test_detect_salience(num_sequences=3)
-    assert [s['mid_replay_ind'] for s in salience] == [7,8,9,10,11,12,13,14,15]
-
-
-def test_2_sequences_emb():
+def test_2_sequences_emb_lvl_0() -> None:
     salience = _test_detect_salience(num_sequences=2, use_emb=True)
-    assert salience[0]['mid_replay_ind'] == 7
+    assert salience[0].below_replay_index == 7
 
 
-def test_3_sequences_emb():
+def test_2_sequences_emb_lvl_1() -> None:
+    salience = _test_detect_salience(num_sequences=2, use_emb=True, level=1)
+    assert salience is not None
+
+def test_2_sequences_lvl_0() -> None:
+    salience = _test_detect_salience(num_sequences=2)
+    assert salience[0].below_replay_index == 7
+
+
+def test_3_sequences_emb_lvl_0() -> None:
     salience = _test_detect_salience(num_sequences=3, use_emb=True)
-    assert [s['mid_replay_ind'] for s in salience] == [7,8,9,10,11,12,13,14,15]
+    assert [s.below_replay_index for s in salience] == [7,8,9,10,11,12,13,14,15]
 
 
-def test_all():
+def test_3_sequences_lvl_0() -> None:
+    salience = _test_detect_salience(num_sequences=3)
+    assert [s.below_replay_index for s in salience] == [7,8,9,10,11,12,13,14,15]
+
+
+
+def test_all() -> None:
     if 'LEAST_SALIENT' in os.environ or 'DISABLE_SALIENCE_TESTS' in os.environ:
         return
     start = time.time()
-    test_3_sequences_emb()
-    test_2_sequences_emb()
-    test_3_sequences()
-    test_2_sequences()
+    test_2_sequences_emb_lvl_1()
+    test_2_sequences_emb_lvl_0()
+    test_2_sequences_lvl_0()
+    test_3_sequences_emb_lvl_0()
+    test_3_sequences_lvl_0()
+
     log.success(f'Tested salience detection in {round(1e3*(time.time() - start))}ms')
 
 
-def test_emb():
-    test_3_sequences_emb()
-    test_2_sequences_emb()
+def test_emb() -> None:
+    test_3_sequences_emb_lvl_0()
+    test_2_sequences_emb_lvl_0()
 
 
 if 'TEST_SALIENCE_EMB' in os.environ:

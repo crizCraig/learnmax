@@ -1,13 +1,15 @@
+from __future__ import annotations
 import collections
 import os
 import time
 import traceback
-from abc import abstractmethod, ABC
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime
 from functools import wraps
-from typing import List
+from typing import List, Any, Union, Tuple, Iterable, Callable, TYPE_CHECKING, Dict, Optional
 
+import PIL
 import torch
 import numpy as np
 import wandb
@@ -15,11 +17,15 @@ from numpy import array
 from torch import nn
 from PIL import Image
 from loguru import logger as log
+if TYPE_CHECKING:
+    from replay_buffer import ReplayBuffers, Experience, SensoryExperience
 
 from learn_max.constants import DATE_FMT, WANDB_MAX_LOG_PERIOD, ROOT_DIR, RUN_ID
 
 
-def topk_interesting(entropy, k, rand_half=False):
+def topk_interesting(
+        entropy: torch.Tensor, k: int, rand_half: bool = False
+) -> Tuple[torch.Tensor, torch.Tensor, Any]:
     """
     Get top k actions with most entropy
 
@@ -91,7 +97,7 @@ def topk_interesting(entropy, k, rand_half=False):
     return action_i, action_entropy, actions_flat
 
 
-def test_topk_interesting():
+def test_topk_interesting() -> None:
     a, e, _ = topk_interesting(torch.arange(10).reshape(2, 1, 5), k=5)
     assert sorted(list(e.cpu().numpy())) == [5, 6, 7, 8, 9]
     assert all([b == 1 for b, a in a.cpu().numpy()])
@@ -100,7 +106,7 @@ def test_topk_interesting():
     assert all([b >= 5 for b, a in a.cpu().numpy()])
 
 
-def get_action_states(logits, actions_flat):
+def get_action_states(logits: torch.Tensor, actions_flat: torch.Tensor) -> torch.Tensor:
     """
     Get most likely state as a result of taking a given action
 
@@ -127,7 +133,7 @@ def get_action_states(logits, actions_flat):
     return s_idx
 
 
-def test_get_state():
+def test_get_state() -> None:
     torch.manual_seed(0)
     torch.cuda.manual_seed_all(0)
     B, W, A, S, K = 4, 1, 18, 4096, 10  # batch, window, action, state, top_k actions
@@ -137,7 +143,7 @@ def test_get_state():
     a_s = get_action_states(logits, actions_flat)
     wi = 0
 
-    def _test_action_state(bi, ai):
+    def _test_action_state(bi: int, ai: int) -> None:
         """
         bi = batch index
         ai = action index
@@ -154,7 +160,7 @@ def test_get_state():
 
 
 # beam search
-def beam_search_decoder(data, k):
+def beam_search_decoder(data: Iterable, k: int) -> List[List[int]]:
     sequences = [[list(), 0.0]]
     # walk over each step in sequence
     for row in data:
@@ -172,7 +178,7 @@ def beam_search_decoder(data, k):
     return sequences
 
 
-def main_example():
+def main_example() -> None:
     # define a sequence of 10 words over a vocab of 5 words
     data = -np.log([[0.1, 0.2, 0.3, 0.4, 0.5],
                    [0.5, 0.4, 0.3, 0.2, 0.1],
@@ -192,7 +198,7 @@ def main_example():
         print(seq)
 
 
-def _init_weights(module):
+def _init_weights(module: torch.nn.Module) -> None:
     """
     Vanilla model initialization:
     - all MatMul weights \in N(0, 0.02) and biases to zero
@@ -207,7 +213,7 @@ def _init_weights(module):
         module.weight.data.fill_(1.0)
 
 
-def _wandb_log_closure():
+def _wandb_log_closure() -> Tuple[Callable, bool]:
     """
     From: https://docs.wandb.ai/guides/track/log/logging-faqs
     We recommend that you try to log less than 10,000 points per metric. If you log more than 1 million points in a
@@ -223,15 +229,15 @@ def _wandb_log_closure():
     # allows quickly seeing initial fast-changing metrics in wandb
     freq = 1
 
-    def _wandb_log(msg_dict):
+    def _wandb_log(msg_dict: Dict[str, Any]) -> None:
         nonlocal accum
         for k in msg_dict:
             accum[k].append(msg_dict[k])
 
-    def check_flush(batch_idx):
+    def check_flush(batch_idx: int) -> bool:
         nonlocal accum, freq
         if batch_idx % freq != 0:
-            return
+            return False
         freq = min(int(freq + 0.1), WANDB_MAX_LOG_PERIOD)  # 10@1hz, 10@1/2hz, 10@1/3hz... 1/WANDB_MAX_LOG_PERIOD
         log_dict = {k: sum(accum[k]) / len(accum[k]) for k in accum}
         log_dict['batch_idx'] = batch_idx
@@ -292,7 +298,7 @@ def sa2as(z_q_flat, z_q_ind, a):
     return a_x, a_y, gpt_x, z_q_ind_x, z_q_ind_y
 
 
-def get_date_str():
+def get_date_str() -> str:
     return datetime.now().strftime(DATE_FMT)
 
 
@@ -354,12 +360,12 @@ def accuracy(logits: torch.Tensor, target: torch.Tensor, topk=(1,)) -> List[torc
         return list_topk_accs  # list of topk accuracies for entire batch [topk1, topk2, ... etc]
 
 
-def no_train(f):
+def no_train(f: Callable) -> Callable:
     """
     Decorator for model ops that don't require grads and should be done in eval mode for things like Dropout
     """
     @wraps(f)
-    def wrapper(self, *args, **kwds):
+    def wrapper(self, *args: int, **kwds: int) -> Any:
         with torch.no_grad():
             was_training = self.training
             self.eval()  # Put Pytorch module in eval mode (e.g. for Dropout, BatchNorm, etc)
@@ -374,12 +380,12 @@ def no_train(f):
 #     f'{ROOT_DIR}/images/viz_salience/{get_date_str()}_r_{RUN_ID}_e_{self.current_epoch}'
 
 
-def best_effort(f):
+def best_effort(f: Callable) -> Callable:
     """
     Decorator for model ops that don't require grads and should be done in eval mode for things like Dropout
     """
     @wraps(f)
-    def wrapper(self, *args, **kwds):
+    def wrapper(self, *args, **kwds) -> Any:
         try:
             return f(self, *args, **kwds)
         except:
@@ -387,7 +393,7 @@ def best_effort(f):
     return wrapper
 
 
-def dist(a, b):
+def dist(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """
     Compute distance between all elements of a and b
     (a-b)^2
@@ -401,14 +407,23 @@ def dist(a, b):
     )
 
 
-def torch_random_choice(tensor, salient_k):
+def torch_random_choice(
+    tensor: torch.Tensor, salient_k: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
     perm = torch.randperm(tensor.size(0))
     idx = perm[:salient_k]
     samples = tensor[idx]
     return samples, idx
 
+
 @torch.no_grad()
-def viz_experiences(experiences, folder, dvq_decoder, device, file_prefix=''):
+def viz_experiences(
+        experiences: List[Experience],
+        folder: str,
+        dvq_decoder: torch.nn.Module,
+        device: str,
+        file_prefix: str = ''
+) -> None:
     for i, x in enumerate(experiences):
         imo = viz_experience(x, dvq_decoder, device)
         filename = f'{folder}/{file_prefix + str(i).zfill(9)}.png'
@@ -416,14 +431,19 @@ def viz_experiences(experiences, folder, dvq_decoder, device, file_prefix=''):
 
 
 @torch.no_grad()
-def viz_experience(x, dvq_decoder, device, show_actual=True):
+def viz_experience(
+        exp: SensoryExperience,
+        dvq_decoder: torch.nn.Module,
+        device: str,
+        show_actual: bool = True,
+) -> PIL.Image.Image:
     # TODO: Allow showing just decoded without the actual
-    im = x.state.state.squeeze(0).permute(1, 2, 0).detach().cpu().numpy()
+    im = exp.state.state.squeeze(0).permute(1, 2, 0).detach().cpu().numpy()
     # emb = x.state.dvq_z_q_flat.to(self.device)
     # B, H, W, E = emb.shape
     # if not self.is_single_token2:
     #     emb = emb.reshape(-1, self.dvq_embedding_dim)
-    imz = dvq_decoder.forward(x.state.dvq_z_q_emb.to(device))
+    imz = dvq_decoder.forward(exp.state.dvq_z_q_emb.to(device))
 
     # Image.fromarray(np.uint8(self.dvq.decoder.forward(x.state.dvq_z_q_emb.to(self.device)).squeeze(0).permute(1, 2, 0).detach().cpu().numpy() * 255)).show()
 
@@ -445,7 +465,14 @@ def viz_experience(x, dvq_decoder, device, show_actual=True):
     return imo
 
 
-def viz_salience(FiS, salient_replay_i, replay_buffers, dvq_decoder, device, file_prefix=''):
+def viz_salience(
+        FiS: int,
+        salient_replay_i: List[int],
+        replay_buffers: ReplayBuffers,
+        dvq_decoder: nn.Module,
+        device: Union[torch.device, str],
+        file_prefix: str = '',
+) -> None:
     os.makedirs(f'{ROOT_DIR}/images/viz_salience', exist_ok=True)
     folder_prefix = f'{ROOT_DIR}/images/viz_salience/{get_date_str()}_r_{RUN_ID}'
     for replay_i in salient_replay_i:
@@ -459,12 +486,13 @@ def viz_salience(FiS, salient_replay_i, replay_buffers, dvq_decoder, device, fil
                         dvq_decoder, device, file_prefix=file_prefix)
 
 
-def dataclass_to_dict(thing, dataclass):
-    if isinstance(thing, dataclass):
+def dataclass_to_dict(thing: Any, datacls: Any) -> Union[dict, List[dict]]:
+    if isinstance(thing, datacls):
         return thing.dict()
-    if isinstance(thing[0], dataclass):
+    if isinstance(thing[0], datacls):
         # agents_states only has a batch dimension, not window size
         return [_.dict() for _ in thing]
+    raise ValueError(f'Unknown type {type(thing)}')
 
 # TODO: Create GptBatchSensor and GptBatchSalient
 
@@ -479,19 +507,18 @@ class GptBatchBase:
         self.type = type(self).__name__
         self._ensure_shape()
 
-    @abstractmethod
-    def _ensure_shape(self):
+    def _ensure_shape(self) -> None:
         pass
 
-    def dict(self):
+    def dict(self) -> dict:
         ret = dataclass_no_none_dict(self)
         return ret
 
-    def _empty_(self):
+    def _empty_(self) -> None:
         self.salience_level_ind = torch.tensor([0])
         self.seq_len = 0
 
-    def __getitem__(self, batch_idx) -> dict:
+    def __getitem__(self, batch_idx: int) -> Dict[str, Any]:
         ret = dict(
             salience_level_ind=self.salience_level_ind[batch_idx].squeeze_(0),
             seq_len=self.seq_len
@@ -499,11 +526,11 @@ class GptBatchBase:
         ret['type'] = type(self).__name__
         return ret
 
-    def _reshape_single_sequence(self):
+    def _reshape_single_sequence(self) -> None:
         self._reshape_single_sequence_hook()
         self.salience_level_ind = self.salience_level_ind.unsqueeze(0)
 
-    def _reshape_multi_sequence(self, a_shp):
+    def _reshape_multi_sequence(self, a_shp: Tuple[int]) -> None:
         self._reshape_multi_sequence_hook(a_shp)
         assert len(self.salience_level_ind.shape) == 1
         self.salience_level_ind = self.salience_level_ind.view(-1, self.seq_len)
@@ -516,35 +543,35 @@ class GptBatchBase:
         return len(self.salience_level_ind)
 
     # Hooks
-    def _reshape_single_sequence_hook(self):
+    def _reshape_single_sequence_hook(self) -> None:
         pass
 
-    def _reshape_multi_sequence_hook(self):
+    def _reshape_multi_sequence_hook(self, ashp: Tuple[int]) -> None:
         pass
 
 
 @dataclass
 class GptSensorBatch(GptBatchBase):
-    z_q_ind: torch.Tensor = None
-    actions: torch.Tensor = None
+    z_q_ind: Optional[torch.Tensor] = None
+    actions: Optional[torch.Tensor] = None
 
-    def empty_(self):
+    def empty_(self) -> None:
         super()._empty_()
         self.z_q_ind = torch.tensor([0])
         self.actions = torch.tensor([0])
 
-    def _reshape_single_sequence_hook(self):
+    def _reshape_single_sequence_hook(self) -> None:
         self.z_q_ind = self.z_q_ind.unsqueeze(0)
         self.actions = self.actions.unsqueeze(0)
 
-    def _reshape_multi_sequence_hook(self, a_shp):
+    def _reshape_multi_sequence_hook(self, a_shp) -> None:
         assert self.z_q_ind.shape[0] == a_shp[0]
         self.actions = self.actions.view(-1, self.seq_len)
         self.z_q_ind = self.z_q_ind.view(
             -1, self.seq_len, *self.z_q_ind.shape[-2:]
         )
 
-    def _ensure_shape(self):
+    def _ensure_shape(self) -> None:
         if self.z_q_ind is not None:
             assert None not in (self.actions, self.salience_level_ind)
             a_shp = self.actions.shape
@@ -557,7 +584,7 @@ class GptSensorBatch(GptBatchBase):
                     # Add batch dimension as 1 if missing
                     self._reshape_single_sequence()
 
-    def __getitem__(self, batch_idx) -> dict:
+    def __getitem__(self, batch_idx: int) -> dict:
         ret = dict(
             z_q_ind=self.z_q_ind[batch_idx],
             actions=self.actions[batch_idx],
@@ -568,7 +595,7 @@ class GptSensorBatch(GptBatchBase):
 
 @dataclass
 class GptSalientBatch(GptBatchBase):
-    salient_cluster_ind: torch.Tensor = None
+    salient_cluster_ind: Optional[torch.Tensor] = None
 
     def __getitem__(self, batch_idx) -> dict:
         ret = dict(
@@ -577,26 +604,38 @@ class GptSalientBatch(GptBatchBase):
         )
         return ret
 
-    def _reshape_single_sequence_hook(self):
+    def _reshape_single_sequence_hook(self) -> None:
         self.salient_cluster_ind = self.salient_cluster_ind.unsqueeze(0)
 
-    def _reshape_multi_sequence_hook(self, a_shp):
+    def _reshape_multi_sequence_hook(self, a_shp) -> None:
         self.salient_cluster_ind = self.salient_cluster_ind.view(-1, self.seq_len)
 
-    def empty_(self):
+    def empty_(self) -> None:
         self.salient_cluster_ind = torch.tensor([0])
         super()._empty_()
 
 
-def horiz_cat_pil(imgs):
+def horiz_cat_pil(imgs: List[Image], captions: List[str]) -> Image:
     widths, heights = zip(*(i.size for i in imgs))
+
+    if captions:
+        caption_height = get_np_txt_caption2(np.asarray(imgs[0]), captions[0]).shape[0]
+    else:
+        caption_height = 0
     total_width = sum(widths)
-    max_height = max(heights)
+    max_height = max(heights) + caption_height
     new_im = Image.new('RGB', (total_width, max_height))
     x_offset = 0
-    for im in imgs:
-        new_im.paste(im, (x_offset, 0))
-        x_offset += im.size[0]
+    for i, img in enumerate(imgs):
+        np_img = np.asarray(img)
+
+        # Add text to bottom of image
+        caption = get_np_txt_caption2(np_img, captions[i])
+        np_img = np.concatenate((np_img, caption), axis=0)
+
+        img = Image.fromarray(np_img)
+        new_im.paste(img, (x_offset, 0))
+        x_offset += img.size[0]
     return new_im
 
 
@@ -617,7 +656,7 @@ GPT_BATCH_TYPE_MAP = {
     GptSalientBatch.__name__: GptSalientBatch,
 }
 
-def dataclass_no_none_dict(obj):
+def dataclass_no_none_dict(obj: Any) -> dict:
     d = obj.__dict__
     ret = {}
     for k in d:
@@ -627,19 +666,28 @@ def dataclass_no_none_dict(obj):
     return ret
 
 
-def get_np_txt_caption2(np_img, text, size=70):
+def get_np_txt_caption2(
+    np_img: np.ndarray, text: str, size: int = 70
+) -> np.ndarray:
     from PIL import Image, ImageDraw, ImageFont
-    image = Image.new('RGBA', (np_img.shape[0] * 4, np_img.shape[0]), (50, 50, 50))
+
+    image = Image.new(
+        'RGBA', (np_img.shape[0] * 4, np_img.shape[0]), (50, 50, 50)
+    )
     draw = ImageDraw.Draw(image)
     # Search for your system's own truetype font if this doesn't work, sorry!
-    font = ImageFont.truetype(font='/usr/share/fonts/truetype/ubuntu/Ubuntu-M.ttf', size=size)
+    font = ImageFont.truetype(
+        font='/usr/share/fonts/truetype/ubuntu/Ubuntu-M.ttf', size=size
+    )
     draw.text((10, 0), text, (200, 200, 200), font=font)
-    img_resized = image.resize((np_img.shape[0], np_img.shape[0] // 5), Image.ANTIALIAS)
+    img_resized = image.resize(
+        (np_img.shape[0], np_img.shape[0] // 5), Image.ANTIALIAS
+    )
     np_txt = np.array(img_resized)[:, :, :3].transpose(0, 1, 2)
     return np_txt
 
 
-def test_gpt_batch():
+def test_gpt_batch() -> None:
     sensor_batch = GptSensorBatch()
     sensor_batch.empty_()
     x = sensor_batch[0]
@@ -661,7 +709,7 @@ def test_gpt_batch():
     assert len(y['salient_cluster_ind'].shape) == 0
     assert len(y['salient_cluster_ind'].shape) == 0
 
-def run_tests():
+def run_tests() -> None:
     start = time.time()
     test_topk_interesting()
     test_gpt_batch()
@@ -671,3 +719,23 @@ run_tests()
 
 if __name__ == '__main__':
     test_gpt_batch()
+
+
+class LRU:
+    def __init__(self, max_size: int = 1000) -> None:
+        self.max_size = max_size
+        self.mp: OrderedDict = OrderedDict()
+
+    def add(self, key: Any, val: Any) -> None:
+        if key not in self.mp:
+            if len(self.mp) == self.max_size:
+                self.mp.popitem(last=False)  # Remove least recently used
+            self.mp[key] = val  # Insert at end
+        else:
+            self.mp.move_to_end(key)  # Make node recently used
+
+    def get(self, key: Any) -> Any:
+        if key not in self.mp:
+            return None
+        self.mp.move_to_end(key)
+        return self.mp[key]

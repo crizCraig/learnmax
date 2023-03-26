@@ -75,9 +75,11 @@
 - Use single token in parallel with patch tokens by prefixing sequences with single token representation. Try projecting the 4410 dim embedding to 30 as well as training a 30 dim dvq for this. Such an "anchor" representation is critical for generalization across time and helps efficiency by allowing transfer learning across salience levels. Should be able to get key without this, so we can delay implementation.
 - Train on level 1 salience and produce level 2 salience, visualize
 - We're now producing two levels! Visualize that second level baby!
+- Okay, we visualized it. It makes sense, but is not epic. We need more levels, but instead of doing a geometric mean to combine across 8 steps and then diff, we can just diff two steps. This as the two steps visually represent 16 frames each and _look_ like they will make good abstractions. 8 steps of 16 frames per step will simply be too much when you look at an image: ![results/viz_salient_events_seq_len_8_0.png](results/viz_salient_events_seq_len_8_0.png)
+- Send gradients for high salience levels down to lower ones, i.e. make training end to end.
 Notes:
 #### Comparison with hierarchy of abstract machines (HAMs)
-These have discrete action, call, choice, and stop where execution is occurring at one level of abstraction at a time (i.e. sequentially). A big difference between this and learnmax is that learnmax can search within different levels of abstraction in parallel. Since high level plans don't change as often, most searching is done in the lower levels even when executing a high level plan to find some long term entropy. So your basically optimizing for entropy reduction per unit time. However since high level entropy possibly unlocks new vistas and worlds of low level entropy, we still should perhaps afford more weight to high level entropy just based on level alone. 
+These have discrete action, call, choice, and stop where execution is occurring at one level of abstraction at a time (i.e. sequentially). A big difference between this and learnmax is that learnmax can search within different levels of abstraction in parallel. Since high level plans don't change as often, most searching is done in the lower levels even when executing a high level plan to find some long term entropy. So your basically optimizing for entropy reduction per unit time. However since high level entropy possibly unlocks new vistas and worlds of low level entropy, we still should perhaps afford more weight to high level entropy just based on level alone.
 
 #### Comparison with options in hierarchical RL
 It seems that options may support planning at multiple levels simultaneously. However, I don't see a way to automatically learn the options. Rather they are provided by humans. 
@@ -91,4 +93,3 @@ representations (lines in different directions) from layer 2. i.e. there is no s
 #### Comparison with "From Skills to Symbols: Learning Symbolic Representations for Abstract High-Level Planning"
 The set of possible salient states above you which you are looking for is similar to the "grounding set" mentioned in Definition 1. However, 
 there's no need to specify states derived from set operations on these states as such combinations should be learned by the transformer.
-

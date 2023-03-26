@@ -5,27 +5,34 @@ import sys
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import List
+from typing import Optional, Any, Dict, Tuple, List, Union
+
+from scipy import spatial
+from typing_extensions import Self  # Will be in typing in 3.11
 
 import numpy as np
 import pandas as pd
 # sns.set_theme()  # Apply the default theme
 import scipy
 import seaborn as sns
+import torch
+from ddsketch import DDSketch
 from loguru import logger as log
 from scipy.spatial import KDTree
 from sklearn.cluster import DBSCAN
 from tdigest import TDigest
 
 from learn_max.constants import RUN_ID, ROOT_DIR, PICKLE_DIR, DATE_STR
+from learn_max.percentile_estimator import PercentileEstimator
 from learn_max.replay_buffer import ReplayBuffers, SalientExperience
 from learn_max.utils import get_date_str, viz_experiences, viz_salience
 
-
+# Note that these contain logit based patch_diffs, which are not stable over time and
+#   are much larger than z_q_emb based patch_diffs.
 TEST_PICKLE_FILE = f'{ROOT_DIR}/test_data/exp_replay_i_and_patch_diff_for_salient_clusters.pickle'
 
 class SalientCluster:
-    def __init__(self, points_in_salient_cluster, cluster_index, dbscan):
+    def __init__(self, points_in_salient_cluster, cluster_index, dbscan) -> None:
         """
         This object helps map the points in original salient cluster to the cluster index,
         through the dbscan core points. This as core points are used in a KDTree to map unseen points
@@ -39,7 +46,7 @@ class SalientCluster:
         """
         # percentile distances of all points in cluster
         points = np.array(
-            [p[1]['patch_diff'].cpu().numpy() for p in points_in_salient_cluster]
+            [p[1].patch_diff.cpu().numpy() for p in points_in_salient_cluster]
         )
         points = points.reshape(points.shape[0], -1)
 
@@ -72,8 +79,8 @@ class SalientCluster:
 
 
         self.cluster_index = cluster_index
-        self.mid_replay_i = np.array(
-            [p[1]['mid_replay_ind'].cpu().numpy() for p in points_in_salient_cluster]
+        self.below_replay_indexes = np.array(
+            [p[1].below_replay_index for p in points_in_salient_cluster]
         )
         self.RUN_ID = RUN_ID
         self.DATE_STR = DATE_STR
@@ -100,61 +107,68 @@ class SalienceLevel:
     unclustered_points: list
 
     # Increase to get better salience deduplication at cost of CPU mem
-    num_points_to_cluster: int = 100_000
+    num_points_to_cluster: int
 
-    clusters: List[SalientCluster]
     encountered_known_salients: list
-    salience_resume_path: str = None  # Path to resume salience from
+    salience_resume_path: Optional[str] = None  # Path to resume salience from
+    pct_est: PercentileEstimator
 
     def __init__(
         self,
-        level,
-        replay_buffers,
-        steps_in_sequence_window,
-        salience_resume_path=None,
-        above=None,
-    ):
+        level: int,
+        replay_buffers: ReplayBuffers,
+        seq_len: int,
+        salience_resume_path: Optional[str] = None,
+        above: Optional[Self] = None,
+    ) -> None:
         # self.cluster_points = []
         # self.cluster_centroids = []
         self.level = level
         self.clustered_points = []
         self.unclustered_points = []
+        self.pct_est = PercentileEstimator()
+        if self.level == 0:
+            self.num_points_to_cluster = 100_000
+        else:
+            self.num_points_to_cluster = 800
+
 
         # TODO: Make this a list of kdtrees
         self.kdtree: scipy.spatial.kdtree.KDTree = None
 
-        self.above: SalientCluster = above
-
-        # Consider ddsketch to reduce error since we're interested in long tail salience
-        # https://blog.acolyer.org/2019/09/06/ddsketch/
-        self.tdigest = TDigest()
+        self.above = above
 
         # Map from DBSCAN core point to SalientEvent cluster
         self.core_point_map: dict = {}  # TODO: Make this a list of dicts
 
-        self.replay_buffers = replay_buffers
-        self.steps_in_sequence_window = steps_in_sequence_window
+        self.replay_buffers: ReplayBuffers = replay_buffers
+        self.seq_len = seq_len
 
         if salience_resume_path is not None:
             self.salience_resume_path = salience_resume_path
             self.load(salience_resume_path)
 
-    def __len__(self):
+    def __len__(self) -> int:
         """Number of steps in replay buffer"""
         return len(self.replay_buffers)
 
-    def add(self, saliences, dvq_decoder, device, FiS, lower_replay_buffers=None):
+    def add(
+        self,
+        saliences: List[SalientExperience],
+        device: Union[str, torch.device],
+        FiS: int,
+        lower_replay_buffers: Optional[ReplayBuffers] = None,
+        dvq_decoder: Optional[torch.nn.Module] = None,
+    ) -> Dict[str, Any]:
         """
         @param lower_replay_buffers: ReplayBuffers from which we extract salient events
         """
         # Move saliences to cpu
         for s in saliences:
-            s['patch_diff'] = s['patch_diff'].cpu()
-            s['mid_replay_ind'] = s['mid_replay_ind'].cpu()
+            s.patch_diff = s.patch_diff.cpu()
         self.unclustered_points.extend(saliences)
-
         repeats = self.detect_repeats(
-            FiS, device, dvq_decoder, lower_replay_buffers, saliences
+            FiS, device, saliences, dvq_decoder, lower_replay_buffers
         )
         if len(repeats) > 0:
             assert len(repeats) == 1  # TODO: Handle multiple repeats, but right now will always be one
@@ -168,17 +182,20 @@ class SalienceLevel:
                 SalientExperience(
 
                     # Avoid repeating mid_replay_ind by storing salient clusters separately
-                    below_replay_index=salience['mid_replay_ind'],
+                    below_replay_index=salience.below_replay_index,
 
-                    patch_diff=salience['patch_diff'],
+                    patch_diff=salience.patch_diff,
                     dist=dist,
-                    seq_len=self.steps_in_sequence_window,
+                    seq_len=self.seq_len,
                     cluster_index=salient_cluster.cluster_index,
-                    below_replay_indexes=salient_cluster.mid_replay_i,
+                    below_cluster_replay_indexes=salient_cluster.below_replay_indexes,
                     level=self.level + 1,
                 )
             )
+
+        # TODO: Decrease for higher levels
         progress = len(self.unclustered_points) / (0.1 * self.num_points_to_cluster)
+
         if len(self.unclustered_points) % 10 == 0:
             log.info(f'Percentage of points needed to cluster: ' f'{100 * progress:.2f}%')
         ret = {'new_salience_level': False}
@@ -191,14 +208,15 @@ class SalienceLevel:
                             + 'currently')
             else:
                 # TODO: Require fewer points for clusterings after the first
-                self.cluster(dvq_decoder, device)
+                # TODO: Deal with high level salience (i.e. no dvq_decoder)
+                self.cluster(device, dvq_decoder)
                 ret['new_salience_level'] = True
         ret['repeats'] = repeats
         return ret
 
     def detect_repeats(
-        self, frames_in_seq, device, dvq_decoder, replay_buffers, saliences
-    ):
+        self, frames_in_seq, device, saliences, dvq_decoder=None, replay_buffers=None
+    ) -> List[Tuple[SalientCluster, SalientExperience, float]]:
         # Map saliences to existing clusters
         # TODO: Write unit test that checks for zero distance when detecting same points that were clustered
         ret = []
@@ -207,7 +225,7 @@ class SalienceLevel:
         ):  # TODO: Visualize salient event and compare with orig closest points
             for salience in saliences:
                 dist, ind = self.kdtree.query(
-                    salience['patch_diff'].cpu().numpy().reshape(1, -1)
+                    salience.patch_diff.cpu().numpy().reshape(1, -1)
                 )
                 dist = dist[0]
                 ind = ind[0]
@@ -227,22 +245,22 @@ class SalienceLevel:
                     # TODO(salience): Inform parent transformer that new event occurred, store event, and train on
                     #   such events when we have enough data
                     ret.append((salient_cluster, salience, dist))
-                    if replay_buffers is not None:
+                    if replay_buffers is not None and dvq_decoder is not None:
                         # Add salient event to replay buffer
 
                         viz_salience(
                             frames_in_seq,
-                            [int(salience['mid_replay_ind'])],
+                            [int(salience.below_replay_ind)],
                             replay_buffers,
                             dvq_decoder,
                             device,
                             file_prefix=f'repeat_salient_exp_for_cluster_{salient_cluster.cluster_index}_',
                         )
                 else:
-                    if replay_buffers is not None:
+                    if replay_buffers is not None and dvq_decoder is not None:
                         viz_salience(
                             frames_in_seq,
-                            [int(salience['mid_replay_ind'])],
+                            [int(salience.below_replay_ind)],
                             replay_buffers,
                             dvq_decoder,
                             device,
@@ -250,7 +268,9 @@ class SalienceLevel:
                         )
         return ret
 
-    def cluster(self, dvq_decoder, device):
+    def cluster(
+            self, device: str, dvq_decoder: Optional[torch.nn.Module] = None
+    ) -> None:
         """
         Cluster points to detect duplicates. E.g. we can test if points are in the 90pct distance away from the
         closest cluster centroid and avoid detecting it as a NEW salient event (i.e. it's an existing one).
@@ -273,38 +293,45 @@ class SalienceLevel:
         # We have 123 dimensions which I think is manageable with euclidean distance in traditional clustering algos,
         # but one thing to try may be dimensionality reduction if dimensions increase or results suck.
         # Also, we should view the points in t-sne.
-        points = self.clustered_points + self.unclustered_points
-        patch_diff = np.array([p['patch_diff'].flatten().detach().cpu().numpy() for p in points]).T
+        points = self.clustered_points + self.unclustered_points  # Clustered points is always empty for now
+        patch_diff = np.array([p.patch_diff.flatten().detach().cpu().numpy() for p in points]).T
         # patch diff shape: (num_state/action/delim_embeddings, tokens_in_frame)
         self.kdtree, self.core_point_map = cluster_patch_diff(
-            patch_diff,
-            self.replay_buffers,
-            points,
-            self.steps_in_sequence_window,
-            dvq_decoder,
-            device,
+            patch_diff=patch_diff,
+            points=points,
+            replay_buffers=self.replay_buffers,
+            seq_len=self.seq_len,
+            dvq_decoder=dvq_decoder,
+            device=device,
+            is_sensory=self.level == 0,
         )
         self.save()
 
-        # TODO: Some reservoir sampling or just keep the core points?
+        # TODO: Some reservoir sampling or just keep the core points or merge old clusters with new ones
+        # self.clustered_points = self.unclustered_points
         self.unclustered_points = []
 
-    def load(self, path):
+    def load(self, path) -> None:
         log.info(f'Loading salience store from {path}')
         self.kdtree = unpickle(f'{path}/kdtree.pickle')
         self.core_point_map = unpickle(f'{path}/core_point_map.pickle')
         self.clustered_points = unpickle(f'{path}/clustered_points.pickle')
-        self.tdigest = unpickle(f'{path}/tdigest.pickle')
+        if os.path.exists(f'{path}/tdigest.pickle'):
+            tdigest: TDigest = unpickle(f'{path}/tdigest.pickle')
+            self.pct_est = PercentileEstimator(tdigest)
+        else:
+            ddsketch: DDSketch = unpickle(f'{path}/sketch.pickle')
+            self.pct_est = PercentileEstimator(ddsketch)
 
-    def save(self):
+    def save(self) -> None:
         save_dir = f'{PICKLE_DIR}/salience_store/lvl_{self.level}/{get_date_str()}'
         os.makedirs(save_dir, exist_ok=True)
         pickle_obj(self.kdtree, f'{save_dir}/kdtree.pickle')
         pickle_obj(self.core_point_map, f'{save_dir}/core_point_map.pickle')
         pickle_obj(self.clustered_points, f'{save_dir}/clustered_points.pickle')
-        pickle_obj(self.tdigest, f'{save_dir}/tdigest.pickle')
+        pickle_obj(self.pct_est, f'{save_dir}/sketch.pickle')
 
-    def get_distance_percentiles(self):
+    def get_distance_percentiles(self) -> List[Tuple[float, float]]:
         """
         NOT USED - Realtime salient event detection
         Do this after clustering so lookups for new events are fast
@@ -318,21 +345,23 @@ class SalienceLevel:
         for i in range(self.samples_per_cluster):
             percentile = (i+1) / self.samples_per_cluster
             pct_distances = []
-            for cluster in self.cluster_points:
+            for cluster in self.clustered_points:
                 pct_distances.append(cluster[i])  # get i-th closest point
             avg_dist = sum(pct_distances) / len(pct_distances)
             ret.append((percentile, avg_dist))
         return ret
 
+
 def cluster_patch_diff(
-    patch_diff,
-    replay_buffers=None,
-    points=None,
-    frames_in_sequence_window=None,
-    dvq_decoder=None,
-    device=None,
-    should_save_clusters=True,
-):
+    patch_diff: np.ndarray,
+    points: List[SalientExperience],
+    replay_buffers: Optional[ReplayBuffers] = None,
+    seq_len: Optional[int] = None,
+    dvq_decoder: Optional[torch.nn.Module] = None,
+    device: Optional[str] = None,
+    should_save_clusters: bool = True,
+    is_sensory: bool = True,
+) -> Tuple[spatial.KDTree, Dict[int, List[SalientExperience]]]:
     """
     patch diff (possibility, num_batches) where possibility is flattened logits for all patches,
     i.e. logits * patches... logits are predictions of the next embedding, so we're looking at the biggest differences
@@ -341,7 +370,7 @@ def cluster_patch_diff(
     # TODO: Visualize the clusters dbscan produces
     # TODO: We should also make sure that consecutive salient events are mostly clustered
 
-    dbscan = tune_dbscan(patch_diff)
+    dbscan = tune_dbscan(patch_diff, min_samples=3)
     should_pickle = False
     if should_pickle:
         pickle.dump(patch_diff, open('/tmp/cluster_patch_diff.pickle', 'wb'))
@@ -353,13 +382,13 @@ def cluster_patch_diff(
         # frames_in_sequence_window = 8
 
 
-    if replay_buffers is not None:
+    if replay_buffers is not None and points and points[0].level <= 1:
         viz_salience_clusters(
             dbscan,
             replay_buffers,
             points,
             patch_diff,
-            frames_in_sequence_window,
+            seq_len,
             dvq_decoder,
             device,
             should_save_clusters,
@@ -368,7 +397,9 @@ def cluster_patch_diff(
     show_non_consecutive_dupes(dbscan)
     return create_clusters(dbscan, points)
 
-def create_clusters(dbscan, points):
+def create_clusters(
+        dbscan: DBSCAN, points: List[SalientExperience]
+) -> Tuple[spatial.KDTree, Dict[int, SalientCluster]]:
     salient_clusters = []
     cluster_map = defaultdict(list)
     for i, label in enumerate(dbscan.labels_):
@@ -388,48 +419,68 @@ def create_clusters(dbscan, points):
     return kdtree, core_point_map
 
 
-def tune_dbscan(patch_diff):
-    """@param patch_diff: logits * patches, num_salience_points
+def tune_dbscan(patch_diff: np.array, min_samples: int = 3) -> DBSCAN:
+    """
+    @param patch_diff: logits * patches, num_salience_points
+    @param min_samples: min points per DBSCAN cluster
     """
     cost = math.inf
     distances = scipy.spatial.distance.pdist(patch_diff.T)
     MAX_ITERS = 200
-    start_eps = np.percentile(distances, 0.01)
+    start_eps = np.percentile(distances, 0.01)  # type: ignore
     eps = start_eps
-    eps_incr = (np.percentile(distances, 10) - start_eps) / MAX_ITERS
+    eps_incr = (np.percentile(distances, 10) - start_eps) / MAX_ITERS  # type: ignore
     eps_i = 0
-    dbscan = None
-    print('tune_dbscan patch_diff', patch_diff.shape, '\n', patch_diff)
+    log.info(f'tune_dbscan patch_diff {patch_diff.shape}\n{patch_diff}')
+    costs = []
     while True:
         new_eps = eps + eps_incr
-        new_dbscan = DBSCAN(eps=new_eps, min_samples=2).fit(patch_diff.T)
+        new_dbscan = DBSCAN(eps=new_eps, min_samples=min_samples).fit(patch_diff.T)
         clusters = Counter(new_dbscan.labels_)
         non_outlier_counts = clusters.copy()
         del non_outlier_counts[-1]
         largest_cluster = max(non_outlier_counts.values()) if non_outlier_counts else 0
         avg_cluster = sum(non_outlier_counts.values()) / len(non_outlier_counts) if non_outlier_counts else 0
-        # new_cost = largest_cluster / avg_cluster  # copilot idea (simpler?)
-        new_cost = (len(clusters) +  # minimize total number of clusters
-                    largest_cluster +  # along with the smallest largest cluster size
-                    avg_cluster +  # while also keeping the average cluster size down
-                    2 * clusters[-1])  # and reducing the number of outliers
+
+        # Spread points among non-outlier clusters
+        # new_cost = -1 * len(clusters) / avg_cluster
+
+        # Spread points among clusters and minimize outliers
+        new_cost = (
+            len(clusters) +  # minimize total number of clusters
+            largest_cluster +  # along with the smallest largest cluster size
+            avg_cluster +  # while also keeping the average cluster size down
+            2 * clusters[-1]  # and reducing the number of outliers
+        )
         print('len', len(clusters), 'max', largest_cluster, 'out', clusters[-1], 'avg', avg_cluster)
         print('eps', new_eps, 'cost', new_cost)
-        if new_cost > cost and clusters[-1] < 0.99 * len(new_dbscan.labels_):
-            # TODO: Make sure we're not stopping too early (is outlier 0.9 check enough?)
-            print('new cost greater', new_cost, '>', cost, 'use eps', eps)
-            break
+        print(Counter(new_dbscan.labels_))
+        # if new_cost > cost and clusters[-1] < 0.99 * len(new_dbscan.labels_):
+        #     # TODO: Make sure we're not stopping too early (is outlier 0.9 check enough?)
+        #     print('new cost greater', new_cost, '>', cost, 'use eps', eps)
+        #     return sorted(costs)[0][2]
         cost = new_cost
         eps = new_eps
         dbscan = new_dbscan
+        costs.append((cost, eps, dbscan, len(clusters), largest_cluster, clusters[-1], avg_cluster))
         eps_i += 1
-        if eps_i >= MAX_ITERS:
-            log.error('Could not find a good dbscan epsilon')
-            break
-    return dbscan
+        if eps > max(distances):
+            return sorted(costs)[0][2]
+        # if eps_i >= MAX_ITERS:
+        #     log.error('Could not find a good dbscan epsilon')
+        #     break
 
-def viz_salience_clusters(dbscan, replay_buffers, points, patch_diff, frames_in_sequence_window, dvq_decoder, device,
-                          should_save_clusters=True):
+
+def viz_salience_clusters(
+    dbscan: DBSCAN,
+    replay_buffers: ReplayBuffers,
+    points: List[SalientExperience],
+    patch_diff: np.array,
+    frames_in_sequence_window: int,
+    dvq_decoder: torch.nn.Module,
+    device: torch.device,
+    should_save_clusters: bool = True,
+) -> None:
     """
     Create folders for each cluster (including an outlier folder) and a t-sne graph
     that colorizes by cluster and has a legend with the cluster index (-1 for outliers).
@@ -443,10 +494,11 @@ def viz_salience_clusters(dbscan, replay_buffers, points, patch_diff, frames_in_
         run_folder = f'{ROOT_DIR}/images/viz_salience_clusters/{get_date_str()}_r_{RUN_ID}'
         FiS = frames_in_sequence_window
         for i, lbl in enumerate(dbscan.labels_):
-            replay_i = int(points[i]['replay_ind'])
+            replay_i = points[i].below_replay_index
             folder = f'{run_folder}/cluster_{lbl}'
             Path(folder).mkdir(parents=True, exist_ok=True)
             log.info(f'Saving salience clusters to {folder}')
+
             # Visualize a movie around the index
             viz_experiences(replay_buffers.train_buf.get(start=replay_i - FiS + 1, length=FiS * 2),
                             folder, dvq_decoder, device, file_prefix=f'cluster_{lbl}_rp_{replay_i}_')
@@ -485,7 +537,7 @@ def viz_salience_clusters(dbscan, replay_buffers, points, patch_diff, frames_in_
     #   we can remove these points after PCA reduction
 
 
-def show_non_consecutive_dupes(dbscan):
+def show_non_consecutive_dupes(dbscan: DBSCAN) -> None:
     scan_counts = Counter(dbscan.labels_)
     cons = 1
     for i, lb in enumerate(dbscan.labels_[:-1]):
@@ -501,18 +553,18 @@ def show_non_consecutive_dupes(dbscan):
             cons = 1
         # print('cons', cons)
 
-def save_cluster_patch_diff_args():
-    pickle.dump(
-        dict(
-            patch_diff=patch_diff,
-            replay_buffers=self.replay_buffers,
-            points=points,
-            frames_in_sequence_window=self.steps_in_sequence_window,
-            dvq_decoder=dvq_decoder,
-            device=device,
-        ),
-        open('/home/a/src/learnmax/cluster_patch_diff', 'wb')
-    )
+# def save_cluster_patch_diff_args():
+#     pickle.dump(
+#         dict(
+#             patch_diff=patch_diff,
+#             replay_buffers=self.replay_buffers,
+#             points=points,
+#             frames_in_sequence_window=self.steps_in_sequence_window,
+#             dvq_decoder=dvq_decoder,
+#             device=device,
+#         ),
+#         open('/home/a/src/learnmax/cluster_patch_diff', 'wb')
+#     )
 
 
 def main():
@@ -520,15 +572,15 @@ def main():
 
     # Instantiate SalienceStore
     salience_store = SalienceLevel(1, None, None, None)
-    salience_store.kdtree = unpickle('/home/a/src/learnmax/pickles/2022.11.27_11:51:10.663231/kdtree.pickle')
+    salience_store.kdtree = unpickle('/home/a/src/learnmax/pickles/2022.11.27_11:51:10.663231/kdtree.pickle')  # 246MB
 
     sys.modules[__name__].SalientEvent = SalientCluster  # Fix rename from when pickle was created
     salience_store.core_point_map = unpickle(
-        '/home/a/src/learnmax/pickles/2022.11.27_11:51:10.663231/core_point_map.pickle'
+        '/home/a/src/learnmax/pickles/2022.11.27_11:51:10.663231/core_point_map.pickle'  # 122MB
     )
-    points = unpickle('/home/a/src/learnmax/pickles/points.pickle')
-    dvq_decoder = unpickle('/home/a/src/learnmax/pickles/dvq_decoder.pickle')
-    device = unpickle('/home/a/src/learnmax/pickles/device.pickle')
+    points = unpickle('/home/a/src/learnmax/pickles/points.pickle')  # 130MB
+    dvq_decoder = unpickle('/home/a/src/learnmax/pickles/dvq_decoder.pickle')  # 1MB
+    device = unpickle('/home/a/src/learnmax/pickles/device.pickle')  # 44B
 
     # test add and detect_repeats
     test_add_and_detect_repeats = False
@@ -542,10 +594,10 @@ def main():
         if salient_add['new_salience_level']:
             log.info(f'New salience level')
 
-    patch_diff = unpickle('/home/a/src/learnmax/patch_diff.pickle')
+    patch_diff = unpickle('/home/a/src/learnmax/patch_diff.pickle')  # 125MB
     # dbscan = unpickle('/home/a/src/learnmax/pickles/dbscan.pickle')
-    replay_buffers = unpickle('/home/a/src/learnmax/pickles/replay_buffers.pickle')
-    frames_in_sequence_window = 8
+    replay_buffers = unpickle('/home/a/src/learnmax/pickles/replay_buffers.pickle')  # 2.6GB
+    seq_len = 8
 
     kdtree, core_point_map = cluster_patch_diff(
         patch_diff=patch_diff,
@@ -553,8 +605,8 @@ def main():
         points=points,
         dvq_decoder=dvq_decoder,
         device=device,
-        frames_in_sequence_window=frames_in_sequence_window,
-        should_save_clusters=False,
+        seq_len=seq_len,
+        should_save_clusters=True,
     )
     salience_store.kdtree = kdtree
     salience_store.core_point_map = core_point_map
@@ -564,42 +616,51 @@ def main():
     # show_non_consecutive_dupes(dbscan)
 
 def salience_level_factory(
-        level, env_id, short_term_mem_max_length, frames_per_file,
-        train_to_test_collection_ratio, should_overfit_gpt,
-        steps_in_sequence_window, salience_resume_path=None,
-        above=None,
-):
+    level: int,
+    env_id: str,
+    short_term_mem_max_length: int,
+
+    # Steps per file should be set such that the
+    # individual files are fast to load and small enough
+    steps_per_file: int,
+
+    train_to_test_collection_ratio: int,
+    should_overfit_gpt: bool,
+    steps_in_sequence_window: int,
+    salience_resume_path: Optional[str] = None,
+    above: Optional[SalienceLevel] = None,
+) -> SalienceLevel:
     replay_buffers = ReplayBuffers(
         env_id=env_id,
         short_term_mem_max_length=short_term_mem_max_length,
         salience_level=level,
-        frames_per_file=frames_per_file,
+        steps_per_file=steps_per_file,
         train_to_test_collection_ratio=train_to_test_collection_ratio,
         overfit_to_short_term=should_overfit_gpt,
     )
     ret = SalienceLevel(level=level,
                         replay_buffers=replay_buffers,
-                        steps_in_sequence_window=steps_in_sequence_window,
+                        seq_len=steps_in_sequence_window,
                         salience_resume_path=salience_resume_path,
                         above=above)
     return ret
 
-def unpickle(file):
+def unpickle(filename: str) -> Any:
 
     # TODO: Delete this module hack
     import sys
     sys.modules['learn_max.salience.salience_store'] = sys.modules[__name__]
 
-    with open(file, 'rb') as fo:
+    with open(filename, 'rb') as fo:
         ret = pickle.load(fo)
     return ret
 
-def pickle_obj(obj, file):
+def pickle_obj(obj: Any, filename: str):
     """Needs to be in the same module for imports to resolve"""
-    with open(file, 'wb') as fo:
+    with open(filename, 'wb') as fo:
         pickle.dump(obj, fo)
 
-def test_salient_cluster():
+def test_salient_cluster() -> None:
     """
     Sanity test salient event object
 
@@ -610,7 +671,7 @@ def test_salient_cluster():
 
     start = time.time()
     points = unpickle(TEST_PICKLE_FILE)
-    patch_diff = [p['patch_diff'].flatten().cpu().numpy() for p in points]
+    patch_diff = [p.patch_diff.flatten().cpu().numpy() for p in points]
     compute_eps = False
     if compute_eps:
         distances = scipy.spatial.distance.pdist(patch_diff)
@@ -632,6 +693,8 @@ def test_salient_cluster():
     log.success(f'Salient event tests passed in {int((time.time() - start) * 1000)}ms')
 
 test_salient_cluster()
+
+
 
 if __name__ == '__main__':
     main()

@@ -17,7 +17,8 @@ def get_model_args():
     args.dvq_checkpoint = '/home/a/src/learnmax/.lightning/learnmax-learn_max_experiments_bin/37yv98e9/checkpoints/epoch=8-step=85999.ckpt'
 
     args.salience_use_logits = False  # logits change so clustering doesn't work over time
-    args.num_state_embeddings = 256  # 6 actions plus 1 delim => 263
+    args.num_state_embeddings = 256  # 255 image patch embeddings + 6 actions + 1 delim => 263
+    # 123 = 121 image patches (11x11) + 1 action + 1 delim => 123
     args.sensor_embedding_dim = 30
     args.salient_embedding_dim = 256
 

@@ -16,8 +16,9 @@ def get_model_args():
     args.should_train_gpt = True
     args.dvq_checkpoint = '/home/a/src/learnmax/.lightning/learnmax-learn_max_experiments_bin/37yv98e9/checkpoints/epoch=8-step=85999.ckpt'
 
-    # args.salience_resume_path = '/home/a/src/learnmax/data/replay_buff/d_2023-02-09_15:30:20.699508_r-YY8SYKJS_env-MontezumaRevenge-v0'
     args.salience_resume_path = '/home/a/src/learnmax/pickles/2022.12.17_17:45:07.646449/salience_store/lvl_0'
+    # TODO: Resume salience 1
+
     args.salience_use_logits = False
     args.num_state_embeddings = 256  # 6 actions plus 1 delim => 263
     args.sensor_embedding_dim = 30
