@@ -51,7 +51,7 @@ def sample(model, x, steps, temperature=1.0, sample=False, top_k=None):
     return x
 
 
-def get_num_output_embeddings(num_state_embeddings, num_actions):
+def get_num_output_embeddings(num_state_embeddings: int, num_actions: int) -> int:
     """
     Number of embeddings for token types: state, action, and delim
 

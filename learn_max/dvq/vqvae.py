@@ -6,6 +6,7 @@ encoder, decoder and a quantize layer in the middle for the discrete bottleneck.
 import os
 import math
 from argparse import ArgumentParser
+from typing import Optional
 
 from loguru import logger as log
 import numpy as np
@@ -31,10 +32,19 @@ else:
 # -----------------------------------------------------------------------------
 
 class VQVAE(dvq_module):
-
-    def __init__(self, n_hid=64, num_embeddings=512, embedding_dim=64, loss_flavor='l2',
-                 input_channels=3, enc_dec_flavor='deepmind', vq_flavor='vqvae', quantize_proj=None,
-                 is_single_token2=False, enable_kmeans=True):
+    def __init__(
+        self,
+        n_hid: int = 64,
+        num_embeddings: int = 512,
+        embedding_dim: int = 64,
+        loss_flavor: str = 'l2',
+        input_channels: int = 3,
+        enc_dec_flavor: str = 'deepmind',
+        vq_flavor: str = 'vqvae',
+        quantize_proj: Optional[int] = None,
+        is_single_token2: bool = False,
+        enable_kmeans: bool = True,
+    ):
         """
         @type n_hid: number of channels controlling the size of the model
         @type num_embeddings: vocabulary size; number of possible discrete states

@@ -1,25 +1,26 @@
 import argparse
 import os
+from dataclasses import dataclass
 
 import pytorch_lightning as pl
 
-from learn_max.constants import DEBUGGING
+from learn_max.constants import DEBUGGING, DEFAULT_GPT_SEQ_LEN
 from loguru import logger as log
 
 
-def get_blank_model_args():
+def get_blank_model_args() -> argparse.Namespace:
     args = get_model_args_from_cli()
     _check_model_defaults(args)
     return args
 
 
-def get_blank_train_args():
+def get_blank_train_args() -> argparse.Namespace:
     args = get_train_args_from_cli()
     _check_train_defaults(args)
     return args
 
 
-def get_model_args_from_cli():
+def get_model_args_from_cli() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     # model args
     parser = add_reinforcement_learning_args(parser)
@@ -36,7 +37,7 @@ def get_model_args_from_cli():
     return args
 
 
-def get_train_args_from_cli():
+def get_train_args_from_cli() -> argparse.Namespace:
     """
     Note there should be no overlap with model args, esp if setting args in python as args you set
      in get_model_args will not 'stick' and you'll need to set them again in train args since
@@ -100,7 +101,7 @@ def add_model_specific_args(arg_parser: argparse.ArgumentParser, ) -> argparse.A
     arg_parser.add_argument('--should_train_gpt', action='store_true', help="Whether to train GPT", default=False)
     arg_parser.add_argument('--gpt_learning_rate', type=float, help="GPT batch size", default=6e-4)
     arg_parser.add_argument('--gpt_batch_size', type=int, help="GPT batch size", default=8)
-    arg_parser.add_argument('--gpt_seq_len', type=int, help="sequence length for the model (length of temporal window)", default=40)
+    arg_parser.add_argument('--gpt_seq_len', type=int, help="sequence length for the model (length of temporal window)", default=DEFAULT_GPT_SEQ_LEN)
     arg_parser.add_argument('--actions_per_batch', type=int, help="avoids overfitting with more data generated between updates", default=1)
     arg_parser.add_argument('--salience_resume_path', type=str, help="path to salience pickles", default=None)
     return arg_parser
@@ -110,11 +111,11 @@ def add_shared_model_train_args(arg_parser: argparse.ArgumentParser, ) -> argpar
     # TODO: Use pin_memory in dataloader when using disk-backed replay buffer
     log.warning('Not pinning memory, do this once testing overfitting!')
     arg_parser.add_argument('-p', '--pin_memory', type=bool, default=False, help="pin memory on dataloaders?")
-    arg_parser.add_argument('--train_to_test_collection_ratio', type=float, help="num train to test examples to collect in replay buffer", default=10)
+    arg_parser.add_argument('--train_to_test_collection_files', type=float, help="num train to test examples to collect in replay buffer", default=10)
     return arg_parser
 
 
-def _check_model_defaults(args):
+def _check_model_defaults(args: argparse.Namespace) -> None:
     # Assert some defaults are set, TODO: Use constants for these
     assert args.checkpoint is None
     assert args.dvq_checkpoint is None
@@ -122,8 +123,14 @@ def _check_model_defaults(args):
     assert args.num_workers == 0
 
 
-def _check_train_defaults(args):
+def _check_train_defaults(args: argparse.Namespace) -> None:
     # Assert some defaults are set, TODO: Use constants for these
     assert args.num_gpus == 1
     assert args.num_epochs == 1000
 
+
+@dataclass
+class TestProps:
+    in_test: bool = False  # Not threadsafe
+
+test_props = TestProps()

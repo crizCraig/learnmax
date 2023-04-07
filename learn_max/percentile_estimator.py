@@ -21,6 +21,8 @@ class PercentileEstimator:
     def __init__(self, est: Optional[Union[TDigest, DDSketch]] = None):
         if est is None:
             est = DDSketch()
+        elif not isinstance(est, (TDigest, DDSketch)):
+            raise ValueError(f'Invalid type for est: {type(est)}')
         self._est = est
         self.is_ddsketch = isinstance(est, DDSketch)
 

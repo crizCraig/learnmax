@@ -6,7 +6,7 @@ import time
 from collections import deque, defaultdict
 from copy import copy
 from pathlib import Path
-from typing import Tuple, List, Optional, Iterable, Dict
+from typing import Tuple, List, Optional, Dict, Callable, Any
 
 import cv2
 import gym
@@ -39,7 +39,8 @@ from learn_max.config import get_train_args_from_cli, get_model_args_from_cli
 from learn_max.agent import LearnMaxAgent, AgentState
 from learn_max.dvq.model.deepmind_enc_dec import ResBlock
 from learn_max.mingpt.utils import get_num_output_embeddings
-from learn_max.replay_buffer import SensoryExperience, ReplayBuffer, get_readonly_replay_buf
+from learn_max.replay_buffer import ReplayBuffer, get_readonly_replay_buf
+from learn_max.salience.experience import SensoryExperience
 from learn_max.salience.detect_salience import detect_sensory_salience, detect_abstract_salience
 from learn_max.salience.salience import salience_level_factory, SalienceLevel
 from learn_max.utils import (
@@ -77,24 +78,15 @@ from learn_max.viz_predicted_trajectories import (
     get_action_text,
 )
 
-log.remove()
-log.add(sys.stderr, level="INFO")
-os.makedirs(f'{ROOT_DIR}/logs', exist_ok=True)
-log.add(
-    f'{ROOT_DIR}/logs/learnmax_log_{time}.log',
-    compression='zip',
-    rotation='10 MB',
-)
-
 
 DEBUG_TRAJ_BUF = 'DEBUG_TRAJ_BUFF' in os.environ
 
 class LearnMax(pl.LightningModule):
     def __init__(
         self,
-        sensor_embedding_dim: int = None,
-        salient_embedding_dim: int = None,
-        num_state_embeddings: int = None,  # Number of possible discrete states shared between dvq and gpt
+        sensor_embedding_dim: Optional[int] = None,
+        salient_embedding_dim: Optional[int] = None,
+        num_state_embeddings: Optional[int] = None,  # Number of possible discrete states shared between dvq and gpt
         # dvq args - dvq = deep vector quantization
         dvq_batch_size: int = 32,  # DVQ batch size
         dvq_n_hid: int = 64,  # number of channels controlling the size of the model
@@ -104,8 +96,8 @@ class LearnMax(pl.LightningModule):
         dvq_input_channels: int = 3,  # 3 for RGB
         dvq_enc_dec_flavor: str = 'deepmind',  # Deepmind VQVAE or OpenAI Dall-E dVAE
         dvq_vq_flavor: str = 'vqvae',  # `vqvae` or `gumbel`
-        dvq_quantize_proj: int = None,
-        dvq_checkpoint: str = None,  # pretrained dvq checkpoint
+        dvq_quantize_proj: Optional[int] = None,
+        dvq_checkpoint: Optional[str] = None,  # pretrained dvq checkpoint
         dvq_enable_kmeans: bool = True,  # whether to train the clusters iteratively with kmeans
         # mingpt model definition args
         # size of the vocabulary (number of possible tokens) -
@@ -155,12 +147,13 @@ class LearnMax(pl.LightningModule):
         single_token2: bool = True,
         should_viz_predict_trajectory: bool = False,
         should_overfit_gpt: bool = False,  # Whether to overfit on a small batch of recent experience
-        train_to_test_collection_ratio: float = 10,  # Number of train to test files to collect in replay buffer
+        train_to_test_collection_files: int = 10,  # Number of train to test files to collect in replay buffer
         # Dataloader
         pin_memory: bool = False,
         # Salience
-        salience_resume_path: str = None,  # path to salience pickles dir
+        salience_resume_path: Optional[str] = None,  # path to salience pickles dir
         salience_use_logits: bool = False,  # whether to use logits in salience
+        steps_per_abstract_replay_buff_file: int = 10,  # how many steps to collect in each abstract replay buffer file
     ):
         """
         Maximizing learning by predicting interesting actions
@@ -237,8 +230,8 @@ class LearnMax(pl.LightningModule):
         self.data_dir = data_dir
         self.total_steps = 0
         self.total_training_steps = 0
-        self.total_rewards = []
-        self.total_episode_steps = []
+        self.total_rewards: List[float] = []
+        self.total_episode_steps: List[int] = []
 
         # Tree search
         self.beam_width = beam_width
@@ -252,6 +245,7 @@ class LearnMax(pl.LightningModule):
         self.salience_resume_path = salience_resume_path
         self.salience_use_logits = salience_use_logits
         self.salient_embedding_dim = salient_embedding_dim
+        self.steps_per_abstract_replay_buff_file = steps_per_abstract_replay_buff_file
 
         self.pin_memory = pin_memory
         self.num_workers = num_workers
@@ -266,7 +260,7 @@ class LearnMax(pl.LightningModule):
 
         self.agent_state = None  # Most recent internal and external state
 
-        def make_env(_env_id):
+        def make_env(_env_id: str) -> gym.Env:
             _env = gym.make(_env_id)
             # _env = MaxAndSkipEnv(_env)
             _env = FireResetEnv(_env)
@@ -388,12 +382,10 @@ class LearnMax(pl.LightningModule):
 
         # RL type tracking metrics
         self.total_rewards = []
-        self.episode_rewards = []
+        self.episode_rewards: List[float] = []
         self.done_episodes = 0
         self.avg_rewards = 0
         self.avg_reward_len = avg_reward_len
-        self.batch_states = []
-        self.batch_actions = []
         self.episode_steps = 0
         self.episode_reward = 0
 
@@ -405,18 +397,17 @@ class LearnMax(pl.LightningModule):
         )
         self.short_term_mem_max_length = short_term_mem_max_length
         self.gpt_steps_per_file = (
-            self.gpt_seq_len * self.gpt_batch_size
-            + self.get_num_extra_seq_samples()
+            self.gpt_seq_len * self.gpt_batch_size + self.get_num_extra_seq_samples()
         )
         self.should_overfit_gpt = should_overfit_gpt
-        self.train_to_test_collection_ratio = train_to_test_collection_ratio
+        self.train_to_test_collection_files = train_to_test_collection_files
         self.sensor_level: SalienceLevel = salience_level_factory(
             level=0,
             env_id=self.env_id,
             short_term_mem_max_length=short_term_mem_max_length,
             # Get a full val batch when training starts (on resume?)
             steps_per_file=max(self.dvq_batch_size, self.gpt_steps_per_file),
-            train_to_test_collection_ratio=train_to_test_collection_ratio,
+            train_to_test_collection_files=train_to_test_collection_files,
             should_overfit_gpt=should_overfit_gpt,
             steps_in_sequence_window=gpt_seq_len,
             salience_resume_path=salience_resume_path,
@@ -532,14 +523,18 @@ class LearnMax(pl.LightningModule):
     def get_salience_level(
         self, salience_resume_path: str, level: int
     ) -> SalienceLevel:
+        if level == 0:
+            steps_per_file = self.gpt_steps_per_file
+        else:
+            steps_per_file = self.steps_per_abstract_replay_buff_file
         return salience_level_factory(
             level=level,
             env_id=self.env_id,
             short_term_mem_max_length=self.short_term_mem_max_length,
-            steps_per_file=self.gpt_steps_per_file,  # TODO: Increase this once 1 is working
+            steps_per_file=steps_per_file,
             steps_in_sequence_window=self.gpt.steps_in_sequence_window,
             should_overfit_gpt=self.should_overfit_gpt,
-            train_to_test_collection_ratio=self.train_to_test_collection_ratio,
+            train_to_test_collection_files=self.train_to_test_collection_files,
             salience_resume_path=salience_resume_path,
         )
 
@@ -665,7 +660,7 @@ class LearnMax(pl.LightningModule):
             while len(self.train_buf) < warm_start:
                 self.step()
 
-    def step(self):
+    def step(self) -> None:
         action, predicted_trajectory = self.agent.get_action(
             self.agent_state, self.device
         )
@@ -674,15 +669,14 @@ class LearnMax(pl.LightningModule):
         self.total_steps += 1
         self.episode_reward += reward
         next_agent_state = self.get_agent_state(next_state)
-        exp = SensoryExperience(
+
+        self.replay_buffers.append(SensoryExperience(
             state=self.agent_state,
             action=action[0],
             reward=reward,
             done=done,
             new_state=next_agent_state,
-        )
-
-        self.replay_buffers.append(exp)
+        ))
 
         self.predicted_trajectory_buffer.append(predicted_trajectory)
 
@@ -712,14 +706,21 @@ class LearnMax(pl.LightningModule):
             # as death is discouraged by resetting to the initial level where
             # new learning is minimal.
             if level.replay_buffers.curr_buf.is_train():
+                # log.info('Detecting abstract salience')
                 recent_exp = level.replay_buffers.short_term_mem
-                if len(recent_exp) >= NUM_DIFF_SALIENT:
+                if (
+                    len(recent_exp) >= NUM_DIFF_SALIENT
+                    and recent_exp[-1].replay_index > level.last_checked_replay_index
+                ):
+                    log.success('Checking new abstract salience')
+                    level.last_checked_replay_index = recent_exp[-1].replay_index
                     patch_diffs = torch.cat(
                         [
                             recent_exp[-2].patch_diff.unsqueeze(0),
                             recent_exp[-1].patch_diff.unsqueeze(0),
                         ]
-                    ).unsqueeze(0)  # Add batch dim
+                    )
+                    patch_diffs = patch_diffs.unsqueeze(0)  # Add batch dim
 
                     # Combine embedding and patch dims
                     patch_diffs = patch_diffs.reshape(*patch_diffs.shape[:-2], -1)
@@ -784,26 +785,25 @@ class LearnMax(pl.LightningModule):
             # This is the only place we should be calling detect_salience
             # TODO: Detect salience at higher levels
             saliences = detect_sensory_salience(
-                actions=actions,
+                # actions=actions,
                 z_q_ind=z_q_ind,
                 z_q_emb=z_q_embed,
                 replay_ind=replay_ind,
                 frames_in_sequence_window=self.gpt_seq_len,
-                tokens_in_frame=self.gpt.tokens_in_frame,
-                state_tokens_in_frame=self.gpt.state_tokens_in_frame,
-                num_state_embeddings=self.gpt.num_state_embeddings,
-                num_actions=self.num_actions,
-
+                # num_state_embeddings=self.gpt.num_state_embeddings,
+                # num_actions=self.num_actions,
                 pct_est=self.salience_levels[0].pct_est,
                 use_emb=use_emb,
+                state_tokens_in_frame=self.gpt.state_tokens_in_frame,
+                tokens_in_frame=self.gpt.tokens_in_frame,
                 logits=gpt_logits,
             )
-            salience_ratio = len(saliences) / len(actions)
+            salience_ratio = len(saliences) / len(actions)  # type: ignore
             wandb_log({'salience/ratio_all': salience_ratio})
 
             if saliences:
+
                 # Add salient event that occurred at level 0, the sensor level
-                # TODO(variable salience): Add to variable level (not just 0)
                 salience_add = self.salience_levels[0].add(
                     saliences=saliences,
                     dvq_decoder=self.dvq.decoder,
@@ -1131,7 +1131,7 @@ class LearnMax(pl.LightningModule):
 
         return gpt_batch
 
-    def get_num_extra_seq_samples(self):
+    def get_num_extra_seq_samples(self) -> int:
         if self.is_single_token2:
             num_extra_seq_items = 2  # action => states and shift targets by 1
         else:
@@ -1139,7 +1139,7 @@ class LearnMax(pl.LightningModule):
             num_extra_seq_items = 1
         return num_extra_seq_items
 
-    def reset_after_death(self):
+    def reset_after_death(self) -> None:
         # TODO: The replay buffer should know reset boundaries so that we can avoid sampling across resets.
         #   This is important for AGI safety in that humans / life cannot respawn, and AI should reason about
         #   exploration in the same context.
@@ -2659,8 +2659,18 @@ class LearnMax(pl.LightningModule):
         return [int(next_action)], predicted_traj
 
     def get_recent_experience(
-        self, delay=0, max_size=None, train_buff_only=False
-    ):
+        self,
+        delay: int = 0,
+        max_size: Optional[int] = None,
+        train_buff_only: bool = False,
+    ) -> Tuple[
+        Optional[torch.Tensor],
+        bool,
+        int,
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]:
         """
         Return recent embeddings, embedding indexes, and actions. May not return a full
         window if agent was recently born. (language: using "born" is better than "spawned" for promoting thinking
@@ -2675,10 +2685,10 @@ class LearnMax(pl.LightningModule):
         #   We learn more from such experiences by default due to high error, however, sample efficiency may be improved
         #   even more through sampling.
 
-        z_q_embed_branches = []
-        z_q_ind_branches = []
-        action_branches = []
-        replay_index_branches = []
+        z_q_embed_branches: List[torch.Tensor] = []
+        z_q_ind_branches: List[torch.Tensor] = []
+        action_branches: List[torch.Tensor] = []
+        replay_index_branches: List[torch.Tensor] = []
 
         max_size = max_size or self.gpt_seq_len
         recent_exp = self.replay_buffers.short_term_mem
@@ -2724,30 +2734,30 @@ class LearnMax(pl.LightningModule):
                 replay_index_branches.append(exp.replay_index)
         if look_back == 0:
             just_died = True
-            z_q_embed_branches = None
-            z_q_ind_branches = None
-            action_branches = None
-            replay_index_branches = None
+            ret_z_q_embed_branches = None
+            ret_z_q_ind_branches = None
+            ret_action_branches = None
+            ret_replay_index_branches = None
         else:
             # Unsqueeze so we have batch, window, embed dims, where batch=1, e.g. 1, 80, 4410
-            z_q_embed_branches = torch.cat(z_q_embed_branches).unsqueeze(0)
-            z_q_ind_branches = torch.cat(z_q_ind_branches).unsqueeze(0)
-            action_branches = (
+            ret_z_q_embed_branches = torch.cat(z_q_embed_branches).unsqueeze(0)
+            ret_z_q_ind_branches = torch.cat(z_q_ind_branches).unsqueeze(0)
+            ret_action_branches = (
                 torch.tensor(action_branches).unsqueeze(0).to(self.device)
             )
-            replay_index_branches = (
+            ret_replay_index_branches = (
                 torch.tensor(replay_index_branches).unsqueeze(0).to(self.device)
             )
         return (
-            action_branches,
+            ret_action_branches,
             just_died,
             look_back,
-            z_q_embed_branches,
-            z_q_ind_branches,
-            replay_index_branches,
+            ret_z_q_embed_branches,
+            ret_z_q_ind_branches,
+            ret_replay_index_branches,
         )
 
-    def log_p_a_given_rs(self, logits):
+    def log_p_a_given_rs(self, logits: torch.Tensor) -> None:
         """
         Takes B,W,S,A logits and logs probability of action across states
 
@@ -2798,9 +2808,9 @@ def set_net_weights(source, target):
 
 
 def cli_main(
-    get_model_args_fn=get_model_args_from_cli,
-    get_train_args_fn=get_train_args_from_cli,
-):
+    get_model_args_fn: Callable[..., Any] = get_model_args_from_cli,
+    get_train_args_fn: Callable[..., Any] = get_train_args_from_cli,
+) -> None:
     torch.backends.cudnn.benchmark = True  # autotune kernels
     torch.multiprocessing.set_start_method('spawn')
     open('/tmp/learnmax-runs.txt', 'a').write(
@@ -3033,7 +3043,7 @@ def _load_pretrained_gpt(_model, model):
 class ProcessFrame84Color(ObservationWrapper):
     """preprocessing images from env"""
 
-    def __init__(self, env=None):
+    def __init__(self, env=None) -> None:
         if not _OPENCV_AVAILABLE:  # pragma: no cover
             raise ModuleNotFoundError(
                 'This class uses OpenCV which it is not installed yet.'
@@ -3044,12 +3054,12 @@ class ProcessFrame84Color(ObservationWrapper):
             low=0, high=255, shape=(84, 84, 3), dtype=np.uint8
         )
 
-    def observation(self, obs):
+    def observation(self, obs) -> np.ndarray:
         """preprocess the obs"""
         return ProcessFrame84Color.process(obs)
 
     @staticmethod
-    def process(frame):
+    def process(frame: np.ndarray) -> np.ndarray:
         """image preprocessing, formats to 84x84"""
         if frame.size == 210 * 160 * 3:
             img = np.reshape(frame, [210, 160, 3]).astype(np.float32)
@@ -3066,7 +3076,7 @@ class ProcessFrame84Color(ObservationWrapper):
         return x_t  # .astype(np.uint8)  # we convert to float32 in ScaledFloatFrame so just leave as float
 
 
-def get_default_sensor_embeddings(is_single_token2=False):
+def get_default_sensor_embeddings(is_single_token2: bool = False) -> Tuple[int, int]:
     if is_single_token2:
         # length we project dvq vectors to for processing within the transformer
         # (large due to whole image reshaped into single token, no patches)

@@ -40,6 +40,6 @@ should_overfit_gpt: false
 should_train_gpt: true
 should_viz_predict_trajectory: true
 single_token2: false
-train_to_test_collection_ratio: 10
+train_to_test_collection_files: 10
 use_internal_salience: true
 warm_start_size: 10000

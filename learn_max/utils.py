@@ -17,8 +17,12 @@ from numpy import array
 from torch import nn
 from PIL import Image
 from loguru import logger as log
+
+from learn_max.config import test_props
+
 if TYPE_CHECKING:
-    from replay_buffer import ReplayBuffers, Experience, SensoryExperience
+    from replay_buffer import ReplayBuffers
+    from learn_max.salience.experience import Experience, SensoryExperience
 
 from learn_max.constants import DATE_FMT, WANDB_MAX_LOG_PERIOD, ROOT_DIR, RUN_ID
 
@@ -365,16 +369,26 @@ def no_train(f: Callable) -> Callable:
     Decorator for model ops that don't require grads and should be done in eval mode for things like Dropout
     """
     @wraps(f)
-    def wrapper(self, *args: int, **kwds: int) -> Any:
+    def wrapper(learnmax: Any, *args: List[Any], **kwds: Dict[str, Any]) -> Any:
         with torch.no_grad():
-            was_training = self.training
-            self.eval()  # Put Pytorch module in eval mode (e.g. for Dropout, BatchNorm, etc)
-            ret = f(self, *args, **kwds)
+            was_training = learnmax.training
+            learnmax.eval()  # Put Pytorch module in eval mode (e.g. for Dropout, BatchNorm, etc)
+            ret = f(learnmax, *args, **kwds)
             if was_training:
-                self.train()  # Switch off Pytorch eval mode, back to train mode
+                learnmax.train()  # Switch off Pytorch eval mode, back to train mode
         return ret
     return wrapper
 
+
+def test(f: Callable) -> Callable:
+    """Decorator for tests"""
+    @wraps(f)
+    def wrapper(*args: List[Any], **kwds: Dict[str, Any]) -> Any:
+        test_props.in_test = True
+        ret = f(*args, **kwds)
+        test_props.in_test = False
+        return ret
+    return wrapper
 
 # def get_viz_salience_folder():
 #     f'{ROOT_DIR}/images/viz_salience/{get_date_str()}_r_{RUN_ID}_e_{self.current_epoch}'
@@ -385,9 +399,9 @@ def best_effort(f: Callable) -> Callable:
     Decorator for model ops that don't require grads and should be done in eval mode for things like Dropout
     """
     @wraps(f)
-    def wrapper(self, *args, **kwds) -> Any:
+    def wrapper(obj: Any, *args: List[Any], **kwds: Dict[str, Any]) -> Any:
         try:
-            return f(self, *args, **kwds)
+            return f(obj, *args, **kwds)
         except:
             print(traceback.format_exc())
     return wrapper
@@ -421,7 +435,7 @@ def viz_experiences(
         experiences: List[Experience],
         folder: str,
         dvq_decoder: torch.nn.Module,
-        device: str,
+        device: Union[str, torch.device],
         file_prefix: str = ''
 ) -> None:
     for i, x in enumerate(experiences):
@@ -478,7 +492,7 @@ def viz_salience(
     for replay_i in salient_replay_i:
         folder = f'{folder_prefix}_i_{int(replay_i)}'
         os.makedirs(folder, exist_ok=True)
-        print('Saving salience to ' + folder)
+        log.info('Saving salience to ' + folder)
         # Use train_buf as we are sampling only from train w. train_only
         # TODO: Use viz_experiences and get all replay_i instead of this loop
         # Visualize a movie around the index

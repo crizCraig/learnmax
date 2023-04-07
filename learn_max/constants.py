@@ -10,6 +10,7 @@ RUN_ID = ''.join(
 BLOCK_SIZE = 128  # spatial extent of the model for its context
 # NEPTUNE_RUN = neptune.init(project='crizcraig/safeobjective', api_token=os.environ['NEPTUNE_CREDS'])
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+REPLAY_ROOT_DIR = f'{ROOT_DIR}/data/replay_buff'
 DATE_FMT = '%Y-%m-%d_%H:%M:%S.%f'
 DATE_STR = datetime.now().strftime(DATE_FMT)
 SAVE_DIR = f'{ROOT_DIR}/checkpoints'
@@ -27,3 +28,4 @@ COMBINE_STEPS_ABSTRACT_SEQ = 1
 COMBINE_STEPS_SENSOR_SEQ = 8
 TRAIN = 'train'
 TEST = 'test'
+DEFAULT_GPT_SEQ_LEN = 8
