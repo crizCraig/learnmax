@@ -56,7 +56,13 @@ class VQVAE(dvq_module):
         @type enable_kmeans: whether to run kmeans alongside online clustering
         """
         super().__init__()
-
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self.loss_flavor = loss_flavor
+        self.input_channels = input_channels
+        self.enc_dec_flavor = enc_dec_flavor
+        self.vq_flavor = vq_flavor
+        self.quantize_proj = quantize_proj
         self.is_single_token2 = is_single_token2
         self.enable_kmeans = enable_kmeans
         if is_single_token2:
@@ -99,9 +105,16 @@ class VQVAE(dvq_module):
             'vqvae': VQVAEQuantize,
             'gumbel': GumbelQuantize,
         }[vq_flavor]
-        self.quantizer = QuantizerModule(self.encoder.output_channels, num_embeddings, embedding_dim,
-                                         patch_width=self.encoder.out_width, output_proj=quantize_proj,
-                                         is_single_token2=self.is_single_token2, enable_kmeans=self.enable_kmeans)
+
+        self.quantizer = QuantizerModule(
+            self.encoder.output_channels,
+            num_embeddings,
+            embedding_dim,
+            patch_width=self.encoder.out_width,
+            output_proj=quantize_proj,
+            is_single_token2=self.is_single_token2,
+            enable_kmeans=self.enable_kmeans,
+        )
 
         # the data reconstruction loss in the ELBO
         ReconLoss = {
@@ -319,6 +332,29 @@ def cli_main():
     trainer = pl.Trainer.from_argparse_args(args, callbacks=callbacks, max_steps=1) # 3000000)
 
     trainer.fit(model, data)
+
+
+def get_standalone_dvq_from_learnmax_dvq(dvq_decoder_path: str) -> VQVAE:
+    saved_module = torch.load(dvq_decoder_path)
+    hparams = saved_module['hyper_parameters']
+    dvq = VQVAE(
+        num_embeddings=hparams['num_embeddings'],
+        embedding_dim=hparams['embedding_dim'],
+        n_hid=hparams['dvq_n_hid'],
+        loss_flavor=hparams['dvq_loss_flavor'],
+        input_channels=hparams['dvq_input_channels'],
+        enc_dec_flavor=hparams['dvq_enc_dec_flavor'],
+        vq_flavor=hparams['dvq_vq_flavor'],
+        quantize_proj=None,
+    )
+    state_dict = saved_module['state_dict']
+    dvq_state_dict = {}
+    for k in state_dict:
+        if k.startswith('dvq.'):
+            dvq_state_dict[k[4:]] = state_dict[k]
+    dvq.load_state_dict(dvq_state_dict)
+    return dvq
+
 
 if __name__ == "__main__":
     cli_main()

@@ -51,7 +51,7 @@ def sample(model, x, steps, temperature=1.0, sample=False, top_k=None):
     return x
 
 
-def get_num_output_embeddings(num_state_embeddings: int, num_actions: int) -> int:
+def get_num_output_embeddings_sensor_lvl(num_state_embeddings: int, num_actions: int) -> int:
     """
     Number of embeddings for token types: state, action, and delim
 
@@ -78,7 +78,9 @@ def add_non_state_tokens(
         tokens_in_frame,
         salient_cluster_ind,
         salience_level_ind,
-):
+        cur_above_salient,
+        next_above_salient,
+) -> torch.Tensor:
     device = z_q_ind.device
     if len(z_q_ind.shape) == 3:
         B, S, TiF = z_q_ind.shape  # batch, sequence-frames, tokens-in-frame
@@ -111,10 +113,18 @@ def add_non_state_tokens(
         ind_delim = torch.tensor(delim_ind).to(device)
         ind_delim = ind_delim.repeat(B * S, 1)
         salience_level_ind += delim_ind  # avoid overlap with image patch indices
+
+
+        # TODO: Add cur_above_salient, next_above_salient if we have
+        #  the salient 1 level clustered already
+
         gpt_ind = torch.cat(
             (z_q_ind, action_z_q_ind, salience_level_ind, ind_delim),
             -1,
         )
+
+
+
         gpt_ind = gpt_ind.reshape(B, S, tokens_in_frame)
     else:
         # TODO: Add index delim if poor salient prediction accuracy

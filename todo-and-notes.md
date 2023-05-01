@@ -77,6 +77,11 @@
 - We're now producing two levels! Visualize that second level baby!
 - Okay, we visualized it. It makes sense, but is not epic. We need more levels, but instead of doing a geometric mean to combine across 8 steps and then diff, we can just diff two steps. This as the two steps visually represent 16 frames each and _look_ like they will make good abstractions. 8 steps of 16 frames per step will simply be too much when you look at an image: ![results/viz_salient_events_seq_len_8_0.png](results/viz_salient_events_seq_len_8_0.png)
 - Send gradients for high salience levels down to lower ones, i.e. make training end to end.
+- It might be useful to compute diffs between the current state (geometric mean of 8 frames if @ level 1) and current salient (geometric mean of 8 frames from the last salient change) such that a slow but significant change is captured. 
+- Automatic replanning will happen at a level when the state changes at that level (triggered by level below salience detection)
+- However, even with above, we may have changed the weights of high levels enough to warrant a periodic replan
+- Create a "move puck towards target" environment would allow me to get away from questions like "why does panama joe fall left of the spawn point way more than the right?"
+- We should likely combine consecutive clusters so most clusters are "non-consecutive" <= search for this in code to see detection
 Notes:
 #### Comparison with hierarchy of abstract machines (HAMs)
 These have discrete action, call, choice, and stop where execution is occurring at one level of abstraction at a time (i.e. sequentially). A big difference between this and learnmax is that learnmax can search within different levels of abstraction in parallel. Since high level plans don't change as often, most searching is done in the lower levels even when executing a high level plan to find some long term entropy. So your basically optimizing for entropy reduction per unit time. However since high level entropy possibly unlocks new vistas and worlds of low level entropy, we still should perhaps afford more weight to high level entropy just based on level alone.

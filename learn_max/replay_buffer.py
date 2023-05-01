@@ -392,24 +392,40 @@ def get_readonly_replay_buf(replay_path: str) -> ReplayBuffer:
     meta_path = list(path.glob(f'meta_*.pt'))
     if len(meta_path) > 0:
         assert len(meta_path) == 1, 'Multiple meta files found'
-        replay_buffer = torch.load(meta_path[0], map_location='cpu')
-        if replay_buffer.lru is None:
-            replay_buffer.create_lru()
+        ret = torch.load(meta_path[0], map_location='cpu')
+        if ret.lru is None:
+            ret.create_lru()
         else:
             log.warning('Unexpected: LRU already exists, not creating')
 
         # Migrations
-        if hasattr(replay_buffer, '_frames_per_file'):
+        if hasattr(ret, '_frames_per_file'):
             log.warning('Frames per file is deprecated, setting to steps per file')
-            replay_buffer._steps_per_file = replay_buffer._frames_per_file
-            del replay_buffer._frames_per_file
-        if hasattr(replay_buffer, 'train_to_test_collection_files'):
+            ret._steps_per_file = ret._frames_per_file
+            del ret._frames_per_file
+        if hasattr(ret, 'train_to_test_collection_files'):
             log.warning('train_to_test_collection_files is now train_to_test_collection_files')
-            replay_buffer.train_to_test_collection_files = (
-                replay_buffer.train_to_test_collection_files
+            ret.train_to_test_collection_files = (
+                ret.train_to_test_collection_files
             )
-            del replay_buffer.train_to_test_collection_files
-        return replay_buffer
+            del ret.train_to_test_collection_files
+        if hasattr(ret, 'read_only'):
+            log.warning('read_only is now resume_readonly')
+            ret.resume_readonly = ret.read_only
+            assert ret.resume_readonly is True
+            del ret.read_only
+        if not hasattr(ret, 'resume_readonly_bufs'):
+            ret.resume_readonly_bufs = []
+        if not hasattr(ret, 'resume_readonly_index_map'):
+            ret.resume_readonly_index_map = {}
+        if not hasattr(ret, 'resume_readonly_length'):
+            # This prop only applys to writable replay buffers
+            ret.resume_readonly_length = 0
+        if not hasattr(ret, '_local_length'):
+            # Local length is only different than length in writable replay buffers
+            ret._local_length = ret.length
+
+        return ret
     # TODO: Remove code below once meta files are saved for replay buffers you care about
     log.warning('No meta file found, loading all files, will be extremely slow')
     exps = []

@@ -1,13 +1,14 @@
 from __future__ import annotations
 import collections
 import os
+import random
+import string
 import time
 import traceback
 from collections import OrderedDict
-from dataclasses import dataclass
 from datetime import datetime
 from functools import wraps
-from typing import List, Any, Union, Tuple, Iterable, Callable, TYPE_CHECKING, Dict, Optional
+from typing import List, Any, Union, Tuple, Iterable, Callable, TYPE_CHECKING, Dict
 
 import PIL
 import torch
@@ -19,9 +20,10 @@ from PIL import Image
 from loguru import logger as log
 
 from learn_max.config import test_props
+from learn_max.mingpt.gpt_batch import GptSalientBatch, GptSensorBatch
 
 if TYPE_CHECKING:
-    from replay_buffer import ReplayBuffers
+    from replay_buffer import ReplayBufferSplits
     from learn_max.salience.experience import Experience, SensoryExperience
 
 from learn_max.constants import DATE_FMT, WANDB_MAX_LOG_PERIOD, ROOT_DIR, RUN_ID
@@ -33,7 +35,7 @@ def topk_interesting(
     """
     Get top k actions with most entropy
 
-    if rand_half: Pick random action in top 50-100 percentile entropy
+    if rand_half: Pick random action in top 50th percentile entropy
     i     entropy
     0:      0.1
     1:      0.2
@@ -390,6 +392,9 @@ def test(f: Callable) -> Callable:
         return ret
     return wrapper
 
+def in_test() -> bool:
+    return test_props.in_test
+
 # def get_viz_salience_folder():
 #     f'{ROOT_DIR}/images/viz_salience/{get_date_str()}_r_{RUN_ID}_e_{self.current_epoch}'
 
@@ -482,7 +487,7 @@ def viz_experience(
 def viz_salience(
         FiS: int,
         salient_replay_i: List[int],
-        replay_buffers: ReplayBuffers,
+        replay_buffers: ReplayBufferSplits,
         dvq_decoder: nn.Module,
         device: Union[torch.device, str],
         file_prefix: str = '',
@@ -507,126 +512,6 @@ def dataclass_to_dict(thing: Any, datacls: Any) -> Union[dict, List[dict]]:
         # agents_states only has a batch dimension, not window size
         return [_.dict() for _ in thing]
     raise ValueError(f'Unknown type {type(thing)}')
-
-# TODO: Create GptBatchSensor and GptBatchSalient
-
-@dataclass
-class GptBatchBase:
-    salience_level_ind: torch.Tensor = None
-    seq_len: int = None
-    type: str = None
-
-
-    def __post_init__(self):
-        self.type = type(self).__name__
-        self._ensure_shape()
-
-    def _ensure_shape(self) -> None:
-        pass
-
-    def dict(self) -> dict:
-        ret = dataclass_no_none_dict(self)
-        return ret
-
-    def _empty_(self) -> None:
-        self.salience_level_ind = torch.tensor([0])
-        self.seq_len = 0
-
-    def __getitem__(self, batch_idx: int) -> Dict[str, Any]:
-        ret = dict(
-            salience_level_ind=self.salience_level_ind[batch_idx].squeeze_(0),
-            seq_len=self.seq_len
-        )
-        ret['type'] = type(self).__name__
-        return ret
-
-    def _reshape_single_sequence(self) -> None:
-        self._reshape_single_sequence_hook()
-        self.salience_level_ind = self.salience_level_ind.unsqueeze(0)
-
-    def _reshape_multi_sequence(self, a_shp: Tuple[int]) -> None:
-        self._reshape_multi_sequence_hook(a_shp)
-        assert len(self.salience_level_ind.shape) == 1
-        self.salience_level_ind = self.salience_level_ind.view(-1, self.seq_len)
-
-    def num_steps(self):
-        return len(self.salience_level_ind.view(-1))
-
-    def __len__(self):
-        # We always have salience_level_ind
-        return len(self.salience_level_ind)
-
-    # Hooks
-    def _reshape_single_sequence_hook(self) -> None:
-        pass
-
-    def _reshape_multi_sequence_hook(self, ashp: Tuple[int]) -> None:
-        pass
-
-
-@dataclass
-class GptSensorBatch(GptBatchBase):
-    z_q_ind: Optional[torch.Tensor] = None
-    actions: Optional[torch.Tensor] = None
-
-    def empty_(self) -> None:
-        super()._empty_()
-        self.z_q_ind = torch.tensor([0])
-        self.actions = torch.tensor([0])
-
-    def _reshape_single_sequence_hook(self) -> None:
-        self.z_q_ind = self.z_q_ind.unsqueeze(0)
-        self.actions = self.actions.unsqueeze(0)
-
-    def _reshape_multi_sequence_hook(self, a_shp) -> None:
-        assert self.z_q_ind.shape[0] == a_shp[0]
-        self.actions = self.actions.view(-1, self.seq_len)
-        self.z_q_ind = self.z_q_ind.view(
-            -1, self.seq_len, *self.z_q_ind.shape[-2:]
-        )
-
-    def _ensure_shape(self) -> None:
-        if self.z_q_ind is not None:
-            assert None not in (self.actions, self.salience_level_ind)
-            a_shp = self.actions.shape
-            if len(a_shp) == 1:
-                if a_shp[0] != self.seq_len:
-                    # We have multiple samples/sequences,
-                    # add sequence dimension (and batch if needed)
-                    self._reshape_multi_sequence(a_shp)
-                else:
-                    # Add batch dimension as 1 if missing
-                    self._reshape_single_sequence()
-
-    def __getitem__(self, batch_idx: int) -> dict:
-        ret = dict(
-            z_q_ind=self.z_q_ind[batch_idx],
-            actions=self.actions[batch_idx],
-            **super().__getitem__(batch_idx),
-        )
-        return ret
-
-
-@dataclass
-class GptSalientBatch(GptBatchBase):
-    salient_cluster_ind: Optional[torch.Tensor] = None
-
-    def __getitem__(self, batch_idx) -> dict:
-        ret = dict(
-            salient_cluster_ind=self.salient_cluster_ind[batch_idx].squeeze_(0),
-            **super().__getitem__(batch_idx),
-        )
-        return ret
-
-    def _reshape_single_sequence_hook(self) -> None:
-        self.salient_cluster_ind = self.salient_cluster_ind.unsqueeze(0)
-
-    def _reshape_multi_sequence_hook(self, a_shp) -> None:
-        self.salient_cluster_ind = self.salient_cluster_ind.view(-1, self.seq_len)
-
-    def empty_(self) -> None:
-        self.salient_cluster_ind = torch.tensor([0])
-        super()._empty_()
 
 
 def horiz_cat_pil(imgs: List[Image], captions: List[str]) -> Image:
@@ -753,3 +638,7 @@ class LRU:
             return None
         self.mp.move_to_end(key)
         return self.mp[key]
+
+
+def get_rand_str(length: int = 10) -> str:
+    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))

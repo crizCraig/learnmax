@@ -23,9 +23,9 @@ from scipy.spatial import KDTree
 from sklearn.cluster import DBSCAN
 from tdigest import TDigest
 
-from learn_max.constants import RUN_ID, ROOT_DIR, PICKLE_DIR, DATE_STR
+from learn_max.constants import RUN_ID, ROOT_DIR, PICKLE_DIR, DATE_STR, NUM_DIFF_SALIENT, LEVEL_PREFIX_STR
 from learn_max.percentile_estimator import PercentileEstimator
-from learn_max.replay_buffer import ReplayBuffers
+from learn_max.replay_buffer import ReplayBufferSplits, ReplayBuffer
 from learn_max.salience.experience import SalientExperience, SensoryExperience, Experience
 from learn_max.utils import get_date_str, viz_experiences, viz_salience
 
@@ -120,7 +120,7 @@ class SalienceLevel:
     unclustered_points: list
 
     # Increase to get better salience deduplication at cost of CPU mem
-    num_points_to_cluster: int
+    num_points_to_cluster: Optional[int]
 
     encountered_known_salients: list
     salience_resume_path: Optional[str] = None  # Path to resume salience from
@@ -128,8 +128,8 @@ class SalienceLevel:
 
     def __init__(
         self,
-        level: int,
-        replay_buffers: ReplayBuffers,
+        input_exp_lvl: int,
+        replay_buffers: ReplayBufferSplits,
         seq_len: int,
         salience_resume_path: Optional[str] = None,
         above: Optional[Self] = None,
@@ -137,16 +137,17 @@ class SalienceLevel:
     ) -> None:
         # self.cluster_points = []
         # self.cluster_centroids = []
-        self.level = level
+        self.input_exp_lvl = input_exp_lvl
+        self.output_lvl = input_exp_lvl + 1
         self.clustered_points = []
         self.unclustered_points = []
         self.pct_est = PercentileEstimator()
         if num_points_to_cluster is not None:
             self.num_points_to_cluster = num_points_to_cluster
-        elif self.level == 0:
+        elif self.input_exp_lvl == 0:
             self.num_points_to_cluster = 100_000
         else:
-            raise ValueError('num_points_to_cluster must be specified for level > 0')
+            self.num_points_to_cluster = None  # Needs to be set when we know the size of the replay buffer
         self.last_log_progress: float = 0
         self.clusters: List[SalientCluster] = []
 
@@ -157,7 +158,7 @@ class SalienceLevel:
         # Map from DBSCAN core point to SalientEvent cluster
         self.core_point_map: dict = {}  # TODO: Make this a list of dicts
 
-        self.replay_buffers: ReplayBuffers = replay_buffers
+        self.replay_splits: ReplayBufferSplits = replay_buffers
         self.seq_len = seq_len
         self.last_checked_replay_index = 0
 
@@ -169,14 +170,14 @@ class SalienceLevel:
 
     def __len__(self) -> int:
         """Number of steps in replay buffer"""
-        return len(self.replay_buffers)
+        return len(self.replay_splits)
 
     def add(
         self,
         saliences: List[SalientExperience],
         device: Union[str, torch.device],
         FiS: int,
-        lower_replay_buffers: Optional[ReplayBuffers] = None,
+        lower_replay_buffers: Optional[ReplayBufferSplits] = None,
         dvq_decoder: Optional[torch.nn.Module] = None,
     ) -> Dict[str, Any]:
         """
@@ -198,28 +199,44 @@ class SalienceLevel:
             if self.above is None:
                 log.warning('Salience level above is None')
             else:
-                self.above.replay_buffers.append(  # At least salience level 1
-                    # TODO: Add cluster points (core points) to salient experience
-                    #  (not just cluster index)
-                    #   so that we can generalize to similar salient events
-                    #   (e.g. opening a new door
-                    #   is thought to be promising for learning because
-                    #   previous doors have been)
-                    SalientExperience(
-
-                        # Avoid repeating mid_replay_ind by storing salient clusters separately
-                        below_replay_index=salience.below_replay_index,
-
-                        patch_diff=salience.patch_diff,
-                        dist=dist,
-                        seq_len=self.seq_len,
-                        cluster_index=salient_cluster.cluster_index,
-                        below_cluster_replay_indexes=salient_cluster.below_replay_indexes,  # type: ignore
-                        level=self.level + 1,
-                    )
+                # Now that we have a salient event, add the cluster props and
+                # append it to the level above
+                salience.dist = dist
+                salience.seq_len = self.seq_len
+                salience.cluster_index = salient_cluster.cluster_index
+                salience.below_cluster_replay_indexes = (
+                    salient_cluster.below_replay_indexes  # type: ignore
                 )
+                salience.level = self.output_lvl
+                splits = self.above.replay_splits
+                raise NotImplementedError('add_to_below_map')
+                if splits.is_train():
+                    splits.train_buf.add_to_below_map(salience)
+                else:
+                    splits.test_buf.add_to_below_map(salience)
+                self.above.replay_splits.append(salience)  # At least salience level 1
+                # TODO: Add cluster points (core points) to salient experience
+                #  (not just cluster index)
+                #   so that we can generalize to similar salient events
+                #   (e.g. opening a new door
+                #   is thought to be promising for learning because
+                #   previous doors have been)
+                # SalientExperience(
+                #
+                #     # Avoid repeating mid_replay_ind by storing salient clusters separately
+                #     below_replay_index=salience.below_replay_index,
+                #
+                #     patch_diff=salience.patch_diff,
+                #     dist=dist,
+                #     seq_len=self.seq_len,
+                #     cluster_index=salient_cluster.cluster_index,
+                #     below_cluster_replay_indexes=salient_cluster.below_replay_indexes,  # type: ignore
+                #     level=self.output_lvl,
+                #     done=salience.done,
+                # )
 
         # TODO: Decrease for higher levels
+        assert self.num_points_to_cluster is not None
         progress = len(self.unclustered_points) / self.num_points_to_cluster
 
         # Log every 10%
@@ -246,9 +263,9 @@ class SalienceLevel:
         self,
         frames_in_seq: int,
         device: Union[str, torch.device],
-        saliences: List[Experience],
+        saliences: List[SalientExperience],
         dvq_decoder: Optional[torch.nn.Module] = None,
-        replay_buffers: Optional[ReplayBuffers] = None,
+        replay_buffers: Optional[ReplayBufferSplits] = None,
     ) -> List[Tuple[SalientCluster, SalientExperience, float]]:
         # Map saliences to existing clusters
         # TODO: Write unit test that checks for zero distance when detecting same points that were clustered
@@ -267,6 +284,7 @@ class SalienceLevel:
                 #   Perhaps SalientExperience should hold the actual below_mid_replay_index in
                 #   addition to the below_mid_replay_indexes in the salient cluster it was closest to.
                 salient_cluster = self.core_point_map[ind]
+
                 if dist < salient_cluster.distance_percentiles[50]:
                     # Here we compare the median distance (50th percentile)
                     # of all points within a cluster to the distance to the closest core point.
@@ -332,11 +350,11 @@ class SalienceLevel:
         self.kdtree, self.core_point_map = cluster_patch_diff(
             patch_diff=patch_diff,
             points=points,
-            replay_buffers=self.replay_buffers,
+            replay_buffers=self.replay_splits,
             seq_len=self.seq_len,
             dvq_decoder=dvq_decoder,
             device=device,
-            is_sensory=self.level == 0,
+            is_sensory=self.input_exp_lvl == 0,
         )
         self.save()
         self.clusters = self.get_clusters()
@@ -370,17 +388,21 @@ class SalienceLevel:
             # for cluster in clusters:
 
         self.clusters = self.get_clusters()
+        # TODO: Load meta
+
         log.info(f'Loaded salience store from {path}')
 
     def save(self) -> str:
-        save_dir = f'{PICKLE_DIR}/salience_store/lvl_{self.level}/{get_date_str()}'
+        save_dir = f'{PICKLE_DIR}/salience_store/{LEVEL_PREFIX_STR}{self.input_exp_lvl}/{get_date_str()}'
         os.makedirs(save_dir, exist_ok=True)
+        replay_lineage = self.replay_splits.get_lineage()
         meta = dict(
-            level=self.level,
+            level=self.input_exp_lvl,
             seq_len=self.seq_len,
-            replay_buffers_data_dir=self.replay_buffers.data_dir,
+            replay_splits_data_dir=self.replay_splits.data_dir,
             run_id=RUN_ID,
             date_str=DATE_STR,
+            replay_lineage=replay_lineage,
         )
         pickle_obj(meta, f'{save_dir}/meta.pickle')
         pickle_obj(self.kdtree, f'{save_dir}/kdtree.pickle')
@@ -401,21 +423,21 @@ class SalienceLevel:
         So I don't see a big advantage to this realtime new salience detection.
         """
         ret: List[Tuple[float, float]] = []
-        for i in range(self.samples_per_cluster):
-            percentile = (i+1) / self.samples_per_cluster * 100
-            raise NotImplementedError('Need to check if this is valid percent')
-            pct_distances = []
-            for cluster in self.clustered_points:
-                pct_distances.append(cluster[i])  # get i-th closest point
-            avg_dist = sum(pct_distances) / len(pct_distances)
-            ret.append((percentile, avg_dist))
+        # for i in range(self.samples_per_cluster):
+        #     percentile = (i+1) / self.samples_per_cluster * 100
+        #     raise NotImplementedError('Need to check if this is valid percent')
+        #     pct_distances = []
+        #     for cluster in self.clustered_points:
+        #         pct_distances.append(cluster[i])  # get i-th closest point
+        #     avg_dist = sum(pct_distances) / len(pct_distances)
+        #     ret.append((percentile, avg_dist))
         return ret
 
 
 def cluster_patch_diff(
     patch_diff: np.ndarray,
     points: List[SalientExperience],
-    replay_buffers: Optional[ReplayBuffers] = None,
+    replay_buffers: Optional[ReplayBufferSplits] = None,
     seq_len: Optional[int] = None,
     dvq_decoder: Optional[torch.nn.Module] = None,
     device: Optional[str] = None,
@@ -445,7 +467,7 @@ def cluster_patch_diff(
     if replay_buffers is not None and points and points[0].level <= 1:
         viz_salience_clusters(
             dbscan,
-            replay_buffers,
+            replay_buffers.train_buf,
             points,
             patch_diff,
             seq_len,
@@ -478,6 +500,7 @@ def create_clusters(
             core_point_map[len(flat_points) - 1] = sc  # can just be append on list
     assert len(core_point_map) == len(flat_points)
     kdtree = KDTree(np.array(flat_points))  # Populate with flat list of core sample i
+    # TODO: Create SalientExperiences
     return kdtree, core_point_map
 
 
@@ -541,10 +564,22 @@ def tune_dbscan(patch_diff: np.ndarray, min_samples: int = 2) -> DBSCAN:
         #     log.error('Could not find a good dbscan epsilon')
         #     break
 
+def ensure_viz_dir(date_str: str, run_id: str, salience_level: int) -> str:
+    ret = (
+        f'{ROOT_DIR}/images/viz_salience_clusters'
+        f'/{date_str}_r_{run_id}_{LEVEL_PREFIX_STR}{salience_level}'
+    )
+    Path(ret).mkdir(parents=True, exist_ok=True)
+    return ret
+
+
+def get_salient_viz_file_prefix(lbl: int, replay_i: int) -> str:
+    return f'cluster_{lbl}_rp_{replay_i}_'
+
 
 def viz_salience_clusters(
     dbscan: DBSCAN,
-    replay_buffers: ReplayBuffers,
+    replay_buffer: ReplayBuffer,
     points: List[SalientExperience],
     patch_diff: np.ndarray,
     frames_in_sequence_window: int,
@@ -562,21 +597,20 @@ def viz_salience_clusters(
         longer chains.
     """
     if should_save_clusters:
-        run_folder = f'{ROOT_DIR}/images/viz_salience_clusters/{get_date_str()}_r_{RUN_ID}'
+        save_dir = ensure_viz_dir(date_str=get_date_str(), run_id=RUN_ID, level=buf.salience_level)
         FiS = frames_in_sequence_window
         for i, lbl in enumerate(dbscan.labels_):
             replay_i = points[i].below_replay_index
-            folder = f'{run_folder}/cluster_{lbl}'
-            Path(folder).mkdir(parents=True, exist_ok=True)
+            folder = ensure_cluster_viz_dir(lbl, save_dir)
             log.info(f'Saving salience clusters to {folder}')
 
             # Visualize a movie around the index
             viz_experiences(
-                replay_buffers.train_buf.get(start=replay_i - FiS + 1, length=FiS * 2),
+                get_sensory_sequence(replay_buffer, replay_i, FiS),
                 folder,
                 dvq_decoder,
                 device,
-                file_prefix=f'cluster_{lbl}_rp_{replay_i}_'
+                file_prefix=get_salient_viz_file_prefix(lbl, replay_i),
             )
 
         # TODO: Disable viz_salience as its redundant to this
@@ -611,6 +645,17 @@ def viz_salience_clusters(
     pass  # TODO: Reduce dimensions 121x30 to 50 then, view points with t-sne per https://scikit-learn.org/stable/modules/generated/sklearn.manifold.TSNE.html
     # TODO: t-sne has issue with more than 2 duplicate points, we can try solver='dense' but may be slow.
     #   we can remove these points after PCA reduction
+
+
+def get_sensory_sequence(replay_buffer: ReplayBuffer, replay_i: int, FiS: int) -> List[Experience]:
+    """Get a sequence of experiences around the salient event."""
+    return replay_buffer.get(start=replay_i - FiS + 1, length=FiS * NUM_DIFF_SALIENT)
+
+
+def ensure_cluster_viz_dir(lbl: int, save_dir: str) -> str:
+    folder = f'{save_dir}/cluster_{lbl}'
+    Path(folder).mkdir(parents=True, exist_ok=True)
+    return folder
 
 
 def show_non_consecutive_dupes(dbscan: DBSCAN) -> None:
@@ -699,7 +744,7 @@ def main() -> None:
     # show_non_consecutive_dupes(dbscan)
 
 def salience_level_factory(
-    level: int,
+    input_exp_lvl: int,
     env_id: str,
     short_term_mem_max_length: int,
 
@@ -713,17 +758,19 @@ def salience_level_factory(
     salience_resume_path: Optional[str] = None,
     above: Optional[SalienceLevel] = None,
     num_points_to_cluster: Optional[int] = None,
+    replay_resume_paths: Optional[List[str]] = None,
 ) -> SalienceLevel:
-    replay_buffers = ReplayBuffers(
+    replay_buffers = ReplayBufferSplits(
         env_id=env_id,
         short_term_mem_max_length=short_term_mem_max_length,
-        salience_level=level,
+        salience_level=input_exp_lvl,
         steps_per_file=steps_per_file,
         train_to_test_collection_files=train_to_test_collection_files,
         overfit_to_short_term=should_overfit_gpt,
+        replay_resume_paths=replay_resume_paths,
     )
     ret = SalienceLevel(
-        level=level,
+        input_exp_lvl=input_exp_lvl,
         replay_buffers=replay_buffers,
         seq_len=steps_in_sequence_window,
         salience_resume_path=salience_resume_path,
@@ -783,7 +830,7 @@ def test_salient_cluster() -> None:
 
 def test_salience_level() -> None:
     salience_level = salience_level_factory(
-        level=1,
+        input_exp_lvl=1,
         env_id='testy-testerson',
         short_term_mem_max_length=32,
         steps_per_file=100,
@@ -796,17 +843,17 @@ def test_salience_level() -> None:
     meta = unpickle(f'{save_dir}/meta.pickle')
     assert meta['level'] == 1
     assert meta['seq_len'] == 8
-    assert os.path.exists(meta['replay_buffers_data_dir'])
+    assert os.path.exists(meta['replay_splits_data_dir'])
 
     # remove the test directory
     shutil.rmtree(save_dir)
 
     # make sure replay buffers data dir is not bigger than 1MB,
     # to prevent deleting real data by accident
-    assert os.path.getsize(meta['replay_buffers_data_dir']) < 1_000_000
+    assert os.path.getsize(meta['replay_splits_data_dir']) < 1_000_000
 
     # delete the replay buffers data dir
-    shutil.rmtree(meta['replay_buffers_data_dir'])
+    shutil.rmtree(meta['replay_splits_data_dir'])
 
 test_salience_level()
 test_salient_cluster()

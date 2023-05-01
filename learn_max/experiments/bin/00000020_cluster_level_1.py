@@ -21,10 +21,16 @@ from learn_max.salience.detect_salience import (
 
 
 create_salience_level_from_replay_buf(
-    '/home/a/src/learnmax/data/replay_buff'
-    '/d_2023-04-02_15:01:27.059619_r-DBJDS9LR'
-    '_env-MontezumaRevenge-v0'
-    '/lvl_1/train',
+    replay_buf_path=(
+        '/home/a/src/learnmax/data/replay_buff'
+        '/d_2023-04-02_15:01:27.059619_r-DBJDS9LR'
+        '_env-MontezumaRevenge-v0'
+        '/lvl_1/train'
+    ),
     num_points_to_cluster=400,
     frames_in_seq=8,
+    dvq_decoder_path=(
+        '/home/a/src/learnmax/checkpoints/dvq_0/37yv98e9/'
+        'checkpoints/epoch=8-step=85999.ckpt'
+    ),
 )

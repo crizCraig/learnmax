@@ -13,6 +13,9 @@ class Experience:
     level: Optional[int] = None
     seq_len: Optional[int] = None  # Transformer sequence length
     split: Optional[str] = None
+    done: Optional[bool] = None  # TODO(safety-critical!): Needs to bubble up from sensory
+    above_replay_index: Optional[int] = None
+    above_salient_cluster_index: Optional[int] = None
 
 
 @dataclass
@@ -25,8 +28,15 @@ class SalientExperience(Experience):
     # inherit from Experience which has optional values
 
     # Key frame index of the sequence that this experience represents
-    below_replay_index: int = None
+    below_replay_index: Optional[int] = None
 
+    # Patches only exist at the sensor level, but the diff
+    # propagates up as the dimensionality remains the same
+    # since we do a patch-wise geometric product at the
+    # sensor level across seq_len (8) frames and
+    # just subtract subsequent same dimensionality representations
+    # without ever combining across patches.
+    # TODO: Just call diff, not patch_diff
     patch_diff: Optional[torch.Tensor] = None
 
     # Cluster properties

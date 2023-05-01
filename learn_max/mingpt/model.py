@@ -8,8 +8,8 @@ GPT model:
 """
 import collections
 import math
-from collections import defaultdict, deque
-from typing import Dict, Tuple
+from collections import defaultdict
+from typing import Dict, Tuple, Optional, Any
 
 import numpy as np
 import torch
@@ -24,8 +24,8 @@ from learn_max.utils import (
     wandb_log,
     sa2as,
     GPT_BATCH_TYPE_MAP,
-    GptSalientBatch,
 )
+from learn_max.mingpt.gpt_batch import GptSalientBatch, GptBatchBase, GptSensorBatch
 
 
 class CausalSelfAttention(nn.Module):
@@ -107,31 +107,41 @@ class Block(nn.Module):
 class GPT(nn.Module):
     """  the full GPT language model, with a context size of block_size """
 
-    def __init__(self,
-                 # model definition args
-                 output_size: int,  # size of the output vocabulary
-                 num_input_embeddings: int,  # number of possible input tokens
-                 num_state_embeddings: int,  # number of possible state tokens (i.e. not action tokens or delimiter token)
-                 frames_in_sequence_window: int,  # number of frames in sequence window (block)
-                 n_layer: int,  # depth of the model; number of Transformer blocks in sequence
-                 input_embedding_dim: int,  # the "width" of the input to the model
-                 n_head: int,  # number of heads in each multi-head attention inside each Transformer block
-                 # model optimization args
-                 learning_rate: float = 3e-4,  # the base learning rate of the model
-                 weight_decay: float = 0.1,  # amount of regularizing L2 weight decay on MatMul ops
-                 betas: Tuple[float, float] = (0.9, 0.95),  # momentum terms (betas) for the Adam optimizer
-                 embd_pdrop: float = 0.1,  # \in [0,1]: amount of dropout on input embeddings
-                 resid_pdrop: float = 0.1,  # \in [0,1]: amount of dropout in each residual connection
-                 attn_pdrop: float = 0.1,  # \in [0,1]: amount of dropout on the attention matrix
-                 should_input_embed: bool = False,  # whether to use embeddings or indexes as input to first layer
-                 should_input_and_learn_embed: bool = False,  # whether to cat input embed with learned token embed
-                 num_actions: int = 0,  # number of actions to use for action embedding
-                 is_single_token2: bool = False,  # whether there's one token per image
-                 state_tokens_in_frame: int = None,  # number of state tokens (i.e. not action or delimeter) in frame
-                 tokens_in_frame: int = None,  # number of tokens per frame (1 in single token)
-                 tokens_in_salient_step: int = None,  # number of tokens per salient step
-                 batch_size: int = None,
-                 ):
+    def __init__(
+        self,
+        # model definition args
+        output_size: int,  # size of the output vocabulary
+        num_input_embeddings: int,  # number of possible input tokens
+        frames_in_sequence_window: int,  # number of steps in sequence window (block)
+        n_layer: int,  # depth of the model; number of Transformer blocks in sequence
+        input_embedding_dim: int,  # the "width" of the input to the model
+        n_head: int,  # number of heads in each multi-head attention inside each Transformer block
+
+        # number of possible state tokens (i.e. not action tokens or delimiter token)
+        num_state_embeddings: Optional[int] = None,
+
+
+            # model optimization args
+        learning_rate: float = 3e-4,  # the base learning rate of the model
+        weight_decay: float = 0.1,  # amount of regularizing L2 weight decay on MatMul ops
+        betas: Tuple[float, float] = (
+            0.9,
+            0.95,
+        ),  # momentum terms (betas) for the Adam optimizer
+        embd_pdrop: float = 0.1,  # \in [0,1]: amount of dropout on input embeddings
+        resid_pdrop: float = 0.1,  # \in [0,1]: amount of dropout in each residual connection
+        attn_pdrop: float = 0.1,  # \in [0,1]: amount of dropout on the attention matrix
+        should_input_embed: bool = False,  # whether to use embeddings or indexes as input to first layer
+        should_input_and_learn_embed: bool = False,  # whether to cat input embed with learned token embed
+        num_actions: Optional[int] = 0,  # number of actions to use for action embedding
+        is_single_token2: bool = False,  # whether there's one token per image
+        state_tokens_in_frame: Optional[int] = None,  # number of state tokens (i.e. not action or delimeter) in frame
+        tokens_in_frame: int = None,  # number of tokens per frame (1 in single token)
+        tokens_in_salient_step: int = None,  # number of tokens per salient step
+        batch_size: Optional[int] = None,
+        is_sensory: bool = True,
+        lvl_emb: Optional[nn.Embedding] = None,
+    ):
         super().__init__()
         self.output_size = output_size
         self.is_single_token2 = is_single_token2
@@ -150,6 +160,11 @@ class GPT(nn.Module):
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         self.betas = betas
+        self.is_sensory = is_sensory
+        self.lvl_emb = lvl_emb
+
+        if self.is_sensory:
+            assert num_state_embeddings is not None
 
         # input embedding stem: drop(content + position)
         #  Eventually:
@@ -170,10 +185,14 @@ class GPT(nn.Module):
             tokens_in_seq = frames_in_sequence_window
         else:
             tokens_in_seq = tokens_in_frame * frames_in_sequence_window
+
+        # Single-token and possible salient
         self.pos_emb = nn.Parameter(torch.zeros(1, tokens_in_seq, embedding_dim))
+
         self.patch_pos_emb = nn.Parameter(
             torch.zeros(1, tokens_in_frame, embedding_dim)
         )
+
         self.frame_pos_emb = nn.Parameter(
             torch.zeros(1, frames_in_sequence_window, tokens_in_frame, embedding_dim)
         )
@@ -336,6 +355,8 @@ class GPT(nn.Module):
             embed, z_q_ind, actions = args
             return self.single_token_forward(actions, embed, z_q_ind)
         else:
+            # TODO: Add cur_above_salient, next_above_salient if we have
+            #  the salient 1 level clustered already
             z_q_ind, actions, salient_cluster_ind, salience_level_ind = args
 
             # TODO: Create embedding for goal token and concatenate with other tokens
@@ -343,7 +364,9 @@ class GPT(nn.Module):
                 z_q_ind,
                 actions,
                 salient_cluster_ind,
-                salience_level_ind
+                salience_level_ind,
+                cur_above_salient,
+                next_above_salient,
             )
 
             B, FiS, TiF = tok_ind.size()  # batch, frames in sequence, tokens in frame
@@ -355,9 +378,12 @@ class GPT(nn.Module):
 
             # map frame and patch positions to a learnable vector
             frame_pos_embed = self.frame_pos_emb[:, :FiS]  # support partial sequences
-            patch_pos_embed = self.patch_pos_emb[:, :TiF]  # support partial frames
 
-            x = token_embed + frame_pos_embed + patch_pos_embed  # broadcast sum embeddings
+            if self.is_sensory:
+                patch_pos_embed = self.patch_pos_emb[:, :TiF]  # support partial frames
+                x = token_embed + frame_pos_embed + patch_pos_embed  # broadcast sum embeddings
+            else:
+                x = token_embed + frame_pos_embed
             x = x.reshape(B, TiF * FiS, self.embedding_dim)
             x = self.drop(x)
             x = self.blocks(x)
@@ -447,33 +473,47 @@ class GPT(nn.Module):
         wandb_log({'train/logits_std': logits.std()})
         return logits, expected_deviation
 
-    def step_(self, split, batch, batch_idx=None):
-        if self.is_single_token2:
-            embed, z_q_ind, next_idx, a, a_next = batch  # gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y
-            if split == 'train':
-                assert embed.size()[1] == self.tok_in_seq, \
-                    'Not filling block size in train will result in untrained latter positions.'
-
-            target_idx = self.s_i_to_as_i(next_idx, a_next)
-            logits, expected_deviation = self.forward(embed, z_q_ind, a)  # B, S
-        else:
+    def step_(
+        self, split: str, batch: GptBatchBase, batch_idx: Optional[int] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # if self.is_single_token2:
+        #     (
+        #         embed,
+        #         z_q_ind,
+        #         next_idx,
+        #         a,
+        #         a_next,
+        #     ) = batch  # gpt_x, z_q_ind_x, z_q_ind_y, a_x, a_y
+        #     if split == 'train':
+        #         assert (
+        #             embed.size()[1] == self.tok_in_seq
+        #         ), 'Not filling block size in train will result in untrained latter positions.'
+        #
+        #     target_idx = self.s_i_to_as_i(next_idx, a_next)
+        #     logits, expected_deviation = self.forward(embed, z_q_ind, a)  # B, S
+        # else:
+        salience_level_ind = batch.salience_level_ind
+        if isinstance(batch, GptSensorBatch):
             z_q_ind = batch.z_q_ind
             actions = batch.actions
-            salient_cluster_ind = (
-                batch.salient_cluster_ind if isinstance(batch, GptSalientBatch) else None
-            )
-            salience_level_ind = batch.salience_level_ind
+            salient_cluster_ind = None
             B, FiS, H, W = z_q_ind.shape
             TiF = H * W
             assert TiF <= self.tokens_in_frame  # delim and action not added yet
             z_q_ind = z_q_ind.reshape(B, FiS, TiF)
+
             if split == 'train':
                 assert FiS * TiF >= self.tok_in_seq, \
                     'Not filling block size in train will result in untrained latter positions.'
             # Shift targets by one patch
             # target_idx = z_q_ind[:,1:,:]
             target_idx = self.add_non_state_tokens(
-                z_q_ind, actions, salient_cluster_ind, salience_level_ind
+                z_q_ind,
+                actions,
+                salient_cluster_ind,
+                salience_level_ind,
+                batch.cur_above_salient,
+                batch.next_above_salient,
             )
             assert target_idx.shape[-1] == self.tokens_in_frame
             target_idx = target_idx.reshape(B, -1)[:, 1:-(target_idx.shape[-1] - 1)]
@@ -486,6 +526,12 @@ class GPT(nn.Module):
             logits, expected_deviation = self.forward(
                 z_q_ind, actions, salient_cluster_ind, salience_level_ind
             )
+        else:
+            salient_cluster_ind = batch.salient_cluster_ind
+            # TODO: Generate salient batch
+
+
+
 
 
         # Calculate mean deviation loss for uncertainty ----------------------
@@ -644,10 +690,12 @@ class GPT(nn.Module):
     def test_step(self, *args, **kwargs):
         return self.step_('test', *args, **kwargs)
 
-    def get_batch(self, batch):
+    def get_batch(self, batch: Dict[str, Any]) -> GptBatchBase:
+        # Remember that things have been collated into a dict of lists
         # TODO: Just put everything in agent_state, next_agent_state dicts
         if isinstance(batch, dict):
             batch_type = batch['type'][0]  # All same type
+            assert all([t == batch_type for t in batch['type']])
             return GPT_BATCH_TYPE_MAP[batch_type](**batch)
         elif len(batch) == 7:
             # TODO: We should be able to delete this now that we have GptBatch
@@ -694,8 +742,10 @@ class GPT(nn.Module):
             z_q_ind,
             actions,
             salient_cluster_ind,
-            salience_level_ind
-    ):
+            salience_level_ind,
+            cur_above_salient,
+            next_above_salient,
+    ) -> torch.Tensor:
         # Actions, delimiter, and salience
         return add_non_state_tokens(
             z_q_ind,
@@ -704,5 +754,7 @@ class GPT(nn.Module):
             self.num_actions,
             self.tokens_in_frame,
             salient_cluster_ind,
-            salience_level_ind
+            salience_level_ind,
+            cur_above_salient,
+            next_above_salient,
         )

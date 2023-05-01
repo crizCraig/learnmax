@@ -16,7 +16,8 @@ def get_model_args():
     args.should_train_gpt = True
     args.dvq_checkpoint = '/home/a/src/learnmax/.lightning/learnmax-learn_max_experiments_bin/37yv98e9/checkpoints/epoch=8-step=85999.ckpt'
     # args.viz_salience_replay_path = '/home/a/src/learnmax/data/replay_buff/d_2023-02-16_12:21:44.150524_r-7ZWCVSK0_env-MontezumaRevenge-v0/lvl_1/train'
-    args.viz_salience_replay_path = '/home/a/src/learnmax/data/replay_buff/d_2023-02-24_13:41:58.214093_r-6GFSSW0S_env-MontezumaRevenge-v0/lvl_1/train'
+    # args.viz_salience_replay_path = '/home/a/src/learnmax/data/replay_buff/d_2023-02-24_13:41:58.214093_r-6GFSSW0S_env-MontezumaRevenge-v0/lvl_1/train'
+    args.viz_salience_replay_path = '/home/a/src/learnmax/data/replay_buff/d_2023-04-02_15:01:27.059619_r-DBJDS9LR_env-MontezumaRevenge-v0/lvl_1/train'
     args.salience_use_logits = False
     args.num_state_embeddings = 256  # 6 actions plus 1 delim => 263
     args.sensor_embedding_dim = 30

@@ -12,15 +12,16 @@ from learn_max.constants import (
     NUM_DIFF_SALIENT,
     COMBINE_STEPS_ABSTRACT_SEQ,
     TRAIN,
-    COMBINE_STEPS_SENSOR_SEQ, REPLAY_ROOT_DIR,
+    COMBINE_STEPS_SENSOR_SEQ, REPLAY_ROOT_DIR, DATE_STR, RUN_ID,
 )
-from learn_max.mingpt.utils import get_num_output_embeddings
+from learn_max.dvq.vqvae import get_standalone_dvq_from_learnmax_dvq
+from learn_max.mingpt.utils import get_num_output_embeddings_sensor_lvl
 from learn_max.percentile_estimator import PercentileEstimator
-from learn_max.replay_buffer import get_readonly_replay_buf, ReplayBuffer, ReplayBuffers, get_replay_buffers_dir
+from learn_max.replay_buffer import get_readonly_replay_buf, ReplayBuffer, ReplayBufferSplits
 from learn_max.salience.experience import SalientExperience, Experience
-from learn_max.salience.salience import SalienceLevel, SalientCluster
-from learn_max.utils import wandb_log, test
-
+from learn_max.salience.salience import SalienceLevel, SalientCluster, ensure_viz_dir, get_salient_viz_file_prefix, \
+    get_sensory_sequence, ensure_cluster_viz_dir
+from learn_max.utils import wandb_log, test, viz_experiences, in_test
 
 log.info(f'in_test: {test_props.in_test}')
 
@@ -30,24 +31,32 @@ def create_salience_level_from_replay_buf(
         frames_in_seq: Optional[int] = None,
         state_tokens_in_frame: Optional[int] = None,
         num_points_to_cluster: Optional[int] = None,
+        dvq_decoder_path: Optional[str] = None,
 ) -> None:
+    if dvq_decoder_path is None:
+        dvq = None
+    else:
+        dvq = get_standalone_dvq_from_learnmax_dvq(dvq_decoder_path)
+
     # Count files in replay buffer path
     buf: ReplayBuffer = get_readonly_replay_buf(replay_buf_path)
-    bufs: ReplayBuffers = ReplayBuffers(
+    bufs: ReplayBufferSplits = ReplayBufferSplits(
         salience_level=buf.salience_level,
         env_id=buf.env_id,
         short_term_mem_max_length=1000,  # Short term mem will not be needed
         steps_per_file=buf.steps_per_file,
     )
 
+    top_level = buf.salience_level + 1
+
     salience_level: SalienceLevel = SalienceLevel(
-        level=buf.salience_level,
+        input_exp_lvl=buf.salience_level,
         replay_buffers=bufs,
         seq_len=COMBINE_STEPS_ABSTRACT_SEQ,
         num_points_to_cluster=num_points_to_cluster,
     )
 
-    i = 0
+    replay_i = 0
     if buf.salience_level == 0:
         combine_steps_for_seq = COMBINE_STEPS_SENSOR_SEQ
         assert frames_in_seq is not None
@@ -55,30 +64,18 @@ def create_salience_level_from_replay_buf(
         combine_steps_for_seq = COMBINE_STEPS_ABSTRACT_SEQ
     steps_per_patch_diff = combine_steps_for_seq * NUM_DIFF_SALIENT
     while True:
-        exps = buf.get(i, steps_per_patch_diff)
+        exps = buf.get(replay_i, steps_per_patch_diff)
         if len(exps) < steps_per_patch_diff:
+            # Reached end of replay buffer
             break
-        i += 1
+        replay_i += 1
         if buf.salience_level == 0:
             salient_experience = get_salient_one_experience(
                 exps, frames_in_seq, salience_level, state_tokens_in_frame
             )
         else:
-            patch_diffs = torch.stack([exp.patch_diff for exp in exps])  # type: ignore
-
-            # Combine patch and embed dims
-            patch_diffs = patch_diffs.reshape(steps_per_patch_diff, -1)
-
-            patch_diffs.unsqueeze_(0)  # Add batch dim
-            replay_ind = [exp.replay_index for exp in exps]
-
-            # TODO: Return SalientExperience from detect_abstract_salience
-            salient_experience = detect_abstract_salience(
-                level=buf.salience_level,
-                patch_diffs=patch_diffs,
-                replay_ind=replay_ind,  # type: ignore
-                pct_est=salience_level.pct_est,
-                split=buf.split,
+            salient_experience = get_salient_two_or_higher_experience(
+                buf, exps, salience_level, steps_per_patch_diff
             )
 
         if salient_experience is not None:
@@ -91,12 +88,63 @@ def create_salience_level_from_replay_buf(
     cluster_to_sensor_replay_i: Dict[SalientCluster, List[int]] = {}
     for cluster in salience_level.clusters:
         cluster_sensor_replay_i: List[int] = []
+        # TODO: Add lineage in the recursive call so we can see lvl 1 clusters
         get_sensor_replay_i(
             buf, buf_map, cluster.below_replay_indexes, cluster_sensor_replay_i
         )
         cluster_to_sensor_replay_i[cluster] = cluster_sensor_replay_i
-    # TODO: Expand sensor replay i with frames_in_seq, then visualize!
+
+    # Expand sensor replay i with frames_in_seq and visualize!
+    if frames_in_seq is None:
+        log.warning('frames_in_seq is None, not visualizing')
+        return
+    top_dir = ensure_viz_dir(date_str=DATE_STR, run_id=RUN_ID, salience_level=top_level)
+    sensor_buf = buf_map[0]
+
+    log.info(f'Saving level {top_level} salient experiences to {top_dir}')
+
+    # TODO: Why always jump to the left?
+    # TODO: What's my FPS, what's my APS?
+    # TODO: Show composite images
+    # TODO: Get better agents than random
+    # TODO: Show 32 image clusters
+    # TODO: Understand why the clusters are contiguous and 24 frames apart in level 0
+
+    for cluster, sensor_replay_i in cluster_to_sensor_replay_i.items():
+        folder = ensure_cluster_viz_dir(cluster.cluster_index, top_dir)
+        for replay_i in sensor_replay_i:
+            viz_experiences(
+                experiences=get_sensory_sequence(sensor_buf, replay_i, frames_in_seq),
+                folder=folder,
+                dvq_decoder=dvq.decoder,
+                device='cpu',
+                file_prefix=get_salient_viz_file_prefix(cluster.cluster_index, replay_i)
+            )
+
+
     pass
+
+
+def get_salient_two_or_higher_experience(
+    buf: ReplayBuffer,
+    exps: List[Experience],
+    salience_level: SalienceLevel,
+    steps_per_patch_diff: int,
+) -> Optional[SalientExperience]:
+    patch_diffs = torch.stack([exp.patch_diff for exp in exps])  # type: ignore
+    # Combine patch and embed dims
+    patch_diffs = patch_diffs.reshape(steps_per_patch_diff, -1)
+    patch_diffs.unsqueeze_(0)  # Add batch dim
+    salient_replay_i = [exp.replay_index for exp in exps]
+    salient_experience = detect_abstract_salience(
+        level=buf.salience_level,
+        patch_diffs=patch_diffs,
+        replay_ind=salient_replay_i,  # type: ignore
+        pct_est=salience_level.pct_est,
+        split=buf.split,
+        done=any([exp.done for exp in exps])
+    )
+    return salient_experience
 
 
 def get_salient_one_experience(
@@ -119,6 +167,7 @@ def get_salient_one_experience(
         state_tokens_in_frame=state_tokens_in_frame,
         pct_est=salience_level.pct_est,
         use_emb=True,
+        died=any([e.done for e in exps]),
     )
     assert len(salient_experiences) <= 1, 'Batch SalienceLevel.add not yet implemented'
     salient_experience = salient_experiences[0] if salient_experiences else None
@@ -167,6 +216,7 @@ def detect_abstract_salience(
     replay_ind: List[int],
     pct_est: PercentileEstimator,
     split: str,
+    done: bool,
     min_reservoir: int = 100,
 ) -> Optional[SalientExperience]:
     """
@@ -196,12 +246,17 @@ def detect_abstract_salience(
             )
     else:
         p90 = pct_est.percentile(90)
+        # TODO: For salient events, since there are so few, maybe store every one,
+        #  not just the top 10%. This goes against the theory that we are storing
+        #  the most salient events though.
+
         if p90 is not None and salience > p90:
             ret = SalientExperience(
                 below_replay_index=replay_ind[0],
                 patch_diff=torch.tensor(patch_diff_next),
                 level=level + 1,
                 split=split,
+                done=done,
             )
     pct_est.add([float(salience)])
     return ret
@@ -217,6 +272,7 @@ def detect_sensory_salience(
     # num_state_embeddings: int,
     # num_actions: int,
     pct_est: PercentileEstimator,
+    died: bool,
     min_reservoir: int = 1000,
     use_emb: bool = True,
     logits: Optional[torch.Tensor] = None,
@@ -348,7 +404,9 @@ def detect_sensory_salience(
     #   and if you fed in 24 frames, you'd get 17 windows and 8 salience diffs (47% usage).
     # TODO: Use the above to more efficiently compute lots saliences by grabbing more than 2 sequences
     #  from the replay buffer at a time (batch mode). This will be especially useful for offline salience
-    #  detection vs now where it's more real time focused. i.e. throughput over latency.
+    #  detection vs now where it's more real time focused. i.e. throughput over latency. IF we do this,
+    #  we need to pass in the "done" info for every experience so that we can correctly
+    #  mark which salient experiences include death.
     # TODO: Try using a different distance metric than manhattan distance
     patch_diff = (windows[FiS:] - windows[:-FiS]).abs()
 
@@ -393,6 +451,11 @@ def detect_sensory_salience(
         # Log reservoir percentage
         log.info(f'Building reservoir: {pct_est.count / min_reservoir * 100:.2f}%')
     elif pct_est.count > min_reservoir:  # Get a big pool before sampling top percentile
+
+        if not in_test():
+            # TODO: Handle done/death differently if we detect more than 1 sequence
+            assert len(salience) <= 1
+
         for i, s in enumerate(salience):
             p50 = pct_est.percentile(50)
             p90 = pct_est.percentile(90)
@@ -418,6 +481,7 @@ def detect_sensory_salience(
                         patch_diff=patch_diff2,
                         seq_len=FiS,
                         level=0,
+                        done=died,
                     )
                     # dict(mid_replay_ind=replay_ind[i] + FiS - 1, patch_diff=patch_diff2)
                 )
@@ -504,7 +568,9 @@ def _test_detect_salience_lvl_1(num_sequences: int = 2) -> List[Optional[Salient
             pct_est=pct_est,
             min_reservoir=min_reservoir_size,
             split=TRAIN,
+            done=False,
         )
+
 
     # The patch diff added in SalienceLevel.add() is the
     # actual diff of Π 8 z_q_emb - Π 8 z_q_emb, not the closest cluster core point
@@ -522,10 +588,13 @@ def _test_detect_salience_lvl_1(num_sequences: int = 2) -> List[Optional[Salient
         pct_est=pct_est,
         min_reservoir=min_reservoir_size,
         split=TRAIN,
+        done=True,
     )
+    assert ret and ret.done is True
     return [ret]
 
 
+@test
 def _test_detect_sensory_salience(num_sequences: int, use_emb: bool) -> List[Optional[SalientExperience]]:
     frames_in_sequence_window = 8
     num_actions = 6
@@ -565,7 +634,7 @@ def _test_detect_sensory_salience(num_sequences: int, use_emb: bool) -> List[Opt
             batch_size,
             num_sequences * frames_in_sequence_window,  # 2 * 8
             tokens_in_frame,
-            get_num_output_embeddings(num_state_embeddings, num_actions),
+            get_num_output_embeddings_sensor_lvl(num_state_embeddings, num_actions),
         )
     # Logit shape: B, _FiS, state_tokens_in_frame, L (263???)  1,16,123,263
     replay_ind = torch.arange(0, num_frames).unsqueeze(0)
@@ -589,6 +658,7 @@ def _test_detect_sensory_salience(num_sequences: int, use_emb: bool) -> List[Opt
             min_reservoir=min_reservoir,
             use_emb=use_emb,
             logits=zero_logits,
+            died=False,
         )
 
     ret = detect_sensory_salience(
@@ -605,6 +675,7 @@ def _test_detect_sensory_salience(num_sequences: int, use_emb: bool) -> List[Opt
         min_reservoir=min_reservoir,
         use_emb=use_emb,
         logits=logits,
+        died=False,
     )
     assert (
             len(ret) == num_frames - 2 * frames_in_sequence_window + 1

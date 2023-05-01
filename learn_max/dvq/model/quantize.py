@@ -27,8 +27,16 @@ class VQVAEQuantize(nn.Module):
     https://github.com/deepmind/sonnet/blob/v2/sonnet/src/nets/vqvae.py
     https://github.com/deepmind/sonnet/blob/v2/examples/vqvae_example.ipynb
     """
-    def __init__(self, num_hiddens, n_embed, embedding_dim, patch_width=None, output_proj=None, is_single_token2=False,
-                 enable_kmeans=True):
+    def __init__(
+        self,
+        num_hiddens,
+        n_embed,
+        embedding_dim,
+        patch_width=None,
+        output_proj=None,
+        is_single_token2=False,
+        enable_kmeans=True,
+    ) -> None:
         super().__init__()
 
         self.embedding_dim = embedding_dim
@@ -65,7 +73,7 @@ class VQVAEQuantize(nn.Module):
         # TODO: If we train the transformer and auto-encoder jointly, consider doing weight initialization in
         #  the same way for both. Right now pytorch does the dvq, with the quantizer initialized with k-means.
 
-    def forward(self, z):
+    def forward(self, z) -> torch.Tensor:
         B, C, H, W = z.size()
         z_e = self.proj(z)  #  (B, E, H, W)  # Output proj channels = E
         z_e = z_e.permute(0, 2, 3, 1)  # make (B, H, W, E)  128, 8, 8, 64

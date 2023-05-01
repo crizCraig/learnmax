@@ -8,7 +8,7 @@ from learn_max.salience.salience import SalientCluster  # TODO: Move to pickle i
 train_to_test_collection_files = 10
 
 
-def get_model_args():
+def get_model_args() -> argparse.Namespace:
     args = get_blank_model_args()
     args.gpt_batch_size = 7  # sequences per sensor batch
     args.gpt_seq_len = 8  # 10 gives OOM
@@ -20,23 +20,9 @@ def get_model_args():
         'checkpoints/epoch=8-step=85999.ckpt'
     )
 
-    # args.salience_resume_path = (
-    #     '/home/a/src/learnmax/pickles'
-    #     '/2023-03-29_14:08:22.437325_T4JAJIKL'
-    #     '/salience_store/lvl_0/2023-03-29_15:40:45.359329'
-    # )  # 352MB, 1015 clusters (min_samples=3)
-
-    # args.salience_resume_path = (
-    #     '/home/a/src/learnmax/pickles'
-    #     '/2023-03-30_15:26:04.393342_2F7OZYZ1/salience_store/lvl_0'
-    #     '/2023-03-30_16:01:13.167669'
-    # )  # folder 423.5 MB, 1562 clusters (min_samples=2)
-
-    args.salience_resume_path = (
-        '/home/a/src/learnmax/pickles'
-        '/2023-04-02_13:06:01.754975_3YO0B3BX/salience_store/lvl_0'
-        '/2023-04-02_13:38:53.271122'
-    )  # folder 423.7 MB, 1562 clusters (min_samples=2)
+    # TODO: Resume all replay buffers with get_readonly_replay_buf
+    args.replay_resume_path = '/home/a/src/learnmax/data/replay_buff/d_2023-04-02_15:01:27.059619_r-DBJDS9LR_env-MontezumaRevenge-v0'
+    args.salience_resume_path = '/home/a/src/learnmax/pickles/2023-04-02_12:03:49.372474_SRZL10AU/salience_store/lvl_0/2023-04-02_12:37:07.254411'
 
     args.steps_per_abstract_replay_buff_file = 1
 
@@ -66,7 +52,5 @@ def get_train_args() -> argparse.Namespace:
 # Tree search not implemented for patch based, so do random actions,
 # perhaps can be simplified to maximize highest saliency entropy (one step lookahead only)
 os.environ['RAND_ACTION'] = ''
-os.environ['SHOULD_VIZ_MOVIE'] = '1'
-
 
 cli_main(get_model_args_fn=get_model_args, get_train_args_fn=get_train_args)
