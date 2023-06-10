@@ -41,20 +41,19 @@ For this, it's useful to define spacetime as $s$. Then $s$ is a way of measuring
 
 The sum of complexity over all spatial and temporal scales can be represented as
 \[
-\xi = \sum_{s=0}^{\infty}K s
+\xi = \sum_{s=0}^{\infty}s (K - K^2)
 \]
-To avoid concentration of representations at any certain spatial and temporal scale, we create an L2 regularization term, $\Lambda$ where
-\[
-\Lambda = \sum_{s=0}^{\infty}K^{2} s
-\]
-This assumes we are discretizing spacetime
+To avoid concentration of representations at any spatial and temporal scale, we used an L2 regularization term, $K^2$.
+
+This assumes we are discretizing spacetime with clustering, so each step of $s$ in the sum above can represent varying sizes and durations. The driving force behind the size of each step is the range of sizes among similarly abstract entities in the cluster. Similarly sized things are grouped together in addition to other semantic dimensions like color and texture may be similar in a cluster. The main trend is that sizes and durations increase and you move up the abstraction hierarchy. See more in Implementing...
+
 We can now define spatially and temporally diverse $K$ as
 \[
-\mathcal{K}:= e^{\xi - \Lambda}
+\mathcal{K}:= e^{\xi}
 \]
-We exponentiate $\xi - \Lambda$ to shift the range from $-\infty\to0$ to $0\to1$.
+We exponentiate $\xi$ to be cute and shift the range from $-\infty\to0$ to $0\to1$.
 
-Not that this only applies to all correctly predicted internal representations of $K$ bits of  $m^3$ meters cubed in size and $t$ seconds in duration. We use L2 regularization to enforce spreading knowledge across spacetime. Since representations can change during learning, we discount $\mathcal{K}$ for predictions by the amount of change to the representation since the prediction was made. So for example, if a model contained a representation for the concept of a \emph{dog} which was 1MB and it was correctly predicted for a total of  that representation would contribute $10^{8}B * 3.58×10^{80}m^3$ * .
+Not that this only applies to all correctly predicted internal representations of $K$ bits of  $m^3$ meters cubed in size and $t$ seconds in duration. Since representations can change during learning, we discount $\mathcal{K}$ for predictions by the amount of change to the representation since the prediction was made. So for example, if a model contained a representation for the concept of the Universe which with a $K$ of 1MB and it was correctly predicted as being activated in the model as the current state, then  that representation would contribute $10^{6}B * 3.58×10^{80}m^3$ * (age of universe).
 
 We then define stagnation, destruction, and termination in terms of $D$, where stagnation is represented by $\Delta D = 0$, destruction: $\Delta D < 0$, and termination: $D = 0$.
 
